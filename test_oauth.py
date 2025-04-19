@@ -57,6 +57,11 @@ def main():
         logger.info(f"Token type: {token_data['token_type']}")
         logger.info(f"Expires in: {token_data['expires_in']} seconds")
         
+        # Save token to file
+        with open('auth_token.txt', 'w') as f:
+            f.write(token_data['access_token'])
+        logger.info("Saved access token to auth_token.txt")
+        
         # Test token refresh
         logger.info("Testing token refresh...")
         if oauth_manager.refresh_if_needed():
