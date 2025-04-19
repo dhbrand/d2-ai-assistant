@@ -1,20 +1,20 @@
 # Destiny 2 Catalyst Tracker
 
-A desktop application to track your Destiny 2 exotic weapon catalysts progress.
+A desktop application to track incomplete catalysts in Destiny 2.
 
 ## Features
 
-- OAuth2 authentication with Bungie.net
-- Real-time catalyst progress tracking
-- Visual progress bars for each catalyst
-- Secure HTTPS communication
+- Track incomplete catalysts across all characters
+- View progress and requirements for each catalyst
+- Automatic authentication with Bungie.net
+- Secure HTTPS OAuth implementation
 
 ## Setup
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/destiny2-catalyst-tracker.git
-cd destiny2-catalyst-tracker
+git clone https://github.com/yourusername/destiny2_catalysts.git
+cd destiny2_catalysts
 ```
 
 2. Create a virtual environment and install dependencies:
@@ -24,54 +24,63 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Set up your Bungie.net API credentials:
-   - Go to https://www.bungie.net/en/Application
-   - Create a new application
-   - Set OAuth Client Type to "Public"
-   - Set Redirect URL to `https://localhost:4200/auth`
-   - Copy your API Key and Client ID
-
-4. Create a `.env` file in the project root:
-```bash
+3. Set up environment variables:
+Create a `.env` file in the project root with:
+```
 BUNGIE_CLIENT_ID=your_client_id
 BUNGIE_API_KEY=your_api_key
 REDIRECT_URI=https://localhost:4200/auth
 ```
 
-5. Generate SSL certificates for local HTTPS:
-```bash
-mkdir dev-certs
-cd dev-certs
-openssl req -x509 -newkey rsa:4096 -nodes -out server.crt -keyout server.key -days 365 -subj "/CN=localhost"
-```
+4. Generate SSL certificates:
+The application will automatically generate self-signed SSL certificates for local development in the `dev-certs` directory.
 
-## Running the Application
+## Authentication
 
-```bash
-python desktop_app.py
-```
+The application uses OAuth 2.0 for secure authentication with Bungie.net. The authentication flow:
+
+1. User initiates authentication
+2. Browser opens to Bungie.net authorization page
+3. User authorizes the application
+4. OAuth callback is handled by local HTTPS server
+5. Access token is obtained and stored securely
+
+The OAuth implementation includes:
+- HTTPS support with self-signed certificates
+- Token refresh handling
+- Error handling and logging
+- Secure state parameter verification
 
 ## Development
 
-This project uses:
-- PyQt6 for the desktop interface
-- Python's built-in SSL and HTTP server for OAuth handling
-- Bungie.net API for Destiny 2 data
+### Testing Authentication
 
-## Security Notes
+To test the authentication flow:
+```bash
+python test_oauth.py
+```
 
-- The application uses HTTPS for OAuth callback handling
-- State parameter is used to prevent CSRF attacks
-- API keys are stored in environment variables
-- SSL certificates are required for local HTTPS
+This will:
+1. Start a local HTTPS server
+2. Open the browser for authentication
+3. Handle the OAuth callback
+4. Test token refresh
+5. Make a test API call
+
+### Project Structure
+
+- `bungie_oauth.py`: OAuth implementation
+- `generate_cert.py`: SSL certificate generation
+- `test_oauth.py`: Authentication testing
+- `catalyst_tracker.py`: Catalyst tracking functionality
+- `desktop_app.py`: Main application GUI
 
 ## Contributing
 
 1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+2. Create a feature branch
+3. Make your changes
+4. Submit a pull request
 
 ## License
 
