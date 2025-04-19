@@ -4,7 +4,7 @@ import secrets
 import urllib.parse
 import webbrowser
 import requests
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import socketserver
 import ssl
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
@@ -36,15 +36,34 @@ if not BUNGIE_CLIENT_ID or not BUNGIE_API_KEY or not REDIRECT_URI:
 logger.debug(f"Using Client ID: {BUNGIE_CLIENT_ID}")
 logger.debug(f"Using Redirect URI: {REDIRECT_URI}")
 
-class OAuthCallbackHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
+class OAuthCallbackHandler(socketserver.BaseRequestHandler):
+    def __init__(self, request, client_address, server):
+        self.oauth_server = getattr(server, 'oauth_server', None)
+        super().__init__(request, client_address, server)
+    
+    def handle(self):
         try:
+            # Parse the request
+            data = self.request.recv(1024).decode()
+            if not data:
+                return
+                
+            # Extract the path from the request
+            path = data.split('\n')[0].split(' ')[1]
+            logger.debug(f"Received request: {path}")
+            
             # Parse the callback URL
-            parsed = urllib.parse.urlparse(self.path)
+            parsed = urllib.parse.urlparse(path)
             params = urllib.parse.parse_qs(parsed.query)
+            logger.debug(f"Query parameters: {params}")
             
             # Get the server instance
-            server = self.server.oauth_server
+            server = self.oauth_server
+            if not server:
+                error = "Server instance not found"
+                logger.error(error)
+                self.send_error_response(error)
+                return
             
             if 'error' in params:
                 error = params['error'][0]
@@ -79,48 +98,35 @@ class OAuthCallbackHandler(BaseHTTPRequestHandler):
         except Exception as e:
             error = f"Error handling callback: {str(e)}"
             logger.error(error)
+            if hasattr(self, 'oauth_server'):
+                self.oauth_server.oauth_error = error
             self.send_error_response(error)
             
     def send_success_response(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        
-        html = """
-        <html>
-        <head><title>Authentication Successful</title></head>
-        <body>
-            <h1>Authentication Successful!</h1>
-            <p>You can close this window now.</p>
-            <script>
-                setTimeout(function() {
-                    window.close();
-                }, 2000);
-            </script>
-        </body>
-        </html>
-        """
-        self.wfile.write(html.encode())
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html\r\n"
+            "\r\n"
+            "<html><body>"
+            "<h1>Authentication Successful!</h1>"
+            "<p>You can close this window now.</p>"
+            "<script>setTimeout(function() { window.close(); }, 2000);</script>"
+            "</body></html>"
+        )
+        self.request.sendall(response.encode())
         
     def send_error_response(self, error):
-        self.send_response(400)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        
-        html = f"""
-        <html>
-        <head><title>Authentication Error</title></head>
-        <body>
-            <h1>Authentication Error</h1>
-            <p>Error: {error}</p>
-            <p>Please close this window and try again.</p>
-        </body>
-        </html>
-        """
-        self.wfile.write(html.encode())
-        
-    def log_message(self, format, *args):
-        logger.debug("Server: " + format%args)
+        response = (
+            "HTTP/1.1 400 Bad Request\r\n"
+            "Content-Type: text/html\r\n"
+            "\r\n"
+            f"<html><body>"
+            f"<h1>Authentication Error</h1>"
+            f"<p>Error: {error}</p>"
+            f"<p>Please close this window and try again.</p>"
+            f"</body></html>"
+        )
+        self.request.sendall(response.encode())
 
 class OAuthServer:
     def __init__(self):
@@ -134,10 +140,8 @@ class OAuthServer:
         
     def start(self):
         """Start the HTTPS server"""
-        import os
-        
         # Create HTTPS server
-        self.httpd = HTTPServer(('localhost', 4200), OAuthCallbackHandler)
+        self.httpd = socketserver.TCPServer(('localhost', 4200), OAuthCallbackHandler)
         self.httpd.oauth_server = self
         
         # Setup SSL context
@@ -145,21 +149,13 @@ class OAuthServer:
         context.verify_mode = ssl.CERT_NONE  # Accept self-signed certificates
         context.check_hostname = False  # Don't verify hostname
         
-        # Get certificate paths
-        cert_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dev-certs')
-        certfile = os.path.join(cert_dir, 'server.crt')
-        keyfile = os.path.join(cert_dir, 'server.key')
+        # Load certificates
+        certfile = 'localhost.pem'
+        keyfile = 'localhost-key.pem'
         
-        # Create dev-certs directory if it doesn't exist
-        if not os.path.exists(cert_dir):
-            os.makedirs(cert_dir)
-            
-        # Generate self-signed certificate if it doesn't exist
         if not (os.path.exists(certfile) and os.path.exists(keyfile)):
-            from generate_cert import generate_self_signed_cert
-            generate_self_signed_cert(certfile, keyfile)
+            raise FileNotFoundError("SSL certificates not found. Please run mkcert to generate them.")
             
-        # Load certificate
         context.load_cert_chain(certfile=certfile, keyfile=keyfile)
         
         # Wrap socket with SSL
@@ -218,8 +214,16 @@ class OAuthManager:
             # Wait for authentication to complete
             self.server.handle_request()
             
+            if self.server.oauth_error:
+                if self.error_callback:
+                    self.error_callback(self.server.oauth_error)
+                return None
+            
             if not self.server.oauth_code:
-                logger.error("No authorization code received")
+                error = "No authorization code received"
+                logger.error(error)
+                if self.error_callback:
+                    self.error_callback(error)
                 return None
                 
             # Exchange code for token
@@ -229,28 +233,36 @@ class OAuthManager:
                 data={
                     'grant_type': 'authorization_code',
                     'code': self.server.oauth_code,
-                    'client_id': BUNGIE_CLIENT_ID
+                    'client_id': BUNGIE_CLIENT_ID,
+                    'redirect_uri': REDIRECT_URI
                 },
-                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+                headers={
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-API-Key': BUNGIE_API_KEY
+                }
             )
             
             if response.status_code != 200:
-                logger.error(f"Token exchange failed: {response.status_code}")
+                error = f"Token exchange failed: {response.status_code}"
+                logger.error(error)
+                if self.error_callback:
+                    self.error_callback(error)
                 return None
                 
             self.token_data = response.json()
             logger.info("Successfully obtained access token")
             
+            if self.auth_code_callback:
+                self.auth_code_callback(self.token_data)
+            
             return self.token_data
             
         except Exception as e:
-            logger.error(f"Error during authentication: {str(e)}")
-            if error_callback:
-                error_callback(str(e))
+            error = f"Error during authentication: {str(e)}"
+            logger.error(error)
+            if self.error_callback:
+                self.error_callback(error)
             return None
-        finally:
-            if self.server:
-                self.server.stop()
     
     def refresh_if_needed(self):
         """Check if token needs refresh and handle re-authentication if needed."""
