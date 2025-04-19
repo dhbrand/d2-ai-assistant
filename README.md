@@ -112,6 +112,37 @@ This will:
 - `catalyst_tracker.py`: Catalyst tracking functionality
 - `desktop_app.py`: Main application GUI
 
+### Test Scripts
+
+The project contains two types of test scripts:
+
+1. **API Test Scripts** (prefixed with `test_` and suffixed with `_api.py`)
+   - `test_oauth_api.py`: Independent script for testing the OAuth authentication flow
+   - `test_catalyst_api.py`: Independent script for testing the Destiny 2 API for catalyst information
+   - These scripts are used for manual testing and development of API integration
+   - They are standalone scripts that can be run independently
+
+2. **Unit Tests** (suffixed with `_test.py`)
+   - `bungie_oauth_test.py`: Unit tests for the OAuth implementation module
+   - `catalyst_test.py`: Unit tests for the catalyst tracking module
+   - These scripts contain automated tests for production code
+   - They test the functionality of our production modules
+
+Naming Convention:
+- API test scripts: `test_[feature]_api.py`
+- Unit tests: `[module]_test.py`
+
+Example Usage:
+```bash
+# Run API test scripts (manual testing)
+python test_oauth_api.py
+python test_catalyst_api.py
+
+# Run unit tests
+python -m unittest bungie_oauth_test.py
+python -m unittest catalyst_test.py
+```
+
 ## Contributing
 
 1. Fork the repository
