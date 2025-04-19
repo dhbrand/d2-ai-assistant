@@ -9,6 +9,43 @@ A desktop application to track incomplete catalysts in Destiny 2.
 - Automatic authentication with Bungie.net
 - Secure HTTPS OAuth implementation
 
+## Development Process
+
+### Branching Strategy
+
+```
+main (production)
+  └── dev (staging/development)
+      ├── feature/oauth-implementation
+      ├── feature/catalyst-tracking
+      └── feature/other-features
+```
+
+#### Branches
+- `main`: Production-ready code, tagged with version numbers
+- `dev`: Integration branch for testing features
+- `feature/*`: Individual feature branches
+
+#### Workflow
+1. Create feature branch from `dev`
+2. Develop and test feature
+3. Create PR to merge into `dev`
+4. Test in `dev` environment
+5. When stable, create PR to merge into `main`
+6. Tag releases in `main`
+
+### Current Features in Development
+
+- OAuth Implementation (`feature/oauth-implementation`)
+  - Secure HTTPS authentication
+  - Token management
+  - Self-signed certificates
+
+- Catalyst Tracking (`feature/catalyst-tracking`)
+  - Progress tracking
+  - Requirements display
+  - Character inventory scanning
+
 ## Setup
 
 1. Clone the repository:
@@ -78,9 +115,9 @@ This will:
 ## Contributing
 
 1. Fork the repository
-2. Create a feature branch
+2. Create a feature branch from `dev`
 3. Make your changes
-4. Submit a pull request
+4. Submit a pull request to `dev`
 
 ## License
 
