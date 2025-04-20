@@ -5,9 +5,37 @@ A desktop application to track incomplete catalysts in Destiny 2.
 ## Features
 
 - Track incomplete catalysts across all characters
-- View progress and requirements for each catalyst
+- View detailed progress and requirements for each catalyst
+- Individual objective tracking with progress bars
+- Modern neon-themed UI with dark/light mode support
 - Automatic authentication with Bungie.net
 - Secure HTTPS OAuth implementation
+- Search, sort, and filter catalysts
+- Group catalysts by weapon type
+- Progress summary statistics
+
+## UI Features
+
+### Modern Design
+- Neon-themed interface with cyberpunk aesthetic
+- Dark and light mode support
+- Responsive layout that adapts to window size
+- Custom fonts and animations
+
+### Catalyst Display
+- Collapsible weapon type groups
+- Individual progress bars for each objective
+- Overall progress calculation
+- Detailed objective descriptions
+- Search by catalyst name
+- Sort by name, progress, or weapon type
+- Filter by completion status (All, Completed, In Progress, Not Started)
+
+### Progress Tracking
+- Overall completion percentage
+- Individual objective progress bars
+- Detailed progress statistics (e.g., "5/10 kills")
+- Progress summary showing total, completed, and in-progress catalysts
 
 ## Development Process
 
@@ -18,6 +46,7 @@ main (production)
   └── dev (staging/development)
       ├── feature/oauth-implementation
       ├── feature/catalyst-tracking
+      ├── feature/ui-improvements
       └── feature/other-features
 ```
 
