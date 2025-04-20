@@ -181,14 +181,12 @@ class CatalystWidget(AnimatedWidget):
         super().__init__(parent)
         self.catalyst = catalyst
         self.theme_toggle = theme_toggle
-        self.setMinimumHeight(150)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         
         # Create progress bar first
         self.progress_bar = QProgressBar()
         self.progress_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.progress_bar.setMinimumHeight(30)
-        self.progress_bar.setMaximumHeight(30)
+        self.progress_bar.setMinimumHeight(20)  # Reduced from 30 to be more proportional
         self.progress_bar.setMaximum(100)
         self.progress_bar.setValue(0)
         progress = self.catalyst.get('progress', 0)
@@ -258,14 +256,13 @@ class CatalystWidget(AnimatedWidget):
 
     def setup_ui(self):
         layout = QVBoxLayout()
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)  # Reduced from 15 to be more compact
+        layout.setContentsMargins(15, 15, 15, 15)  # Reduced from 20 to be more compact
         
         # Title with proper sizing
         title = QLabel(self.catalyst.get('name', 'Unknown Catalyst').upper())
         title.setFont(FONTS['heading'])
         title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        title.setMinimumHeight(30)
         layout.addWidget(title)
         
         # Description with proper wrapping
@@ -273,7 +270,6 @@ class CatalystWidget(AnimatedWidget):
         desc.setFont(FONTS['body'])
         desc.setWordWrap(True)
         desc.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        desc.setMinimumHeight(50)
         layout.addWidget(desc)
         
         # Progress bar
@@ -282,7 +278,7 @@ class CatalystWidget(AnimatedWidget):
         self.setLayout(layout)
         
         # Animate progress
-        progress = self.catalyst.get('progress', 0)  # Default to 0 if not found
+        progress = self.catalyst.get('progress', 0)
         self.progress_animation.setStartValue(0)
         self.progress_animation.setEndValue(progress)
         self.progress_animation.start()
@@ -298,20 +294,19 @@ class CollapsibleGroup(QWidget):
         layout.setSpacing(0)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        # Header button with fixed height
+        # Header button with dynamic sizing
         self.header = QPushButton(f"▼ {title}")
         self.header.setCheckable(True)
         self.header.setChecked(True)
-        self.header.setMinimumHeight(50)
         self.header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.header.clicked.connect(self.toggle_content)
         
-        # Content widget with expanding size policy
+        # Content widget with dynamic sizing
         self.content = QWidget()
-        self.content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.content_layout = QVBoxLayout(self.content)
         self.content_layout.setSpacing(10)
-        self.content_layout.setContentsMargins(10, 10, 10, 10)
+        self.content_layout.setContentsMargins(10, 5, 10, 5)  # Reduced vertical margins
         
         layout.addWidget(self.header)
         layout.addWidget(self.content)
@@ -327,6 +322,7 @@ class ControlPanel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent_app = parent
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.setup_ui()
         
         # Connect signals only if parent is provided
@@ -361,50 +357,16 @@ class ControlPanel(QFrame):
         search_layout = QHBoxLayout()
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("SEARCH CATALYSTS...")
-        self.search_bar.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: {THEMES['dark']['background']};
-                color: {THEMES['dark']['text']};
-                border: 2px solid {THEMES['dark']['primary']};
-                border-radius: 10px;
-                padding: 10px;
-                font-family: 'Rajdhani';
-                font-size: 14px;
-                letter-spacing: 1px;
-            }}
-            QLineEdit:focus {{
-                border-color: {THEMES['dark']['accent']};
-            }}
-        """)
+        self.search_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         search_layout.addWidget(self.search_bar)
         
         # Sort options with neon styling
         sort_layout = QHBoxLayout()
         sort_label = QLabel("SORT BY:")
-        sort_label.setStyleSheet(f"color: {THEMES['dark']['text_secondary']};")
+        sort_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(["NAME", "PROGRESS", "WEAPON TYPE"])
-        self.sort_combo.setStyleSheet(f"""
-            QComboBox {{
-                background-color: {THEMES['dark']['background']};
-                color: {THEMES['dark']['text']};
-                border: 2px solid {THEMES['dark']['primary']};
-                border-radius: 10px;
-                padding: 8px;
-                min-width: 150px;
-                font-family: 'Rajdhani';
-            }}
-            QComboBox::drop-down {{
-                border: none;
-            }}
-            QComboBox::down-arrow {{
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 5px solid {THEMES['dark']['primary']};
-                margin-right: 8px;
-            }}
-        """)
+        self.sort_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         sort_layout.addWidget(sort_label)
         sort_layout.addWidget(self.sort_combo)
         sort_layout.addStretch()
@@ -475,7 +437,7 @@ class DestinyApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Destiny 2 Catalyst Tracker")
-        self.setMinimumSize(800, 600)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         # Initialize variables
         self.api = None
