@@ -189,12 +189,28 @@ class CatalystWidget(AnimatedWidget):
         self.progress_bar.setMinimumHeight(20)  # Reduced from 30 to be more proportional
         self.progress_bar.setMaximum(100)
         self.progress_bar.setValue(0)
-        progress = self.catalyst.get('progress', 0)
+        
+        # Calculate progress from objectives
+        progress = self.calculate_progress()
         self.progress_bar.setFormat(f"{progress}% Complete")
         
         self.setup_animations()
         self.setup_ui()
         self.update_style()
+
+    def calculate_progress(self):
+        """Calculate overall progress from objectives"""
+        objectives = self.catalyst.get('objectives', [])
+        if not objectives:
+            return 0
+        
+        total_progress = 0
+        for obj in objectives:
+            if obj.get('completion', 0) > 0:
+                progress = (obj.get('progress', 0) / obj.get('completion', 1)) * 100
+                total_progress += progress
+        
+        return min(round(total_progress / len(objectives), 1), 100)
 
     def setup_animations(self):
         # Progress bar animation
@@ -272,13 +288,40 @@ class CatalystWidget(AnimatedWidget):
         desc.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         layout.addWidget(desc)
         
-        # Progress bar
+        # Add objectives list
+        objectives = self.catalyst.get('objectives', [])
+        if objectives:
+            obj_container = QWidget()
+            obj_layout = QVBoxLayout(obj_container)
+            obj_layout.setSpacing(5)
+            obj_layout.setContentsMargins(0, 0, 0, 0)
+            
+            for obj in objectives:
+                obj_text = QLabel(obj.get('description', '').upper())
+                obj_text.setFont(FONTS['body'])
+                obj_text.setWordWrap(True)
+                obj_text.setStyleSheet("font-size: 11px;")
+                obj_layout.addWidget(obj_text)
+                
+                # Add individual progress bar for objective
+                if obj.get('completion', 0) > 0:
+                    obj_progress = QProgressBar()
+                    obj_progress.setMaximum(100)
+                    progress = (obj.get('progress', 0) / obj.get('completion', 1)) * 100
+                    obj_progress.setValue(int(progress))
+                    obj_progress.setFormat(f"{obj.get('progress', 0)}/{obj.get('completion', 1)} ({progress:.1f}%)")
+                    obj_progress.setMinimumHeight(15)
+                    obj_layout.addWidget(obj_progress)
+            
+            layout.addWidget(obj_container)
+        
+        # Overall progress bar
         layout.addWidget(self.progress_bar)
         
         self.setLayout(layout)
         
         # Animate progress
-        progress = self.catalyst.get('progress', 0)
+        progress = self.calculate_progress()
         self.progress_animation.setStartValue(0)
         self.progress_animation.setEndValue(progress)
         self.progress_animation.start()
