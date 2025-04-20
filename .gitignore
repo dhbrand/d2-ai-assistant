@@ -1,9 +1,15 @@
+# Generated files
+auth_token.txt
+catalyst_cache.json
+manifest.content
+
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+env/
 build/
 develop-eggs/
 dist/
@@ -15,7 +21,6 @@ lib64/
 parts/
 sdist/
 var/
-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -23,13 +28,16 @@ wheels/
 # Virtual Environment
 venv/
 ENV/
-env/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+
+# OS
+.DS_Store
+Thumbs.db
 
 # Environment variables
 .env
@@ -44,6 +52,5 @@ dev-certs/
 *.log
 
 # macOS
-.DS_Store
 .AppleDouble
 .LSOverride 
