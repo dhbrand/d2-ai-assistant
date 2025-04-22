@@ -43,7 +43,8 @@ class TestOAuthManager(unittest.TestCase):
         mock_response.json.return_value = {
             "access_token": "test_access_token",
             "token_type": "Bearer",
-            "expires_in": 3600
+            "expires_in": 3600,
+            "refresh_token": "test_refresh_token"
         }
         mock_post.return_value = mock_response
         
@@ -68,6 +69,8 @@ class TestOAuthManager(unittest.TestCase):
         # Verify token data and callback
         self.assertIsNotNone(token_data)
         self.assertEqual(token_data["access_token"], "test_access_token")
+        self.assertEqual(token_data["refresh_token"], "test_refresh_token")
+        self.assertIn("obtained_at", token_data)
         success_callback.assert_called_once_with(token_data)
         error_callback.assert_not_called()
         
@@ -107,26 +110,106 @@ class TestOAuthManager(unittest.TestCase):
         }
         self.assertTrue(self.oauth_manager.refresh_if_needed())
         
-    @patch('bungie_oauth.OAuthManager.start_auth')
-    def test_refresh_if_needed_expired(self, mock_start_auth):
+    @patch('bungie_oauth.OAuthManager.refresh_token')
+    def test_refresh_if_needed_expired(self, mock_refresh_token):
         """Test refresh with expired token"""
         # Set expired token
         self.oauth_manager.token_data = {
             "access_token": "test_token",
             "expires_in": 3600,
-            "obtained_at": (datetime.now() - timedelta(hours=2)).timestamp()
+            "obtained_at": (datetime.now() - timedelta(hours=2)).timestamp(),
+            "refresh_token": "test_refresh_token"
         }
         
-        # Mock new token response
-        mock_start_auth.return_value = {
-            "access_token": "new_token",
-            "expires_in": 3600
-        }
+        # Mock successful refresh
+        mock_refresh_token.return_value = True
         
         # Test refresh
         result = self.oauth_manager.refresh_if_needed()
         self.assertTrue(result)
+        mock_refresh_token.assert_called_once()
+        
+    @patch('bungie_oauth.OAuthManager.refresh_token')
+    @patch('bungie_oauth.OAuthManager.start_auth')
+    def test_refresh_if_needed_failed_refresh(self, mock_start_auth, mock_refresh_token):
+        """Test refresh fallback to full auth when refresh fails"""
+        # Set expired token
+        self.oauth_manager.token_data = {
+            "access_token": "test_token",
+            "expires_in": 3600,
+            "obtained_at": (datetime.now() - timedelta(hours=2)).timestamp(),
+            "refresh_token": "test_refresh_token"
+        }
+        
+        # Mock failed refresh and successful auth
+        mock_refresh_token.return_value = False
+        mock_start_auth.return_value = {"access_token": "new_token"}
+        
+        # Test refresh
+        result = self.oauth_manager.refresh_if_needed()
+        self.assertTrue(result)
+        mock_refresh_token.assert_called_once()
         mock_start_auth.assert_called_once()
+        
+    @patch('requests.post')
+    def test_refresh_token_success(self, mock_post):
+        """Test successful token refresh"""
+        # Set up token data
+        self.oauth_manager.token_data = {
+            "access_token": "old_token",
+            "refresh_token": "test_refresh_token",
+            "obtained_at": datetime.now().timestamp()
+        }
+        
+        # Mock successful refresh response
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "access_token": "new_token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": "new_refresh_token"
+        }
+        mock_post.return_value = mock_response
+        
+        # Test refresh
+        result = self.oauth_manager.refresh_token()
+        self.assertTrue(result)
+        self.assertEqual(self.oauth_manager.token_data["access_token"], "new_token")
+        self.assertEqual(self.oauth_manager.token_data["refresh_token"], "new_refresh_token")
+        self.assertIn("obtained_at", self.oauth_manager.token_data)
+        
+    @patch('requests.post')
+    def test_refresh_token_no_refresh_token(self, mock_post):
+        """Test refresh with no refresh token"""
+        self.oauth_manager.token_data = {
+            "access_token": "test_token",
+            "obtained_at": datetime.now().timestamp()
+        }
+        
+        result = self.oauth_manager.refresh_token()
+        self.assertFalse(result)
+        mock_post.assert_not_called()
+        
+    @patch('requests.post')
+    def test_refresh_token_failure(self, mock_post):
+        """Test failed token refresh"""
+        # Set up token data
+        self.oauth_manager.token_data = {
+            "access_token": "old_token",
+            "refresh_token": "test_refresh_token",
+            "obtained_at": datetime.now().timestamp()
+        }
+        
+        # Mock failed refresh response
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_post.return_value = mock_response
+        
+        # Test refresh
+        result = self.oauth_manager.refresh_token()
+        self.assertFalse(result)
+        self.assertEqual(self.oauth_manager.token_data["access_token"], "old_token")
         
     def test_get_headers(self):
         """Test header generation"""

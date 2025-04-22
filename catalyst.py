@@ -8,6 +8,7 @@ import requests
 import time
 from threading import Event
 from catalyst_hashes import CATALYST_RECORD_HASHES
+from bungie_oauth import OAuthManager
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -25,11 +26,10 @@ class DestinyRecordState:
     CAN_EQUIP_TITLE = 64
 
 class CatalystAPI:
-    def __init__(self, api_key: str, auth_token: str):
-        """Initialize the Catalyst API with API key and auth token"""
+    def __init__(self, oauth_manager: OAuthManager):
+        """Initialize the Catalyst API with an OAuthManager instance"""
         self.base_url = "https://www.bungie.net/Platform"
-        self.api_key = api_key
-        self.auth_token = auth_token
+        self.oauth_manager = oauth_manager
         self.session = self._create_session()
         self.definition_cache = {}  # Cache for definitions
         self.cancel_event = Event()  # For cancelling operations
@@ -48,13 +48,6 @@ class CatalystAPI:
         session.mount('https://', adapter)
         return session
         
-    def _get_headers(self) -> Dict[str, str]:
-        """Get headers with API key and auth token"""
-        return {
-            'X-API-Key': self.api_key,
-            'Authorization': f'Bearer {self.auth_token}'
-        }
-        
     def get_membership_info(self) -> Optional[Dict[str, str]]:
         """Get the current user's membership info"""
         if self.cancel_event.is_set():
@@ -63,9 +56,10 @@ class CatalystAPI:
         try:
             url = f"{self.base_url}/User/GetMembershipsForCurrentUser/"
             logger.info(f"Fetching membership from: {url}")
-            response = self.session.get(url, headers=self._get_headers(), timeout=8)
+            headers = self.oauth_manager.get_headers()
+            response = self.session.get(url, headers=headers, timeout=8)
             if response.status_code != 200:
-                logger.error(f"Failed to get membership info: {response.status_code}")
+                logger.error(f"Failed to get membership info: {response.status_code} - {response.text}")
                 return None
                 
             data = response.json()
@@ -107,7 +101,8 @@ class CatalystAPI:
             }
             logger.info("Fetching profile data with components: %s", params["components"])
             
-            response = self.session.get(url, headers=self._get_headers(), params=params, timeout=15)  # Increased timeout
+            headers = self.oauth_manager.get_headers()
+            response = self.session.get(url, headers=headers, params=params, timeout=15)
             logger.info("API URL: %s", response.url)
             
             if response.status_code != 200:
@@ -143,7 +138,8 @@ class CatalystAPI:
             
         try:
             url = f"{self.base_url}/Destiny2/Manifest/{table}/{hash_id}/"
-            response = self.session.get(url, headers=self._get_headers(), timeout=10)  # Increased timeout
+            headers = self.oauth_manager.get_headers()
+            response = self.session.get(url, headers=headers, timeout=10)
             if response.status_code != 200:
                 logger.debug(f"Failed to get definition for {table} {hash_id}: {response.status_code}")
                 return None

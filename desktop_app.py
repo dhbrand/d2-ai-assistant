@@ -56,10 +56,10 @@ THEMES = {
 
 # Custom fonts
 FONTS = {
-    'title': QFont('Rajdhani, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif', 24, QFont.Weight.Bold),
-    'heading': QFont('Rajdhani, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif', 18, QFont.Weight.Medium),
-    'body': QFont('Rajdhani, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif', 12),
-    'mono': QFont('JetBrains Mono, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace', 10)
+    'title': QFont('Rajdhani, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif', 24, QFont.Weight.Bold),
+    'heading': QFont('Rajdhani, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif', 18, QFont.Weight.Medium),
+    'body': QFont('Rajdhani, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif', 12),
+    'mono': QFont('"JetBrains Mono", Consolas, Monaco, "Courier New", monospace', 10)
 }
 
 class AnimatedWidget(QFrame):
@@ -99,7 +99,6 @@ class LogDisplay(QScrollArea):
         self.text_widget = QLabel()
         self.text_widget.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.text_widget.setWordWrap(True)
-        self.text_widget.setStyleSheet("background-color: #f0f0f0; padding: 10px;")
         self.text_widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.setWidget(self.text_widget)
         self.log_lines = []
@@ -479,33 +478,120 @@ class ControlPanel(QFrame):
 class DestinyApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.current_theme = 'dark'
         self.setWindowTitle("Destiny 2 Catalyst Tracker")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        
-        # Initialize variables
-        self.api = None
-        self.oauth_manager = None
+        self.setGeometry(100, 100, 1200, 800)
+        self.oauth = OAuthManager()
+        self.api = CatalystAPI(self.oauth)
         self.catalyst_thread = None
-        self.cached_catalysts = {}
-        self.cache_file = "catalyst_cache.json"
-        
-        # Create theme toggle button first
-        self.theme_toggle = ThemeToggleButton()
-        self.theme_toggle.toggled.connect(self.toggle_theme)
-        self.theme_toggle.setChecked(False)  # Start with dark theme
-        
-        # Setup UI components
-        self.setup_ui()
-        self.apply_theme(False)  # Apply initial dark theme
+        self.cache_file = "catalyst_cache.json" # Define cache file path
+        self.discovered_catalysts = {} # Use this for current session data
+        self.weapon_groups = {}
+        self.control_panel = None
+
+        # Apply initial theme and setup UI
+        self.apply_theme(is_light=False)
         self.setup_animations()
+        self.setup_ui()
+
+        # Load and display data from cache immediately after UI setup
+        self.load_and_display_cache()
+
+        # Attempt to validate token (doesn't trigger fetch anymore)
+        self._check_initial_auth_status()
+
+    def load_and_display_cache(self):
+        """Load data from cache file and populate the UI if valid."""
+        loaded_from_cache = False
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'r') as f:
+                    cache_data = json.load(f)
+                    
+                # Check if cache is still valid (e.g., less than 1 day old)
+                cache_time_str = cache_data.get('timestamp')
+                if cache_time_str:
+                    cache_time = datetime.fromisoformat(cache_time_str)
+                    if datetime.now() - cache_time < timedelta(days=1):
+                        self.discovered_catalysts = cache_data.get('catalysts', {})
+                        logging.info(f"Loaded {len(self.discovered_catalysts)} catalysts from valid cache.")
+                        # Populate UI with cached data
+                        self.populate_ui_from_discovered_data()
+                        loaded_from_cache = True
+                    else:
+                        logging.info("Cache exists but is older than 1 day. Needs refresh.")
+                else:
+                    logging.warning("Cache file found but missing timestamp.")
+            else:
+                logging.info(f"Cache file {self.cache_file} not found.")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError) as e:
+            logging.error(f"Error loading or parsing cache file {self.cache_file}: {e}")
+            # Optionally delete corrupted cache?
+            # if os.path.exists(self.cache_file):
+            #     os.remove(self.cache_file)
+            self.discovered_catalysts = {}
+
+        # If cache wasn't loaded or was invalid, ensure UI is clear
+        if not loaded_from_cache:
+            self.clear_catalyst_display()
+            self.update_progress_summary() # Ensure summary shows zeros
+
+    def populate_ui_from_discovered_data(self):
+        """Clears and refills the UI based on self.discovered_catalysts."""
+        self.clear_catalyst_display()
+        logging.info(f"Populating UI with {len(self.discovered_catalysts)} catalysts...")
+        # Sort catalysts before displaying (e.g., by name)
+        # Note: Sorting dict values requires getting items and sorting based on a key
+        sorted_catalysts = sorted(self.discovered_catalysts.values(), key=lambda c: c.get('name', ''))
         
-        # Load cache
-        self.load_cache()
-        
-        # Setup timer for periodic updates
-        self.update_timer = QTimer()
-        self.update_timer.timeout.connect(self.fetch_catalysts)
-        self.update_timer.start(300000)  # 5 minutes
+        for catalyst_data in sorted_catalysts:
+            # Replicate the core logic of handle_catalyst_found for UI population
+            widget = CatalystWidget(catalyst_data, self.theme_toggle)
+            weapon_type = catalyst_data.get('weaponType', 'Unknown')
+            group = self.get_or_create_weapon_group(weapon_type)
+            group.add_widget(widget)
+            
+        self.update_progress_summary()
+        logging.info("Finished populating UI from data.")
+
+    def _check_initial_auth_status(self):
+        """Check for existing valid token on startup."""
+        try:
+            self.oauth.get_headers()
+            logging.info("Successfully validated existing token on startup.")
+            self._update_auth_state(authenticated=True)
+        except Exception as e:
+            logging.warning(f"Initial token validation failed: {e}. User needs to authenticate.")
+            self._update_auth_state(authenticated=False)
+
+    def _update_auth_state(self, authenticated: bool):
+        """Update UI elements based on authentication status."""
+        if authenticated:
+            logging.info("Authentication successful. Enabling authenticated features.")
+            if self.auth_button:
+                self.auth_button.setEnabled(False)
+                self.auth_button.setText("Authenticated")
+            if self.fetch_button:
+                self.fetch_button.setEnabled(True)
+            if self.discover_button:
+                self.discover_button.setEnabled(True)
+            if self.control_panel:
+                 self.control_panel.setEnabled(True)
+            # REMOVED: self.fetch_catalysts() - Don't fetch automatically here anymore
+        else:
+            logging.info("Authentication needed. Enabling authentication button.")
+            if self.auth_button:
+                self.auth_button.setEnabled(True)
+                self.auth_button.setText("Authenticate with Bungie")
+            if self.fetch_button:
+                self.fetch_button.setEnabled(False)
+            if self.discover_button:
+                self.discover_button.setEnabled(False)
+            if self.control_panel:
+                 self.control_panel.setEnabled(False)
+            # Optionally clear display if auth fails *after* cache was shown?
+            # self.clear_catalyst_display() 
+            # self.update_progress_summary()
 
     def apply_theme(self, is_light):
         theme = THEMES['light' if is_light else 'dark']
@@ -528,7 +614,6 @@ class DestinyApp(QMainWindow):
             QPushButton:hover {{
                 color: {theme['text']};
                 border-color: {theme['secondary']};
-                box-shadow: {theme['neon_glow_strong']} {theme['secondary']};
             }}
             QPushButton:pressed {{
                 background-color: {theme['secondary']};
@@ -606,389 +691,227 @@ class DestinyApp(QMainWindow):
         main_widget = QWidget()
         main_widget.setObjectName("central")
         self.setCentralWidget(main_widget)
-        layout = QVBoxLayout(main_widget)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(15)
         
         # Top bar with neon buttons
-        top_bar = QHBoxLayout()
-        top_bar.setSpacing(15)
-        
-        # Auth button with neon effect
-        self.auth_button = QPushButton("AUTHENTICATE WITH BUNGIE")
-        self.auth_button.clicked.connect(self.authenticate)
-        self.auth_button.setMinimumHeight(45)
-        self.auth_button.setMinimumWidth(300)
+        top_bar_widget = QFrame()
+        top_bar_layout = QHBoxLayout(top_bar_widget)
+        top_bar_layout.setContentsMargins(10, 5, 10, 5) # Reduced vertical margins
+
+        # Title Label (Optional, if needed)
+        # title_label = QLabel("Destiny 2 Catalyst Tracker")
+        # title_label.setFont(FONTS['heading']) 
+        # top_bar_layout.addWidget(title_label)
+
+        # Spacer
+        top_bar_layout.addStretch(1)
+
+        # Authentication Button
+        self.auth_button = QPushButton("Authenticate with Bungie")
         self.auth_button.setFont(FONTS['body'])
-        self.auth_button.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {THEMES['dark']['background']};
-                color: {THEMES['dark']['primary']};
-                border: 2px solid {THEMES['dark']['primary']};
-                border-radius: 10px;
-            }}
-        """)
+        self.auth_button.setIcon(QIcon.fromTheme("security-high")) # Example icon
+        self.auth_button.setToolTip("Authenticate with Bungie.net to fetch your catalyst data")
+        self.auth_button.clicked.connect(self.authenticate)
+        self.auth_button.setEnabled(True) # Start enabled, will be updated by _update_auth_state
+        top_bar_layout.addWidget(self.auth_button)
+
+        # Fetch Button
+        self.fetch_button = QPushButton("Fetch Catalysts")
+        self.fetch_button.setFont(FONTS['body'])
+        self.fetch_button.setIcon(QIcon.fromTheme("view-refresh")) # Example icon
+        self.fetch_button.setToolTip("Fetch the latest catalyst progress")
+        self.fetch_button.clicked.connect(self.fetch_catalysts)
+        self.fetch_button.setEnabled(False) # Start disabled until authenticated
+        top_bar_layout.addWidget(self.fetch_button)
         
-        # Discovery mode button with neon effect
-        self.discover_button = QPushButton("DISCOVERY MODE")
-        self.discover_button.clicked.connect(self.toggle_discovery_mode)
-        self.discover_button.setCheckable(True)
-        self.discover_button.setMinimumHeight(45)
-        self.discover_button.setMinimumWidth(200)
+        # Discovery Mode Button
+        self.discover_button = QPushButton("Discover New")
         self.discover_button.setFont(FONTS['body'])
-        self.discover_button.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {THEMES['dark']['background']};
-                color: {THEMES['dark']['secondary']};
-                border: 2px solid {THEMES['dark']['secondary']};
-                border-radius: 10px;
-            }}
-            QPushButton:checked {{
-                background-color: {THEMES['dark']['secondary']};
-                color: {THEMES['dark']['background']};
-            }}
-        """)
-        
-        top_bar.addWidget(self.auth_button)
-        top_bar.addWidget(self.discover_button)
-        top_bar.addStretch()
-        
-        # Enhanced theme toggle with neon border
-        self.theme_toggle.setMinimumSize(45, 45)
-        self.theme_toggle.setStyleSheet("""
-            QToolButton {
-                background-color: #0D0D0D;
-                border: 2px solid #EBFE05;
-                border-radius: 22px;
-                padding: 5px;
-            }
-            QToolButton:checked {
-                background-color: #EBFE05;
-                border-color: #FF0099;
-            }
-        """)
-        top_bar.addWidget(self.theme_toggle)
-        
-        layout.addLayout(top_bar)
-        
-        # Control panel
+        self.discover_button.setIcon(QIcon.fromTheme("system-search")) # Example icon
+        self.discover_button.setCheckable(True)
+        self.discover_button.setToolTip("Run in discovery mode to find potentially new/missing catalysts (slower)")
+        self.discover_button.clicked.connect(self.toggle_discovery_mode)
+        self.discover_button.setEnabled(False) # Start disabled until authenticated
+        top_bar_layout.addWidget(self.discover_button)
+
+        # Theme Toggle Button
+        self.theme_toggle = ThemeToggleButton()
+        self.theme_toggle.toggled.connect(self.toggle_theme)
+        top_bar_layout.addWidget(self.theme_toggle)
+
+        main_layout.addWidget(top_bar_widget) # Add top bar to main layout
+
+        # --- Control Panel ---
         self.control_panel = ControlPanel(self)
-        layout.addWidget(self.control_panel)
-        
-        # Create splitter with neon handle
+        self.control_panel.search_bar.textChanged.connect(self.search_catalysts)
+        self.control_panel.sort_combo.currentTextChanged.connect(self.sort_catalysts)
+        # Connect filter buttons (Iterate directly over the list)
+        for btn in self.control_panel.filter_buttons:
+            btn.clicked.connect(lambda checked, b=btn: self.control_panel.handle_filter_click(b))
+        self.control_panel.filter_buttons[0].setChecked(True) # Corrected access
+        self.control_panel.setEnabled(False) # Start disabled until authenticated
+        main_layout.addWidget(self.control_panel)
+
+        # --- Catalyst Scroll Area ---
+        # Splitter for scroll area and log display
         self.splitter = QSplitter(Qt.Orientation.Vertical)
-        self.splitter.setStyleSheet("""
-            QSplitter::handle {
-                height: 2px;
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #EBFE05, stop:1 #FF0099);
-            }
-        """)
-        
-        # Scroll area with custom scrollbar
+        # Apply theme styles later in apply_theme if needed
+
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setStyleSheet("""
-            QScrollArea {
-                border: none;
-                background: transparent;
-            }
-            QScrollBar:vertical {
-                border: none;
-                background: #1A1A1A;
-                width: 10px;
-                border-radius: 5px;
-            }
-            QScrollBar::handle:vertical {
-                background: #EBFE05;
-                border-radius: 5px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                border: none;
-                background: none;
-            }
-        """)
-        
-        # Catalysts container
-        self.catalysts_widget = QWidget()
-        catalysts_layout = QVBoxLayout(self.catalysts_widget)
-        catalysts_layout.setSpacing(10)
-        catalysts_layout.setContentsMargins(10, 10, 10, 10)
-        catalysts_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        scroll_area.setWidget(self.catalysts_widget)
-        
-        # Log display with neon border
+        scroll_area.setObjectName("catalystScrollArea")
+        # Apply theme styles later
+
+        # Use self.catalyst_scroll_content as the container for groups
+        self.catalyst_scroll_content = QWidget()
+        self.catalyst_layout = QVBoxLayout(self.catalyst_scroll_content)
+        self.catalyst_layout.setSpacing(5) # Reduced spacing between groups
+        self.catalyst_layout.setContentsMargins(5, 5, 5, 5) # Reduced margins
+        self.catalyst_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        scroll_area.setWidget(self.catalyst_scroll_content)
+
+        # --- Log Display ---
         self.log_display = LogDisplay()
-        self.log_display.setMinimumHeight(150)
-        self.log_display.text_widget.setStyleSheet(f"""
-            QLabel {{
-                background-color: {THEMES['dark']['background']};
-                color: {THEMES['dark']['text_secondary']};
-                padding: 15px;
-                font-family: 'JetBrains Mono';
-                font-size: 13px;
-                border: 2px solid {THEMES['dark']['text_secondary']};
-                border-radius: 10px;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-            }}
-        """)
-        
+        self.log_display.setMinimumHeight(100) # Reduced minimum height
+        self.log_display.setObjectName("logDisplay")
+        # Apply theme styles later
+
         self.splitter.addWidget(scroll_area)
         self.splitter.addWidget(self.log_display)
-        layout.addWidget(self.splitter)
-        
-        # Status bar with neon styling
-        status_bar = QWidget()
-        status_layout = QHBoxLayout(status_bar)
-        status_layout.setContentsMargins(10, 10, 10, 10)
-        status_layout.setSpacing(15)
-        
-        self.status_label = QLabel("Please authenticate to continue")
-        self.status_label.setStyleSheet(f"""
-            QLabel {{
-                color: {THEMES['dark']['accent']};
-                font-size: 16px;
-                font-weight: bold;
-                padding: 10px;
-                background-color: {THEMES['dark']['background']};
-                border: 2px solid {THEMES['dark']['accent']};
-                border-radius: 10px;
-                text-transform: uppercase;
-                letter-spacing: 2px;
-            }}
-        """)
-        
-        # Cache checkbox with neon styling
-        self.use_cache_checkbox = QCheckBox("Use cached data")
-        self.use_cache_checkbox.setChecked(True)
-        self.use_cache_checkbox.setStyleSheet(f"""
-            QCheckBox {{
-                color: {THEMES['dark']['accent']};
-                font-size: 14px;
-                font-weight: bold;
-                padding: 5px;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-            }}
-            QCheckBox::indicator {{
-                width: 20px;
-                height: 20px;
-                border-radius: 5px;
-                border: 2px solid {THEMES['dark']['accent']};
-            }}
-            QCheckBox::indicator:checked {{
-                background-color: {THEMES['dark']['accent']};
-            }}
-            QCheckBox::indicator:unchecked {{
-                background-color: {THEMES['dark']['background']};
-            }}
-        """)
-        
-        # Refresh button with neon styling
-        self.refresh_button = QPushButton("REFRESH CATALYSTS")
-        self.refresh_button.setDisabled(True)
-        self.refresh_button.setMinimumHeight(45)
-        self.refresh_button.setMinimumWidth(200)
-        self.refresh_button.setFont(FONTS['body'])
-        self.refresh_button.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {THEMES['dark']['background']};
-                color: {THEMES['dark']['secondary']};
-                border: 2px solid {THEMES['dark']['secondary']};
-                border-radius: 10px;
-            }}
-            QPushButton:disabled {{
-                background-color: {THEMES['dark']['surface']};
-                border-color: {THEMES['dark']['text_secondary']};
-                color: {THEMES['dark']['text_secondary']};
-            }}
-        """)
-        
-        status_layout.addWidget(self.status_label, 1)
-        status_layout.insertWidget(1, self.use_cache_checkbox)
-        status_layout.addWidget(self.refresh_button)
-        
-        layout.addWidget(status_bar)
-        
-        # Configure logging
-        root_logger = logging.getLogger()
-        root_logger.setLevel(logging.INFO)
-        
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-            
+        self.splitter.setStretchFactor(0, 3) # Give more space to catalysts initially
+        self.splitter.setStretchFactor(1, 1)
+        # Use main_layout here as well
+        main_layout.addWidget(self.splitter) 
+
+        # Configure logging handler to use the log display
         log_handler = LogHandler(self.log_display)
-        root_logger.addHandler(log_handler)
-        
-        self.splitter.setSizes([400, 200])
-        
-        # Load cached catalysts if available
-        self.load_cache()
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+        log_handler.setFormatter(formatter)
+        # Add handler only if not already added
+        if not any(isinstance(h, LogHandler) for h in root_logger.handlers):
+             root_logger.addHandler(log_handler)
 
-    def load_cache(self):
-        """Load cached catalyst data from file if it exists"""
+    def save_cache(self):
+        """Save current catalyst data to cache file."""
         try:
-            if os.path.exists(self.cache_file):
-                with open(self.cache_file, 'r') as f:
-                    cache_data = json.load(f)
-                    
-                # Check if cache is still valid (less than 1 day old)
-                cache_time = datetime.fromisoformat(cache_data.get('timestamp', '2000-01-01'))
-                if datetime.now() - cache_time < timedelta(days=1):
-                    self.cached_catalysts = cache_data.get('catalysts', {})
-                    logging.info(f"Loaded {len(self.cached_catalysts)} catalysts from cache")
-                else:
-                    logging.info("Cache is older than 1 day, will fetch fresh data")
-        except Exception as e:
-            logging.error(f"Error loading cache: {e}")
-            self.cached_catalysts = {}
-
-    def save_cache(self, catalysts):
-        """Save catalyst data to cache file"""
-        try:
-            # Convert list of catalysts to dictionary with hash as key
-            catalyst_dict = {str(c.get('recordHash')): c for c in catalysts if 'recordHash' in c}
-            
             cache_data = {
                 'timestamp': datetime.now().isoformat(),
-                'catalysts': catalyst_dict
+                'catalysts': self.discovered_catalysts # Save the current data
             }
             
-            with open(self.cache_file, 'w') as f:
-                json.dump(cache_data, f)
+            with open(self.cache_file, 'w') as f: # Use self.cache_file
+                json.dump(cache_data, f, indent=4)
                 
-            logging.info(f"Saved {len(catalyst_dict)} catalysts to cache")
+            logging.info(f"Saved {len(self.discovered_catalysts)} catalysts to {self.cache_file}")
         except Exception as e:
-            logging.error(f"Error saving cache: {e}")
+            logging.error(f"Error saving cache to {self.cache_file}: {e}")
 
     def authenticate(self):
-        """Authenticate with Bungie.net"""
-        self.status_label.setText("Authenticating with Bungie.net...")
-        logging.info("Starting authentication process...")
-        
-        # Initialize OAuthManager
-        from bungie_oauth import OAuthManager
-        
-        api_key = os.environ.get("BUNGIE_API_KEY", "")
-        if not api_key:
-            error_msg = "BUNGIE_API_KEY environment variable not set"
-            logging.error(error_msg)
-            self.status_label.setText(error_msg)
-            return
-            
-        logging.info("API key found, initializing OAuth manager...")
-        self.oauth_manager = OAuthManager()
-        
-        # Start authentication process
+        """Initiate the Bungie OAuth flow when the button is clicked."""
+        logging.info("Authentication button clicked, starting OAuth flow...")
         try:
-            logging.info("Starting OAuth flow...")
-            token_data = self.oauth_manager.start_auth(
-                auth_code_callback=lambda code: logging.info(f"Received auth code: {code}"),
-                error_callback=lambda error: logging.error(f"Auth error: {error}")
-            )
+            # Start the authentication flow (blocking)
+            token_data = self.oauth.start_auth() 
             
-            if not token_data:
-                error_msg = "Authentication failed. Please try again."
-                logging.error("No token data received from OAuth manager")
-                self.status_label.setText(error_msg)
-                return
-                
-            logging.info("Authentication successful, received token data")
-            self.status_label.setText("Authentication successful! Fetching catalysts...")
-            
-            # Enable mode selection and refresh button
-            logging.info("Enabling UI controls...")
-            self.discover_button.setEnabled(True)
-            self.refresh_button.setEnabled(True)
-            self.auth_button.setEnabled(False)
-            
-            # Initialize catalyst API with token
-            logging.info("Initializing Catalyst API...")
-            self.api = CatalystAPI(api_key, token_data["access_token"])
-            
-            # Start fetching catalysts
-            logging.info("Starting catalyst fetch...")
-            self.fetch_catalysts()
-            
+            if token_data:
+                logging.info("Manual authentication successful via button.")
+                self._update_auth_state(authenticated=True)
+            else:
+                # Auth failed or was cancelled by user closing browser etc.
+                logging.warning("Manual authentication failed or was cancelled.")
+                self._update_auth_state(authenticated=False) 
+                QMessageBox.warning(self, "Authentication Failed", 
+                                     "Could not authenticate with Bungie. Please check logs and ensure you complete the browser step.")
         except Exception as e:
-            error_msg = f"Authentication error: {str(e)}"
-            logging.error(error_msg, exc_info=True)  # This will log the full stack trace
-            self.status_label.setText(error_msg)
-        finally:
-            # Clean up OAuth server
-            if self.oauth_manager and self.oauth_manager.server:
-                logging.info("Stopping OAuth server...")
-                self.oauth_manager.stop_server()
+            logging.error(f"Error during manual authentication: {e}", exc_info=True)
+            self._update_auth_state(authenticated=False)
+            QMessageBox.critical(self, "Authentication Error", 
+                                  f"An unexpected error occurred during authentication: {e}")
 
     def fetch_catalysts(self):
-        """Fetch and display catalysts"""
-        if not self.api:
-            self.status_label.setText("Please authenticate first")
-            return
-            
-        # Clear existing catalysts
-        while self.catalysts_widget.layout().count():
-            item = self.catalysts_widget.layout().takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        root_logger.info("Starting catalyst fetch in desktop app...")
-        self.status_label.setText("Fetching catalysts...")
-        
-        # Check if we should use cached data
-        discover_mode = self.discover_button.isChecked()
-        use_cache = self.use_cache_checkbox.isChecked() and not discover_mode
-        
-        if use_cache and self.cached_catalysts:
-            # If we have cached data and user wants to use it, display from cache
-            logging.info("Using cached catalyst data")
-            catalysts = list(self.cached_catalysts.values())
-            # Sort catalysts by completion status and name
-            catalysts.sort(key=lambda c: (c.get('complete', False), c.get('name', '')))
-            for catalyst in catalysts:
-                self.handle_catalyst_found(catalyst)
-            self.handle_catalysts_finished()
-            return
-        
-        # Create and start catalyst thread
-        root_logger.info("Creating catalyst thread...")
+        """Fetch catalyst data using a background thread (triggered by button)."""
         if self.catalyst_thread and self.catalyst_thread.isRunning():
-            self.catalyst_thread.stop()
-            self.catalyst_thread.wait()
+            logging.warning("Catalyst fetch already in progress.")
+            return
             
-        self.catalyst_thread = CatalystThread(self.api, discover_mode)
+        # Clear previous results visually *before* fetching when manually triggered
+        self.clear_catalyst_display() 
+        self.update_progress_summary() # Reset summary to zero while fetching
+        # Clear the internal data dict as well, so handle_catalyst_found repopulates it cleanly
+        self.discovered_catalysts.clear() 
+
+        logging.info("Manual catalyst fetch triggered by button.")
+        try:
+            self.oauth.get_headers() 
+        except Exception as e:
+             logging.error(f"Cannot fetch catalysts: Authentication issue - {e}")
+             QMessageBox.critical(self, "Authentication Error", f"Cannot fetch catalysts. Please re-authenticate.\nError: {e}")
+             self._update_auth_state(authenticated=False)
+             return
+
+        # Use discovery mode based on button state
+        discovery_mode = self.discover_button.isChecked()
+
+        self.catalyst_thread = CatalystThread(self.api, discover_mode=discovery_mode)
         self.catalyst_thread.catalyst_found.connect(self.handle_catalyst_found)
         self.catalyst_thread.finished.connect(self.handle_catalysts_finished)
         self.catalyst_thread.error.connect(self.handle_catalysts_error)
         
-        root_logger.info("Starting catalyst thread...")
+        self.fetch_button.setText("Fetching...")
+        self.fetch_button.setEnabled(False)
+        self.discover_button.setEnabled(False)
+        self.control_panel.setEnabled(False)
         self.catalyst_thread.start()
+
+    def clear_catalyst_display(self):
+        """Removes all catalyst widgets and group widgets from the layout."""
+        # Clear existing groups first
+        for group_widget in list(self.weapon_groups.values()): # Iterate over a copy
+            group_widget.setParent(None)
+            group_widget.deleteLater()
+        self.weapon_groups.clear()
+        self.discovered_catalysts.clear() # Clear cache as well
+        
+        # You might need a placeholder if the layout becomes empty
+        # if self.catalyst_layout.count() == 0:
+        #    placeholder = QLabel("Click 'Fetch Catalysts' to begin.")
+        #    self.catalyst_layout.addWidget(placeholder)
 
     def handle_catalyst_found(self, catalyst_data):
         """Handle found catalyst"""
         is_discovered = catalyst_data.get('discovered', False)
         status_text = " [DISCOVERED]" if is_discovered else ""
-        root_logger.info(f"Found catalyst: {catalyst_data['name']}{status_text}")
+        catalyst_name = catalyst_data.get('name', 'Unknown')
+        logging.info(f"Found catalyst: {catalyst_name}{status_text}")
         
+        # Ensure hash exists before proceeding
+        record_hash = catalyst_data.get('recordHash')
+        if not record_hash:
+            logging.warning(f"Skipping catalyst without recordHash: {catalyst_name}")
+            return
+
+        record_hash_str = str(record_hash)
+
+        # Update internal dictionary
+        self.discovered_catalysts[record_hash_str] = catalyst_data
+
+        # Create or update widget
         widget = CatalystWidget(catalyst_data, self.theme_toggle)
         
         # Get or create weapon type group
         weapon_type = catalyst_data.get('weaponType', 'Unknown')
         group = self.get_or_create_weapon_group(weapon_type)
         group.add_widget(widget)
-        
-        # Add to collected catalysts for caching
-        if 'recordHash' in catalyst_data and (not is_discovered or self.discover_button.isChecked()):
-            self.cached_catalysts[str(catalyst_data['recordHash'])] = catalyst_data
             
-        # Update progress summary
+        # Update progress summary (which now uses discovered_catalysts)
         self.update_progress_summary()
 
     def get_or_create_weapon_group(self, weapon_type):
         """Get existing weapon type group or create new one"""
         # Look for existing group
-        layout = self.catalysts_widget.layout()
+        layout = self.catalyst_layout
         for i in range(layout.count()):
             widget = layout.itemAt(i).widget()
             if isinstance(widget, CollapsibleGroup) and widget.header.text()[2:] == weapon_type:
@@ -1000,21 +923,49 @@ class DestinyApp(QMainWindow):
         return group
 
     def handle_catalysts_finished(self):
-        """Handle finished catalyst fetch"""
-        mode_text = "discovery" if self.discover_button.isChecked() else "standard"
-        root_logger.info(f"Catalyst fetch complete in {mode_text} mode")
+        logging.info("Catalyst fetch finished.")
+        self.fetch_button.setText("Fetch Catalysts")
+        # Re-enable buttons based on auth state (should still be true)
+        is_authenticated = False
+        try:
+            self.oauth.get_headers()
+            is_authenticated = True
+        except:
+            is_authenticated = False
         
-        # Save catalysts to cache (even in discovery mode to remember found items)
-        self.save_cache(list(self.cached_catalysts.values()))
+        if is_authenticated:
+             self.fetch_button.setEnabled(True)
+             self.discover_button.setEnabled(True)
+             self.control_panel.setEnabled(True) # Re-enable controls
+        else:
+             self._update_auth_state(authenticated=False) # Update if auth somehow failed
+
+        # Save cache after successful fetch (now saves discovered_catalysts)
+        self.save_cache()
         
-        # Show count in status bar
-        count = self.catalysts_widget.layout().count()
-        self.status_label.setText(f"Found {count} catalysts in {mode_text} mode")
+        # Update summary after loading/fetching is complete
+        self.update_progress_summary()
 
     def handle_catalysts_error(self, error):
-        """Handle catalyst fetch error"""
-        root_logger.error(f"Error fetching catalysts in desktop app: {error}")
-        self.status_label.setText(f"Error fetching catalysts: {error}")
+        logging.error(f"Error received from catalyst thread: {error}")
+        self.fetch_button.setText("Fetch Catalysts")
+        QMessageBox.critical(self, "Fetch Error", f"Could not fetch catalyst data:\n{error}")
+        # Check auth state again after error
+        is_authenticated = False
+        try:
+            self.oauth.get_headers()
+            is_authenticated = True
+        except Exception as auth_e:
+            logging.warning(f"Authentication check failed after fetch error: {auth_e}")
+            is_authenticated = False
+
+        if is_authenticated:
+             self.fetch_button.setEnabled(True)
+             self.discover_button.setEnabled(True)
+             self.control_panel.setEnabled(True) # Re-enable controls
+        else:
+             # If authentication failed, update UI state
+             self._update_auth_state(authenticated=False)
 
     def toggle_discovery_mode(self):
         """Toggle between discovery mode and standard mode"""
@@ -1027,24 +978,42 @@ class DestinyApp(QMainWindow):
             self.fetch_catalysts()
 
     def update_progress_summary(self):
-        """Update the progress summary stats"""
-        total = len(self.cached_catalysts)
-        completed = sum(1 for c in self.cached_catalysts.values() if c.get('progress', 0) == 100)
-        in_progress = sum(1 for c in self.cached_catalysts.values() if 0 < c.get('progress', 0) < 100)
-        
+        """Update the progress summary stats using discovered_catalysts."""
+        # Use self.discovered_catalysts now
+        catalysts_data = self.discovered_catalysts.values()
+        total = len(catalysts_data)
+        completed = sum(1 for c in catalysts_data if c.get('complete', False)) # Use 'complete' flag
+        # Calculate in_progress based on objectives within each catalyst
+        in_progress = 0
+        for c in catalysts_data:
+            if not c.get('complete', False):
+                 has_progress = False
+                 objectives = c.get('objectives', [])
+                 if objectives:
+                      # Check if *any* objective has progress but is not complete
+                      for obj in objectives:
+                           if 0 < obj.get('progress', 0) < obj.get('completion', 1):
+                                has_progress = True
+                                break
+                 if has_progress:
+                      in_progress += 1
+            
         # Update the labels in the control panel
         summary_frame = self.control_panel.findChild(QFrame)
         if summary_frame:
-            stats = summary_frame.findChildren(QLabel)
-            value_labels = [s for s in stats if s.text().isdigit() or s.text() == '0']
+            # Find labels more reliably (maybe by object name?)
+            # Assuming order for now:
+            value_labels = summary_frame.findChildren(QLabel)[1::2] # Get every second label (the values)
             if len(value_labels) >= 3:
                 value_labels[0].setText(str(total))
                 value_labels[1].setText(str(completed))
                 value_labels[2].setText(str(in_progress))
+            else:
+                logging.warning("Could not find all progress summary labels to update.")
 
     def filter_catalysts(self, filter_type):
         """Filter catalysts based on progress"""
-        layout = self.catalysts_widget.layout()
+        layout = self.catalyst_layout
         for i in range(layout.count()):
             group = layout.itemAt(i).widget()
             if isinstance(group, CollapsibleGroup):
@@ -1074,7 +1043,7 @@ class DestinyApp(QMainWindow):
     def search_catalysts(self, search_text):
         """Search catalysts by name"""
         search_text = search_text.lower()
-        layout = self.catalysts_widget.layout()
+        layout = self.catalyst_layout
         
         for i in range(layout.count()):
             group = layout.itemAt(i).widget()
@@ -1096,7 +1065,7 @@ class DestinyApp(QMainWindow):
     
     def sort_catalysts(self, sort_by):
         """Sort catalysts by the selected criteria"""
-        layout = self.catalysts_widget.layout()
+        layout = self.catalyst_layout
         groups = []
         
         # Collect all groups
