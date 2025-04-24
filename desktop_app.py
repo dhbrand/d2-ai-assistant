@@ -700,12 +700,7 @@ class DestinyApp(QMainWindow):
         # Top bar with neon buttons
         top_bar_widget = QFrame()
         top_bar_layout = QHBoxLayout(top_bar_widget)
-        top_bar_layout.setContentsMargins(10, 5, 10, 5) # Reduced vertical margins
-
-        # Title Label (Optional, if needed)
-        # title_label = QLabel("Destiny 2 Catalyst Tracker")
-        # title_label.setFont(FONTS['heading']) 
-        # top_bar_layout.addWidget(title_label)
+        top_bar_layout.setContentsMargins(10, 5, 10, 5)
 
         # Spacer
         top_bar_layout.addStretch(1)
@@ -713,29 +708,29 @@ class DestinyApp(QMainWindow):
         # Authentication Button
         self.auth_button = QPushButton("Authenticate with Bungie")
         self.auth_button.setFont(FONTS['body'])
-        self.auth_button.setIcon(QIcon.fromTheme("security-high")) # Example icon
+        self.auth_button.setIcon(QIcon.fromTheme("security-high"))
         self.auth_button.setToolTip("Authenticate with Bungie.net to fetch your catalyst data")
         self.auth_button.clicked.connect(self.authenticate)
-        self.auth_button.setEnabled(True) # Start enabled, will be updated by _update_auth_state
+        self.auth_button.setEnabled(True)
         top_bar_layout.addWidget(self.auth_button)
 
         # Fetch Button
         self.fetch_button = QPushButton("Fetch Catalysts")
         self.fetch_button.setFont(FONTS['body'])
-        self.fetch_button.setIcon(QIcon.fromTheme("view-refresh")) # Example icon
+        self.fetch_button.setIcon(QIcon.fromTheme("view-refresh"))
         self.fetch_button.setToolTip("Fetch the latest catalyst progress")
         self.fetch_button.clicked.connect(self.fetch_catalysts)
-        self.fetch_button.setEnabled(False) # Start disabled until authenticated
+        self.fetch_button.setEnabled(False)
         top_bar_layout.addWidget(self.fetch_button)
         
         # Discovery Mode Button
         self.discover_button = QPushButton("Discover New")
         self.discover_button.setFont(FONTS['body'])
-        self.discover_button.setIcon(QIcon.fromTheme("system-search")) # Example icon
+        self.discover_button.setIcon(QIcon.fromTheme("system-search"))
         self.discover_button.setCheckable(True)
         self.discover_button.setToolTip("Run in discovery mode to find potentially new/missing catalysts (slower)")
         self.discover_button.clicked.connect(self.toggle_discovery_mode)
-        self.discover_button.setEnabled(False) # Start disabled until authenticated
+        self.discover_button.setEnabled(False)
         top_bar_layout.addWidget(self.discover_button)
 
         # Theme Toggle Button
@@ -743,55 +738,59 @@ class DestinyApp(QMainWindow):
         self.theme_toggle.toggled.connect(self.toggle_theme)
         top_bar_layout.addWidget(self.theme_toggle)
 
-        main_layout.addWidget(top_bar_widget) # Add top bar to main layout
+        main_layout.addWidget(top_bar_widget)
 
         # --- Control Panel ---
         self.control_panel = ControlPanel(self)
         self.control_panel.search_bar.textChanged.connect(self.search_catalysts)
         self.control_panel.sort_combo.currentTextChanged.connect(self.sort_catalysts)
-        # Connect filter buttons (Iterate directly over the list)
+        # Connect filter buttons
         for btn in self.control_panel.filter_buttons:
             btn.clicked.connect(lambda checked, b=btn: self.control_panel.handle_filter_click(b))
-        self.control_panel.filter_buttons[0].setChecked(True) # Corrected access
-        self.control_panel.setEnabled(False) # Start disabled until authenticated
+        self.control_panel.filter_buttons[0].setChecked(True)
+        self.control_panel.setEnabled(False)
+        
+        # Initialize summary labels
+        self.summary_labels = {}
+        summary_frame = self.control_panel.findChild(QFrame)
+        if summary_frame:
+            value_labels = summary_frame.findChildren(QLabel)[1::2]  # Get every second label (the values)
+            if len(value_labels) >= 3:
+                self.summary_labels['total'] = value_labels[0]
+                self.summary_labels['completed'] = value_labels[1]
+                self.summary_labels['in_progress'] = value_labels[2]
+        
         main_layout.addWidget(self.control_panel)
 
         # --- Catalyst Scroll Area ---
-        # Splitter for scroll area and log display
         self.splitter = QSplitter(Qt.Orientation.Vertical)
-        # Apply theme styles later in apply_theme if needed
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setObjectName("catalystScrollArea")
-        # Apply theme styles later
 
-        # Use self.catalyst_scroll_content as the container for groups
         self.catalyst_scroll_content = QWidget()
         self.catalyst_layout = QVBoxLayout(self.catalyst_scroll_content)
-        self.catalyst_layout.setSpacing(5) # Reduced spacing between groups
-        self.catalyst_layout.setContentsMargins(5, 5, 5, 5) # Reduced margins
+        self.catalyst_layout.setSpacing(5)
+        self.catalyst_layout.setContentsMargins(5, 5, 5, 5)
         self.catalyst_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         scroll_area.setWidget(self.catalyst_scroll_content)
 
         # --- Log Display ---
         self.log_display = LogDisplay()
-        self.log_display.setMinimumHeight(100) # Reduced minimum height
+        self.log_display.setMinimumHeight(100)
         self.log_display.setObjectName("logDisplay")
-        # Apply theme styles later
 
         self.splitter.addWidget(scroll_area)
         self.splitter.addWidget(self.log_display)
-        self.splitter.setStretchFactor(0, 3) # Give more space to catalysts initially
+        self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 1)
-        # Use main_layout here as well
-        main_layout.addWidget(self.splitter) 
+        main_layout.addWidget(self.splitter)
 
-        # Configure logging handler to use the log display
+        # Configure logging handler
         log_handler = LogHandler(self.log_display)
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
         log_handler.setFormatter(formatter)
-        # Add handler only if not already added
         if not any(isinstance(h, LogHandler) for h in root_logger.handlers):
              root_logger.addHandler(log_handler)
 
@@ -983,37 +982,34 @@ class DestinyApp(QMainWindow):
 
     def update_progress_summary(self):
         """Update the progress summary stats using discovered_catalysts."""
-        # Use self.discovered_catalysts now
+        if not hasattr(self, 'summary_labels'):
+            return
+
         catalysts_data = self.discovered_catalysts.values()
         total = len(catalysts_data)
-        completed = sum(1 for c in catalysts_data if c.get('complete', False)) # Use 'complete' flag
+        completed = sum(1 for c in catalysts_data if c.get('complete', False))
+        
         # Calculate in_progress based on objectives within each catalyst
         in_progress = 0
         for c in catalysts_data:
             if not c.get('complete', False):
-                 has_progress = False
-                 objectives = c.get('objectives', [])
-                 if objectives:
-                      # Check if *any* objective has progress but is not complete
-                      for obj in objectives:
-                           if 0 < obj.get('progress', 0) < obj.get('completion', 1):
-                                has_progress = True
-                                break
-                 if has_progress:
-                      in_progress += 1
-            
-        # Update the labels in the control panel
-        summary_frame = self.control_panel.findChild(QFrame)
-        if summary_frame:
-            # Find labels more reliably (maybe by object name?)
-            # Assuming order for now:
-            value_labels = summary_frame.findChildren(QLabel)[1::2] # Get every second label (the values)
-            if len(value_labels) >= 3:
-                value_labels[0].setText(str(total))
-                value_labels[1].setText(str(completed))
-                value_labels[2].setText(str(in_progress))
-            else:
-                logging.warning("Could not find all progress summary labels to update.")
+                has_progress = False
+                objectives = c.get('objectives', [])
+                if objectives:
+                    for obj in objectives:
+                        if 0 < obj.get('progress', 0) < obj.get('completion', 1):
+                            has_progress = True
+                            break
+                if has_progress:
+                    in_progress += 1
+
+        # Update the summary labels
+        if 'total' in self.summary_labels:
+            self.summary_labels['total'].setText(str(total))
+        if 'completed' in self.summary_labels:
+            self.summary_labels['completed'].setText(str(completed))
+        if 'in_progress' in self.summary_labels:
+            self.summary_labels['in_progress'].setText(str(in_progress))
 
     def filter_catalysts(self, filter_type):
         """Filter catalysts based on progress"""
