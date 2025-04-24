@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import threading
 import json
 from datetime import datetime, timedelta
+from catalyst_db import CatalystDB
 
 # Load environment variables
 load_dotenv()
@@ -480,61 +481,62 @@ class DestinyApp(QMainWindow):
         super().__init__()
         self.current_theme = 'dark'
         self.setWindowTitle("Destiny 2 Catalyst Tracker")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setMinimumSize(800, 600)
+        
+        # Initialize theme toggle first
+        self.theme_toggle = ThemeToggleButton()
+        self.theme_toggle.toggled.connect(self.toggle_theme)
+        
         self.oauth = OAuthManager()
         self.api = CatalystAPI(self.oauth)
         self.catalyst_thread = None
-        self.cache_file = "catalyst_cache.json" # Define cache file path
-        self.discovered_catalysts = {} # Use this for current session data
+        self.discovered_catalysts = {}
         self.weapon_groups = {}
         self.control_panel = None
 
+        # Initialize database
+        self.db = CatalystDB()
+        
+        # Center and maximize window
+        self.setGeometry(100, 100, 1200, 800)  # Set initial size
+        self.centerWindow()
+        self.showMaximized()  # This will use the macOS maximize behavior
+        
         # Apply initial theme and setup UI
         self.apply_theme(is_light=False)
         self.setup_animations()
         self.setup_ui()
-
-        # Load and display data from cache immediately after UI setup
-        self.load_and_display_cache()
+        
+        # Load cached data if available (after UI setup)
+        self.load_cache()
 
         # Attempt to validate token (doesn't trigger fetch anymore)
         self._check_initial_auth_status()
 
-    def load_and_display_cache(self):
-        """Load data from cache file and populate the UI if valid."""
-        loaded_from_cache = False
+    def centerWindow(self):
+        """Center the window on the screen"""
+        screen = QApplication.primaryScreen().geometry()
+        size = self.geometry()
+        x = (screen.width() - size.width()) // 2
+        y = (screen.height() - size.height()) // 2
+        self.move(x, y)
+        
+    def load_cache(self):
+        """Load data from database and populate the UI if valid."""
         try:
-            if os.path.exists(self.cache_file):
-                with open(self.cache_file, 'r') as f:
-                    cache_data = json.load(f)
-                    
-                # Check if cache is still valid (e.g., less than 1 day old)
-                cache_time_str = cache_data.get('timestamp')
-                if cache_time_str:
-                    cache_time = datetime.fromisoformat(cache_time_str)
-                    if datetime.now() - cache_time < timedelta(days=1):
-                        self.discovered_catalysts = cache_data.get('catalysts', {})
-                        logging.info(f"Loaded {len(self.discovered_catalysts)} catalysts from valid cache.")
-                        # Populate UI with cached data
-                        self.populate_ui_from_discovered_data()
-                        loaded_from_cache = True
-                    else:
-                        logging.info("Cache exists but is older than 1 day. Needs refresh.")
-                else:
-                    logging.warning("Cache file found but missing timestamp.")
-            else:
-                logging.info(f"Cache file {self.cache_file} not found.")
-        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError) as e:
-            logging.error(f"Error loading or parsing cache file {self.cache_file}: {e}")
-            # Optionally delete corrupted cache?
-            # if os.path.exists(self.cache_file):
-            #     os.remove(self.cache_file)
-            self.discovered_catalysts = {}
-
-        # If cache wasn't loaded or was invalid, ensure UI is clear
-        if not loaded_from_cache:
-            self.clear_catalyst_display()
-            self.update_progress_summary() # Ensure summary shows zeros
+            # Get all catalysts from database
+            catalysts = self.db.get_all_catalysts()
+            if catalysts:
+                self.discovered_catalysts = {str(cat['recordHash']): cat for cat in catalysts}
+                logging.info(f"Loaded {len(catalysts)} catalysts from database")
+                
+                # Update UI with loaded data
+                self.clear_catalyst_display()
+                for catalyst in catalysts:
+                    self.handle_catalyst_found(catalyst)
+                self.update_progress_summary()
+        except Exception as e:
+            logging.error(f"Error loading from database: {e}")
 
     def populate_ui_from_discovered_data(self):
         """Clears and refills the UI based on self.discovered_catalysts."""
@@ -794,19 +796,14 @@ class DestinyApp(QMainWindow):
              root_logger.addHandler(log_handler)
 
     def save_cache(self):
-        """Save current catalyst data to cache file."""
+        """Save current catalyst data to database."""
         try:
-            cache_data = {
-                'timestamp': datetime.now().isoformat(),
-                'catalysts': self.discovered_catalysts # Save the current data
-            }
-            
-            with open(self.cache_file, 'w') as f: # Use self.cache_file
-                json.dump(cache_data, f, indent=4)
-                
-            logging.info(f"Saved {len(self.discovered_catalysts)} catalysts to {self.cache_file}")
+            # Store each catalyst in the database
+            for catalyst in self.discovered_catalysts.values():
+                self.db.store_catalyst(catalyst)
+            logging.info(f"Saved {len(self.discovered_catalysts)} catalysts to database")
         except Exception as e:
-            logging.error(f"Error saving cache to {self.cache_file}: {e}")
+            logging.error(f"Error saving to database: {e}")
 
     def authenticate(self):
         """Initiate the Bungie OAuth flow when the button is clicked."""
@@ -868,16 +865,17 @@ class DestinyApp(QMainWindow):
     def clear_catalyst_display(self):
         """Removes all catalyst widgets and group widgets from the layout."""
         # Clear existing groups first
-        for group_widget in list(self.weapon_groups.values()): # Iterate over a copy
+        for group_widget in list(self.weapon_groups.values()):
             group_widget.setParent(None)
             group_widget.deleteLater()
         self.weapon_groups.clear()
-        self.discovered_catalysts.clear() # Clear cache as well
+        self.discovered_catalysts.clear()
         
-        # You might need a placeholder if the layout becomes empty
-        # if self.catalyst_layout.count() == 0:
-        #    placeholder = QLabel("Click 'Fetch Catalysts' to begin.")
-        #    self.catalyst_layout.addWidget(placeholder)
+        # Clear database
+        try:
+            self.db.clear_old_data(max_age_days=0)  # Clear all data
+        except Exception as e:
+            logging.error(f"Error clearing database: {e}")
 
     def handle_catalyst_found(self, catalyst_data):
         """Handle found catalyst"""
@@ -897,6 +895,12 @@ class DestinyApp(QMainWindow):
         # Update internal dictionary
         self.discovered_catalysts[record_hash_str] = catalyst_data
 
+        # Store in database
+        try:
+            self.db.store_catalyst(catalyst_data)
+        except Exception as e:
+            logging.error(f"Error storing catalyst {catalyst_name} in database: {e}")
+
         # Create or update widget
         widget = CatalystWidget(catalyst_data, self.theme_toggle)
         
@@ -905,7 +909,7 @@ class DestinyApp(QMainWindow):
         group = self.get_or_create_weapon_group(weapon_type)
         group.add_widget(widget)
             
-        # Update progress summary (which now uses discovered_catalysts)
+        # Update progress summary
         self.update_progress_summary()
 
     def get_or_create_weapon_group(self, weapon_type):
@@ -1098,6 +1102,15 @@ class DestinyApp(QMainWindow):
         # Add sorted groups back to layout
         for group in groups:
             layout.addWidget(group)
+
+    def keyPressEvent(self, event):
+        """Handle key press events"""
+        if event.key() == Qt.Key.Key_F11:
+            if self.isMaximized():
+                self.showNormal()
+            else:
+                self.showMaximized()
+        super().keyPressEvent(event)
 
 def main():
     app = QApplication(sys.argv)
