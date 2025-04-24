@@ -1,92 +1,96 @@
-# Destiny 2 Catalyst Tracker Web Application
+# Destiny 2 Catalyst Tracker
 
-A modern web application for tracking Destiny 2 catalyst progress, built with React and FastAPI.
-
-## Project Structure
-
-```
-web-app/
-├── frontend/         # React frontend
-└── backend/          # FastAPI backend
-```
-
-## Development Setup
-
-### Backend Setup
-
-1. Navigate to the backend directory:
-   ```bash
-   cd web-app/backend
-   ```
-
-2. Create a virtual environment:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Create a `.env` file with your Bungie API credentials:
-   ```
-   BUNGIE_API_KEY=your_api_key
-   BUNGIE_CLIENT_ID=your_client_id
-   BUNGIE_CLIENT_SECRET=your_client_secret
-   ```
-
-5. Run the backend server:
-   ```bash
-   uvicorn main:app --reload
-   ```
-
-### Frontend Setup
-
-1. Navigate to the frontend directory:
-   ```bash
-   cd web-app/frontend
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-3. Start the development server:
-   ```bash
-   npm start
-   ```
+A desktop and web application for tracking your Destiny 2 exotic catalyst progress.
 
 ## Features
 
-- Modern, responsive UI
-- Real-time catalyst progress tracking
-- Authentication with Bungie.net
-- Progress visualization
-- Search and filter functionality
-- Cross-platform support
+- Track completion progress for all Destiny 2 exotic catalysts
+- Automatic data synchronization with Bungie.net API
+- Dark/Light theme support
+- Cross-platform desktop application (Windows, macOS, Linux)
+- Web interface for mobile access
 
-## Technology Stack
+## Prerequisites
 
-- Frontend:
-  - React
-  - Material-UI
-  - Recharts
-  - Axios
+- Python 3.8 or higher
+- Node.js 16 or higher
+- npm 8 or higher
 
-- Backend:
-  - FastAPI
-  - SQLAlchemy
-  - Bungie API Integration
+## Development Setup
 
-## Development Status
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/destiny2-catalyst-tracker.git
+cd destiny2-catalyst-tracker
+```
 
-This is a work in progress. Current focus:
-- [ ] Complete backend API implementation
-- [ ] Implement frontend components
-- [ ] Add authentication flow
-- [ ] Implement data persistence
-- [ ] Add progress visualization
-- [ ] Implement search and filter functionality 
+2. Run the development setup script:
+```bash
+cd web-app
+chmod +x setup_dev.sh
+./setup_dev.sh
+```
+
+The setup script will:
+- Create and activate a Python virtual environment
+- Install backend dependencies
+- Run backend tests
+- Install frontend dependencies
+- Run frontend tests
+
+## Running the Application
+
+### Desktop Application
+
+```bash
+python desktop_app.py
+```
+
+### Web Application
+
+1. Start the backend server:
+```bash
+cd web-app/backend
+source venv/bin/activate  # On Windows: .\venv\Scripts\activate
+uvicorn main:app --reload
+```
+
+2. Start the frontend development server:
+```bash
+cd web-app/frontend
+npm run dev
+```
+
+The web application will be available at `http://localhost:3000`
+
+## Testing
+
+### Backend Tests
+```bash
+cd web-app/backend
+source venv/bin/activate  # On Windows: .\venv\Scripts\activate
+pytest
+```
+
+### Frontend Tests
+```bash
+cd web-app/frontend
+npm test
+```
+
+## Contributing
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgments
+
+- Bungie for providing the Destiny 2 API
+- The Destiny 2 community for their support and feedback 
