@@ -11,6 +11,7 @@ from bungie_oauth import OAuthManager
 from models import init_db, User, Catalyst
 from sqlalchemy.orm import Session
 from catalyst import CatalystAPI
+import logging
 
 # Load environment variables
 load_dotenv()
@@ -20,17 +21,27 @@ app = FastAPI(title="Destiny 2 Catalyst Tracker API")
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # React dev server
+    allow_origins=["https://localhost:3000"],  # React dev server with HTTPS
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize database
-db = init_db()
+# Initialize database - get the factory from the function call
+engine, SessionLocal = init_db()
+
+# Dependency to get DB session per request
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # Initialize OAuth manager
 oauth_manager = OAuthManager()
+
+logger = logging.getLogger(__name__)
 
 class CatalystBase(BaseModel):
     recordHash: str
@@ -52,16 +63,46 @@ class TokenData(BaseModel):
     refresh_token: str
     expires_in: int
 
-def get_current_user(token: str = Depends(oauth_manager.get_headers)) -> User:
+def get_current_user(token_header: dict = Depends(oauth_manager.get_headers), db: Session = Depends(get_db)) -> User:
+    logger.info("[DEBUG] Entering get_current_user")
     try:
+        logger.info(f"[DEBUG] Received token_header: {token_header}")
+        if not isinstance(token_header, dict) or 'Authorization' not in token_header:
+             logger.error("[DEBUG] Invalid token header format received from get_headers")
+             raise ValueError("Invalid token header format")
+             
+        auth_header = token_header['Authorization']
+        if not auth_header.startswith("Bearer "):
+             logger.error("[DEBUG] Authorization header missing 'Bearer ' prefix")
+             raise ValueError("Invalid Bearer token format")
+             
+        token = auth_header.split(" ")[1]
+        logger.info(f"[DEBUG] Extracted token: {token[:10]}...")
+        
+        logger.info("[DEBUG] Calling oauth_manager.get_bungie_id")
         bungie_id = oauth_manager.get_bungie_id(token)
+        logger.info(f"[DEBUG] Got bungie_id: {bungie_id}")
+        
+        # Use the injected session 'db' instead of 'session'
         user = db.query(User).filter(User.bungie_id == bungie_id).first()
+        
         if not user:
-            user = User(bungie_id=bungie_id, access_token=token)
-            db.add(user)
+            logger.info(f"[DEBUG] User with bungie_id {bungie_id} not found in DB. Creating new user.")
+            new_user = User(bungie_id=bungie_id, access_token=token) # Store token if needed
+            db.add(new_user)
             db.commit()
-        return user
+            db.refresh(new_user)
+            logger.info(f"[DEBUG] Created new user with ID: {new_user.id}")
+            return new_user
+        else:
+             logger.info(f"[DEBUG] Found user in DB with ID: {user.id}")
+             # Optionally update the access token
+             # user.access_token = token
+             # db.commit()
+             return user
+             
     except Exception as e:
+        logger.error(f"[DEBUG] Exception in get_current_user: {e}", exc_info=True)
         raise HTTPException(status_code=401, detail="Invalid authentication")
 
 @app.get("/")
@@ -78,9 +119,14 @@ async def get_auth_url():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/auth/callback")
-async def auth_callback(code: str):
+async def auth_callback(request: Request):
     """Handle the OAuth callback and exchange code for tokens"""
     try:
+        data = await request.json()
+        code = data.get('code')
+        if not code:
+            raise HTTPException(status_code=400, detail="Code parameter is required")
+        
         token_data = oauth_manager.handle_callback(code)
         return {"status": "success", "token_data": token_data}
     except Exception as e:
@@ -92,7 +138,7 @@ async def verify_token(current_user: User = Depends(get_current_user)):
     return {"status": "valid", "bungie_id": current_user.bungie_id}
 
 @app.get("/catalysts", response_model=List[CatalystResponse])
-async def get_catalysts(current_user: User = Depends(get_current_user)):
+async def get_catalysts(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get all catalysts for the authenticated user"""
     try:
         # Initialize CatalystAPI with the user's token
@@ -136,6 +182,7 @@ async def get_catalysts(current_user: User = Depends(get_current_user)):
         return updated_catalysts
         
     except Exception as e:
+        # db.rollback() # Optionally rollback on error
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":

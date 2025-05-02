@@ -1,24 +1,53 @@
-import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useState, useEffect, useRef } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
 import {
   Box,
   Button,
   Typography,
   Container,
   Paper,
+  CircularProgress,
 } from '@mui/material';
 import { useAuth } from '../contexts/AuthContext';
 
 const Login = () => {
-  const { login, error } = useAuth();
+  const { login, handleCallback, error } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
+  const [isLoading, setIsLoading] = useState(false);
+  const hasCalledCallback = useRef(false);
 
-  const handleLogin = async () => {
-    try {
-      await login();
-    } catch (err) {
-      console.error('Login failed:', err);
+  useEffect(() => {
+    const query = new URLSearchParams(location.search);
+    const code = query.get('code');
+    const state = query.get('state');
+
+    if (code && !hasCalledCallback.current) {
+      console.log('Authorization code detected, processing callback...');
+      hasCalledCallback.current = true;
+      setIsLoading(true);
+
+      handleCallback(code, state)
+        .then(() => {
+          console.log('OAuth callback handling complete, navigating...');
+          navigate('/');
+        })
+        .catch(err => {
+          console.error('OAuth callback handling failed:', err);
+        })
+        .finally(() => {
+          setIsLoading(false);
+        });
     }
+  }, [location, handleCallback, navigate]);
+
+  const handleLogin = async (e) => {
+    if (e) e.preventDefault(); // Prevents page reload
+    localStorage.removeItem('bungie_token');
+    localStorage.removeItem('oauth_state');
+    setIsLoading(true);
+    await login();
+    setIsLoading(false);
   };
 
   return (
@@ -57,6 +86,8 @@ const Login = () => {
             variant="contained"
             color="primary"
             onClick={handleLogin}
+            type="button"
+            disabled={isLoading}
             sx={{
               mt: 2,
               py: 1.5,
@@ -69,7 +100,11 @@ const Login = () => {
               },
             }}
           >
-            Sign in with Bungie
+            {isLoading ? (
+              <CircularProgress size={24} color="inherit" />
+            ) : (
+              'Sign in with Bungie'
+            )}
           </Button>
 
           {error && (

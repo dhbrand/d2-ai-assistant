@@ -12,7 +12,6 @@ import {
   LinearProgress,
   Card,
   CardContent,
-  IconButton,
   Chip,
   useTheme,
 } from '@mui/material';
@@ -21,35 +20,19 @@ import {
   Sort as SortIcon,
   FilterList as FilterIcon,
 } from '@mui/icons-material';
-import axios from 'axios';
 
 const Dashboard = () => {
   const theme = useTheme();
   const [catalysts, setCatalysts] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [sortBy, setSortBy] = useState('name');
   const [filterBy, setFilterBy] = useState('all');
 
   useEffect(() => {
-    fetchCatalysts();
+    // We've removed the fetchCatalysts call
   }, []);
-
-  const fetchCatalysts = async () => {
-    try {
-      const token = localStorage.getItem('bungie_token');
-      const response = await axios.get('/api/catalysts', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setCatalysts(response.data);
-    } catch (err) {
-      setError('Failed to fetch catalysts');
-      console.error('Error fetching catalysts:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const filteredCatalysts = catalysts
     .filter(catalyst => {

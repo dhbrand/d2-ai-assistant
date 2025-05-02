@@ -28,8 +28,8 @@ class Catalyst(Base):
     user_id = Column(Integer, ForeignKey('users.id'))
     user = relationship('User', back_populates='catalysts')
 
-def init_db(database_url='sqlite:///catalysts.db'):
-    engine = create_engine(database_url)
-    Base.metadata.create_all(engine)
-    Session = sessionmaker(bind=engine)
-    return Session() 
+def init_db(database_url='sqlite:///./catalysts.db'):
+    engine = create_engine(database_url, connect_args={"check_same_thread": False})
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    return engine, SessionLocal 
