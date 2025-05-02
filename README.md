@@ -1,6 +1,67 @@
 # Destiny 2 Catalyst Tracker
 
-A desktop and web application for tracking your Destiny 2 exotic catalyst progress.
+A tool to track your Destiny 2 catalyst collection and progress.
+
+## Repository Structure
+
+This repository contains two versions of the Destiny 2 Catalyst Tracker:
+
+- **desktop-app/**: Terminal-based Python application (original version)
+- **web-app/**: Modern web application with React frontend and FastAPI backend
+- **common/**: Shared resources used by both applications
+
+## Web Application (Recommended)
+
+The web application offers a modern, user-friendly interface for tracking your Destiny 2 catalysts.
+
+### Setup
+
+1. Navigate to the web-app directory:
+   ```bash
+   cd web-app
+   ```
+
+2. Follow the instructions in the [web-app README](web-app/README.md).
+
+## Desktop Application (Legacy)
+
+The desktop application is a command-line tool written in Python.
+
+### Setup
+
+1. Navigate to the desktop-app directory:
+   ```bash
+   cd desktop-app
+   ```
+
+2. Follow the instructions in the [desktop-app README](desktop-app/README.md).
+
+## Common Resources
+
+Both applications share resources in the `common/` directory, including:
+
+- **Database**: SQLite database for storing catalyst data
+- **API Data**: Cached API responses and manifest data
+
+## Development
+
+### Generate SSL Certificates
+
+For local development with HTTPS:
+
+```bash
+python generate_cert.py
+```
+
+### Requirements
+
+- Python 3.9+
+- Node.js 16+
+- Bungie.net API key (obtain from [Bungie Developer Portal](https://www.bungie.net/en/Application))
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Features
 
@@ -85,10 +146,6 @@ npm test
 3. Commit your changes (`git commit -m 'Add some amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Acknowledgments
 
