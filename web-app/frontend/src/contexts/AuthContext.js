@@ -2,7 +2,6 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import axios from 'axios';
 
 const API_URL = 'https://localhost:8000';
-const DEBUG = true; // Enable debug mode
 
 // Configure axios to handle HTTPS requests
 axios.defaults.httpsAgent = {
@@ -26,42 +25,84 @@ export const AuthProvider = ({ children }) => {
 
   useEffect(() => {
     checkAuthStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const checkAuthStatus = async () => {
+    setIsLoading(true); // Set loading state
     try {
       const token = localStorage.getItem('bungie_token');
-      if (token) {
-        // Verify token with backend
-        await axios.get(`${API_URL}/auth/verify`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+      if (!token) {
+        setIsAuthenticated(false);
+        setIsLoading(false); // Ensure loading stops
+        return;
+      }
+      
+      // Check if token is expired based on our stored expiry time
+      if (isTokenExpired()) {
+        console.log('AuthContext: Token is expired, logging out');
+        logout();
+        setIsLoading(false); // Ensure loading stops
+        return;
+      }
+      
+      const response = await axios.get(`${API_URL}/auth/verify`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      
+      if (response.data && response.data.status === 'valid') {
         setIsAuthenticated(true);
+        setError(null);
+      } else {
+        // Token invalid according to backend
+        console.log('AuthContext: Token invalid according to backend');
+        logout();
       }
     } catch (err) {
-      if (DEBUG) {
-        console.error('Auth verification failed:', err.message);
-        if (err.response) {
-          console.error('Response data:', err.response.data);
-          console.error('Response status:', err.response.status);
-        }
+      console.error('AuthContext: Error checking auth status:', err);
+      // Don't immediately logout on network errors
+      // This prevents logout on temporary API issues
+      if (err.response && (err.response.status === 401 || err.response.status === 403)) {
+        logout();
       }
-      localStorage.removeItem('bungie_token');
-      setIsAuthenticated(false);
     } finally {
-      setIsLoading(false);
+      setIsLoading(false); // Always ensure loading stops
     }
   };
 
   const login = async () => {
     try {
       console.log('AuthContext: Starting login process');
+      
+      // Clear any existing tokens and state to ensure a fresh start
+      localStorage.removeItem('bungie_token');
+      localStorage.removeItem('oauth_state');
+      localStorage.removeItem('last_auth_attempt');
+      
+      // Check for potential redirect loops
+      const now = new Date().getTime();
+      const lastAttempt = localStorage.getItem('last_auth_attempt');
+      
+      if (lastAttempt && (now - parseInt(lastAttempt)) < 5000) {
+        // If we tried auth within the last 5 seconds, we might be in a loop
+        console.warn('AuthContext: Possible redirect loop detected');
+        setError('Too many redirects. Please try in an incognito window or clear your browser cache.');
+        return;
+      }
+      
+      // Mark this login attempt time
+      localStorage.setItem('last_auth_attempt', now.toString());
+      
       const response = await axios.get(`${API_URL}/auth/url`);
       console.log('AuthContext: Received response:', response);
       if (response.data && response.data.auth_url) {
         const url = new URL(response.data.auth_url);
         const state = url.searchParams.get('state');
         localStorage.setItem('oauth_state', state);
+        
+        // Store timestamp for this auth attempt
+        localStorage.setItem('auth_redirect_time', now.toString());
+        
         console.log('AuthContext: Redirecting to Bungie OAuth page:', response.data.auth_url);
         window.location.href = response.data.auth_url;
       } else {
@@ -79,8 +120,18 @@ export const AuthProvider = ({ children }) => {
     try {
       console.log('AuthContext: Handling callback with code and state');
       
+      // Check for stale callback (older than 5 minutes)
+      const redirectTime = localStorage.getItem('auth_redirect_time');
+      const now = new Date().getTime();
+      if (redirectTime && (now - parseInt(redirectTime)) > 300000) {
+        console.error('AuthContext: Stale callback detected (older than 5 minutes)');
+        localStorage.removeItem('oauth_state');
+        localStorage.removeItem('auth_redirect_time');
+        setError('Authentication session expired. Please try again.');
+        throw new Error('Stale authentication callback');
+      }
+      
       // Get the state parameter from localStorage (sent state)
-      // const state = urlParams.get('state'); // No longer need to get from URL here
       const storedState = localStorage.getItem('oauth_state');
       
       console.log('AuthContext: Callback state check:', { 
@@ -89,58 +140,75 @@ export const AuthProvider = ({ children }) => {
         stateInLocalStorage: !!localStorage.getItem('oauth_state')
       });
       
-      // Log all localStorage items for debugging
-      console.log('AuthContext: All localStorage items:');
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
-        console.log(`- ${key}: ${localStorage.getItem(key)}`);
-      }
-      
-      // Verify state parameter (stricter check recommended for production)
+      // Verify state parameter
       if (!state || !storedState || state !== storedState) {
          console.error('AuthContext: State mismatch!', { receivedState: state, storedState });
+         localStorage.removeItem('oauth_state');
+         localStorage.removeItem('auth_redirect_time');
+         setError('Security verification failed. Please try again.');
          throw new Error('State parameter mismatch');
-         // In development, you might comment out the throw to proceed
-         // console.warn('AuthContext: State mismatch, but continuing anyway for development');
       }
       
       // Clear the stored state AFTER verification
       localStorage.removeItem('oauth_state');
+      localStorage.removeItem('auth_redirect_time');
+      localStorage.removeItem('last_auth_attempt');
       
       console.log('AuthContext: Making callback request to:', `${API_URL}/auth/callback`);
-      const response = await axios.post(`${API_URL}/auth/callback`, { code }); // Send only the code
-      console.log('AuthContext: Callback response:', response.data);
-      
+      const response = await axios.post(`${API_URL}/auth/callback`, { code });
       if (response.data && response.data.token_data && response.data.token_data.access_token) {
         localStorage.setItem('bungie_token', response.data.token_data.access_token);
-        console.log('AuthContext: Token stored in localStorage');
+        
+        // Also store refresh token if available
+        if (response.data.token_data.refresh_token) {
+          localStorage.setItem('bungie_refresh_token', response.data.token_data.refresh_token);
+        }
+        
+        // Store token expiry time for future checks
+        if (response.data.token_data.expires_in) {
+          const expiryTime = new Date().getTime() + (response.data.token_data.expires_in * 1000);
+          localStorage.setItem('token_expiry', expiryTime.toString());
+        }
+        
         setIsAuthenticated(true);
         setError(null);
-        
-        // Success message
-        console.log('AuthContext: Authentication successful!');
-        
-        // Redirect to dashboard after successful authentication
-        window.location.href = '/';
       } else {
-        console.error('AuthContext: Invalid token data received:', response.data);
         throw new Error('Invalid token data received');
       }
     } catch (err) {
-      console.error('AuthContext: Callback error details:', {
-        message: err.message,
-        response: err.response ? {
-          data: err.response.data,
-          status: err.response.status
-        } : 'No response'
-      });
+      console.error('AuthContext: Callback error:', err);
       setError('Authentication failed');
       throw err;
     }
   };
 
+  // Fix the isTokenExpired function
+  const isTokenExpired = () => {
+    const expiryTime = localStorage.getItem('token_expiry');
+    if (!expiryTime) {
+      console.log('AuthContext: No expiry time found, assuming token is not expired');
+      return false; // Don't assume expired if we don't have an expiry time
+    }
+    
+    const now = new Date().getTime();
+    const expired = now > parseInt(expiryTime);
+    console.log('AuthContext: Token expiry check:', { 
+      now, 
+      expiryTime: parseInt(expiryTime), 
+      expired,
+      timeLeft: Math.round((parseInt(expiryTime) - now) / 1000) + ' seconds'
+    });
+    
+    return expired;
+  };
+
   const logout = () => {
     localStorage.removeItem('bungie_token');
+    localStorage.removeItem('bungie_refresh_token');
+    localStorage.removeItem('token_expiry');
+    localStorage.removeItem('oauth_state');
+    localStorage.removeItem('auth_redirect_time');
+    localStorage.removeItem('last_auth_attempt');
     setIsAuthenticated(false);
   };
 

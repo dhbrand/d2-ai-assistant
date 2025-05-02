@@ -1,39 +1,75 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
+import { useAuth } from '../contexts/AuthContext';
 import {
-  Box,
   Button,
-  Typography,
   Container,
+  Typography,
+  Box,
   Paper,
   CircularProgress,
+  Alert,
 } from '@mui/material';
-import { useAuth } from '../contexts/AuthContext';
 
 const Login = () => {
-  const { login, handleCallback, error } = useAuth();
+  const { login, handleCallback, isAuthenticated, error } = useAuth();
+  const [isLoading, setIsLoading] = useState(false);
+  const [localError, setLocalError] = useState(null);
   const navigate = useNavigate();
   const location = useLocation();
-  const [isLoading, setIsLoading] = useState(false);
   const hasCalledCallback = useRef(false);
+
+  // Clear any lingering tokens on component mount
+  useEffect(() => {
+    // This helps with Safari's aggressive caching
+    const cleanupSafariCache = () => {
+      try {
+        // Remove specific Safari cookie behavior issues by clearing
+        // these items - especially important for regular windows
+        localStorage.removeItem('bungie_token');
+        localStorage.removeItem('oauth_state');
+        
+        // Force clear cookie path for localhost
+        document.cookie = 'bungie_oauth=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+      } catch (e) {
+        console.error('Error cleaning up Safari cache:', e);
+      }
+    };
+    
+    // Only clean up if this is a fresh login, not a callback
+    if (!location.search || !location.search.includes('code=')) {
+      cleanupSafariCache();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const query = new URLSearchParams(location.search);
     const code = query.get('code');
     const state = query.get('state');
+    const error = query.get('error');
+    
+    // Handle error parameter from OAuth provider
+    if (error) {
+      setLocalError(`Authentication error: ${error}`);
+      setIsLoading(false);
+      return;
+    }
 
-    if (code && !hasCalledCallback.current) {
-      console.log('Authorization code detected, processing callback...');
-      hasCalledCallback.current = true;
+    // Only handle callback if code exists and hasn't been processed yet
+    if (code && state && !hasCalledCallback.current) {
+      console.log('Login: Authorization code detected, processing callback...');
+      hasCalledCallback.current = true; // Mark as processed
       setIsLoading(true);
 
       handleCallback(code, state)
         .then(() => {
-          console.log('OAuth callback handling complete, navigating...');
+          console.log('Login: OAuth callback handling complete');
           navigate('/');
         })
         .catch(err => {
-          console.error('OAuth callback handling failed:', err);
+          console.error('Login: OAuth callback handling failed:', err);
+          setLocalError('Authentication failed. Please try again or use an incognito window.');
         })
         .finally(() => {
           setIsLoading(false);
@@ -41,63 +77,71 @@ const Login = () => {
     }
   }, [location, handleCallback, navigate]);
 
+  // Redirect to dashboard if already authenticated
+  useEffect(() => {
+    if (isAuthenticated) {
+      navigate('/');
+    }
+  }, [isAuthenticated, navigate]);
+
   const handleLogin = async (e) => {
     if (e) e.preventDefault(); // Prevents page reload
-    localStorage.removeItem('bungie_token');
-    localStorage.removeItem('oauth_state');
+    
+    // Clear errors before starting new login
+    setLocalError(null);
+    
     setIsLoading(true);
-    await login();
-    setIsLoading(false);
+    try {
+      await login();
+      // Note: No need to navigate here as login() redirects to Bungie
+    } catch (err) {
+      setLocalError('Failed to initiate login. Please try again.');
+      setIsLoading(false);
+    }
   };
 
   return (
-    <Container component="main" maxWidth="sm">
-      <Box
-        sx={{
-          marginTop: 8,
-          display: 'flex',
-          flexDirection: 'column',
-          alignItems: 'center',
-        }}
-      >
+    <Container maxWidth="sm">
+      <Box sx={{ mt: 8, display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
         <Paper
           elevation={3}
           sx={{
             p: 4,
+            width: '100%',
             display: 'flex',
             flexDirection: 'column',
             alignItems: 'center',
             background: 'rgba(13, 13, 13, 0.8)',
             backdropFilter: 'blur(10px)',
-            border: '1px solid',
-            borderColor: 'primary.main',
-            borderRadius: 2,
           }}
         >
-          <Typography component="h1" variant="h4" gutterBottom>
-            Welcome Guardian
+          <Typography variant="h4" component="h1" gutterBottom>
+            Destiny 2 Catalyst Tracker
           </Typography>
           
-          <Typography variant="body1" sx={{ mb: 3, textAlign: 'center' }}>
-            Track your Destiny 2 catalyst progress and never miss a completion.
+          <Typography variant="body1" sx={{ mb: 4, textAlign: 'center' }}>
+            Track your Destiny 2 catalyst progress and never miss a completion
           </Typography>
-
+          
+          {(error || localError) && (
+            <Alert severity="error" sx={{ mb: 3, width: '100%' }}>
+              {error || localError}
+            </Alert>
+          )}
+          
           <Button
-            variant="contained"
-            color="primary"
             onClick={handleLogin}
             type="button"
+            variant="contained"
+            color="primary"
+            size="large"
             disabled={isLoading}
             sx={{
-              mt: 2,
               py: 1.5,
-              px: 4,
-              borderRadius: 2,
-              textTransform: 'none',
               fontSize: '1.1rem',
-              '&:hover': {
-                boxShadow: '0 0 15px',
-              },
+              width: '100%',
+              maxWidth: 300,
+              borderRadius: 2,
             }}
           >
             {isLoading ? (
@@ -106,12 +150,10 @@ const Login = () => {
               'Sign in with Bungie'
             )}
           </Button>
-
-          {error && (
-            <Typography color="error" sx={{ mt: 2 }}>
-              {error}
-            </Typography>
-          )}
+          
+          <Typography variant="body2" sx={{ mt: 2, opacity: 0.7, textAlign: 'center' }}>
+            For the best experience, try using an incognito/private window.
+          </Typography>
         </Paper>
       </Box>
     </Container>
