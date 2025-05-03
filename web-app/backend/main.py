@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 import os
 from dotenv import load_dotenv
@@ -44,16 +44,18 @@ oauth_manager = OAuthManager()
 logger = logging.getLogger(__name__)
 
 class CatalystBase(BaseModel):
-    recordHash: str
+    recordHash: str = Field(alias='record_hash')
     name: str
     description: str
-    weaponType: str
+    weaponType: str = Field(alias='weapon_type')
     objectives: List[dict]
     complete: bool
     progress: float
 
     class Config:
         orm_mode = True
+        populate_by_name = True
+        from_attributes = True
 
 class CatalystResponse(CatalystBase):
     id: int
@@ -142,46 +144,64 @@ async def get_catalysts(current_user: User = Depends(get_current_user), db: Sess
     """Get all catalysts for the authenticated user"""
     try:
         # Initialize CatalystAPI with the user's token
+        logger.info("Initializing CatalystAPI...")
         catalyst_api = CatalystAPI(oauth_manager)
         
         # Fetch catalysts from Bungie API
+        logger.info("Fetching catalysts from Bungie API...")
         catalysts_data = catalyst_api.get_catalysts()
+        logger.info(f"Retrieved {len(catalysts_data)} catalysts from API")
         
         # Update database with new catalyst data
         updated_catalysts = []
         for catalyst_data in catalysts_data:
-            catalyst = db.query(Catalyst).filter(
-                Catalyst.record_hash == str(catalyst_data['recordHash']),
-                Catalyst.user_id == current_user.id
-            ).first()
-            
-            if not catalyst:
-                catalyst = Catalyst(
-                    user_id=current_user.id,
-                    record_hash=str(catalyst_data['recordHash']),
-                    name=catalyst_data['name'],
-                    description=catalyst_data['description'],
-                    weapon_type=catalyst_data['weaponType'],
-                    objectives=catalyst_data['objectives'],
-                    complete=catalyst_data.get('complete', False),
-                    progress=catalyst_data.get('progress', 0.0)
-                )
-                db.add(catalyst)
-            else:
-                # Update existing catalyst
-                catalyst.name = catalyst_data['name']
-                catalyst.description = catalyst_data['description']
-                catalyst.weapon_type = catalyst_data['weaponType']
-                catalyst.objectives = catalyst_data['objectives']
-                catalyst.complete = catalyst_data.get('complete', False)
-                catalyst.progress = catalyst_data.get('progress', 0.0)
-            
-            updated_catalysts.append(catalyst)
+            try:
+                logger.debug(f"Processing catalyst: {catalyst_data.get('name', 'Unknown')}")
+                
+                # Debug the structure of a catalyst
+                if len(updated_catalysts) == 0:
+                    logger.debug(f"First catalyst data: {catalyst_data}")
+                
+                catalyst = db.query(Catalyst).filter(
+                    Catalyst.record_hash == str(catalyst_data['recordHash']),
+                    Catalyst.user_id == current_user.id
+                ).first()
+                
+                if not catalyst:
+                    logger.debug(f"Creating new catalyst entry for {catalyst_data['name']}")
+                    catalyst = Catalyst(
+                        user_id=current_user.id,
+                        record_hash=str(catalyst_data['recordHash']),
+                        name=catalyst_data['name'],
+                        description=catalyst_data['description'],
+                        weapon_type=catalyst_data.get('weaponType', 'Unknown'),
+                        objectives=catalyst_data['objectives'],
+                        complete=catalyst_data.get('complete', False),
+                        progress=catalyst_data.get('progress', 0.0)
+                    )
+                    db.add(catalyst)
+                else:
+                    logger.debug(f"Updating existing catalyst entry for {catalyst_data['name']}")
+                    # Update existing catalyst
+                    catalyst.name = catalyst_data['name']
+                    catalyst.description = catalyst_data['description']
+                    catalyst.weapon_type = catalyst_data.get('weaponType', 'Unknown')
+                    catalyst.objectives = catalyst_data['objectives']
+                    catalyst.complete = catalyst_data.get('complete', False)
+                    catalyst.progress = catalyst_data.get('progress', 0.0)
+                
+                updated_catalysts.append(catalyst)
+            except Exception as inner_e:
+                logger.error(f"Error processing individual catalyst: {inner_e}", exc_info=True)
+                # Continue processing other catalysts instead of failing
+                continue
         
         db.commit()
+        logger.info(f"Successfully processed {len(updated_catalysts)} catalysts")
         return updated_catalysts
         
     except Exception as e:
+        logger.error(f"Error in get_catalysts: {e}", exc_info=True)
         # db.rollback() # Optionally rollback on error
         raise HTTPException(status_code=500, detail=str(e))
 

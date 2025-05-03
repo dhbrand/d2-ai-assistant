@@ -310,6 +310,23 @@ class CatalystAPI:
             if objectives:
                 logger.debug(f"Objectives: {objectives}")
             
+            # Determine weapon type - this is a new addition
+            weapon_type = "Exotic"  # Default type
+            
+            # Could be enhanced to actually parse the weapon type from the catalyst or record name
+            if "Pistol" in name or "Hand Cannon" in name:
+                weapon_type = "Hand Cannon"
+            elif "Rifle" in name or "Scout" in name:
+                weapon_type = "Rifle"
+            elif "Shotgun" in name:
+                weapon_type = "Shotgun"
+            elif "Sword" in name or "Blade" in name:
+                weapon_type = "Sword"
+            elif "Bow" in name:
+                weapon_type = "Bow"
+            elif "Launcher" in name:
+                weapon_type = "Launcher"
+            
             return {
                 'name': name,
                 'description': description,
@@ -318,7 +335,8 @@ class CatalystAPI:
                 'complete': state['complete'],
                 'unlocked': state['unlocked'],
                 'recordHash': record_hash,
-                'discovered': self.discovery_mode and record_hash not in CATALYST_RECORD_HASHES
+                'discovered': self.discovery_mode and record_hash not in CATALYST_RECORD_HASHES,
+                'weaponType': weapon_type  # Add weaponType to the return value
             }
         except Exception as e:
             logger.error(f"Error getting catalyst info for record {record_hash}: {e}")

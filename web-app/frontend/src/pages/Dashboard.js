@@ -31,7 +31,33 @@ const Dashboard = () => {
   const [filterBy, setFilterBy] = useState('all');
 
   useEffect(() => {
-    // We've removed the fetchCatalysts call
+    const fetchCatalysts = async () => {
+      setLoading(true);
+      try {
+        const response = await fetch('https://localhost:8000/catalysts', {
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        });
+        
+        if (!response.ok) {
+          throw new Error(`Error fetching catalysts: ${response.status}`);
+        }
+        
+        const data = await response.json();
+        setCatalysts(data);
+        setError(null);
+      } catch (err) {
+        console.error('Failed to fetch catalysts:', err);
+        setError('Failed to fetch catalysts. Please try again later.');
+        setCatalysts([]);
+      } finally {
+        setLoading(false);
+      }
+    };
+    
+    fetchCatalysts();
   }, []);
 
   const filteredCatalysts = catalysts
