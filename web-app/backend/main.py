@@ -109,46 +109,30 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     access_token = token 
     logger.debug(f"[DEBUG] Received access token via dependency: {access_token[:10]}...")
     
-    # 2. Get Bungie ID (Initial check if token is even parseable by Bungie)
-    bungie_id = None # Initialize bungie_id
-    try:
-        bungie_id = oauth_manager.get_bungie_id(access_token)
-        if not bungie_id:
-             logger.warning(f"[DEBUG] get_bungie_id returned None for token {access_token[:10]}...")
-             raise HTTPException(status_code=401, detail="Invalid or expired token (initial check)")
-        logger.debug(f"[DEBUG] Got bungie_id: {bungie_id} from initial token check")
-    except Exception as e: 
-        logger.warning(f"[DEBUG] Initial get_bungie_id failed for token {access_token[:10]}... Error: {e}", exc_info=False) # Keep log brief
-        # Continue to DB check, maybe it was just expired or we can find user via other means if implemented
-        # For now, if we fail here AND can't find the user below, it's fatal.
-        pass 
-
-    # 3. Find User in Database
-    # Attempt to find user even if initial bungie_id lookup failed, 
-    # in case the token is merely expired and DB has the ID.
-    # This requires a way to link the access_token back to a user without calling Bungie yet.
-    # --> This is flawed. We NEED the bungie_id to look up the user reliably.
-    # --> Let's adjust: If get_bungie_id fails, we cannot proceed securely.
-    
-    # --- Revised Logic --- 
     # 2. Get Bungie ID (REQUIRED to find user)
     try:
         bungie_id = oauth_manager.get_bungie_id(access_token)
-        if not bungie_id:
-             logger.error(f"[DEBUG] get_bungie_id returned None for token {access_token[:10]}... Token likely invalid.")
-             raise HTTPException(status_code=401, detail="Invalid token")
+        if not bungie_id: # Should not happen if get_bungie_id raises correctly
+             logger.error(f"[DEBUG] get_bungie_id failed unexpectedly without exception for token {access_token[:10]}...")
+             raise HTTPException(status_code=401, detail="Token validation failed (unexpected)")
         logger.debug(f"[DEBUG] Got bungie_id: {bungie_id}")
-    except Exception as e:
-        logger.error(f"[DEBUG] Exception calling get_bungie_id for token {access_token[:10]}... Error: {e}", exc_info=True)
-        # Assume token is invalid if we can't get an ID from it
+
+    except requests.exceptions.HTTPError as http_err: # Catch specific HTTP errors from Bungie
+        status_code = http_err.response.status_code if http_err.response is not None else 500
+        logger.error(f"[DEBUG] HTTP error {status_code} calling get_bungie_id: {http_err}", exc_info=False)
+        if 500 <= status_code <= 599: # Check if it's a 5xx server error
+             raise HTTPException(status_code=503, detail=f"Bungie API unavailable ({status_code})")
+        else: # Assume other errors (4xx) mean the token is invalid
+             raise HTTPException(status_code=401, detail=f"Token rejected by Bungie ({status_code})")
+
+    except Exception as e: # Catch other errors from get_bungie_id
+        logger.error(f"[DEBUG] Non-HTTP exception calling get_bungie_id for token {access_token[:10]}... Error: {e}", exc_info=True)
         raise HTTPException(status_code=401, detail=f"Token validation failed: {e}")
         
     # 3. Find User in Database (Now we definitely have bungie_id)
     user = db.query(User).filter(User.bungie_id == bungie_id).first()
     if not user:
         logger.error(f"[DEBUG] User with bungie_id {bungie_id} not found in DB for a validated token.")
-        # This case is odd - token is valid for Bungie, but user not in our DB?
-        # Could happen if DB was wiped after login. Force re-login?
         raise HTTPException(status_code=401, detail="User profile not found. Please login again.")
 
     logger.debug(f"[DEBUG] Found user in DB with ID: {user.id}")

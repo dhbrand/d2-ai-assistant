@@ -562,7 +562,7 @@ class OAuthManager:
             'Authorization': f'Bearer {access_token}'
         }
         logger.info(f"[DEBUG] Calling Bungie API: {BUNGIE_API_ROOT}/User/GetMembershipsForCurrentUser/")
-        logger.info(f"[DEBUG] Headers for GetMemberships: {headers}") # Be cautious logging full headers
+        logger.info(f"[DEBUG] Headers for GetMemberships: {headers}") 
 
         try:
             response = requests.get(
@@ -570,7 +570,7 @@ class OAuthManager:
                 headers=headers
             )
             logger.info(f"[DEBUG] GetMemberships response status: {response.status_code}")
-            logger.info(f"[DEBUG] GetMemberships response text: {response.text[:200]}...") # Log partial response
+            logger.info(f"[DEBUG] GetMemberships response text: {response.text[:200]}...")
 
             response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
 
@@ -581,21 +581,22 @@ class OAuthManager:
                 logger.error(f"[DEBUG] {error_msg}")
                 raise Exception(error_msg)
 
-            # Extract the primary membership ID (usually the first one)
             if not user_data['Response']['destinyMemberships']:
                  logger.error("[DEBUG] No Destiny memberships found for user.")
                  raise Exception("No Destiny memberships found for user.")
                  
-            # Use the BUNGIE membership ID from the top level
             bungie_membership_id = user_data['Response']['bungieNetUser']['membershipId']
             logger.info(f"[DEBUG] Found Bungie Membership ID: {bungie_membership_id}")
             
             return bungie_membership_id
             
-        except requests.exceptions.RequestException as e:
-            logger.error(f"[DEBUG] HTTP Error getting memberships: {e}", exc_info=True)
-            raise Exception(f"Failed to get user memberships from Bungie API: {e}")
-        except Exception as e:
+        except requests.exceptions.HTTPError as http_err: # Catch HTTPError specifically
+            logger.error(f"[DEBUG] HTTP Error getting memberships: {http_err}", exc_info=False) # Log it briefly
+            raise # Re-raise the original HTTPError
+        except requests.exceptions.RequestException as req_err: # Catch other request errors (timeout, connection)
+             logger.error(f"[DEBUG] Request Error getting memberships: {req_err}", exc_info=True)
+             raise Exception(f"Network error getting memberships from Bungie API: {req_err}") from req_err
+        except Exception as e: # Catch other errors (JSON parsing etc.)
             logger.error(f"[DEBUG] Error processing memberships response: {e}", exc_info=True)
             raise Exception(f"Error processing Bungie API response: {e}")
 
