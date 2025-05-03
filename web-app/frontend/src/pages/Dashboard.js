@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useContext } from 'react';
 import {
   Box,
   Grid,
@@ -14,21 +14,57 @@ import {
   CardContent,
   Chip,
   useTheme,
+  Container,
+  CircularProgress,
+  Alert,
+  Button,
 } from '@mui/material';
 import {
   Search as SearchIcon,
   Sort as SortIcon,
   FilterList as FilterIcon,
 } from '@mui/icons-material';
+import { useAuth } from '../contexts/AuthContext';
+import Layout from '../components/Layout';
 
 const Dashboard = () => {
   const theme = useTheme();
+  const { getToken } = useAuth();
   const [catalysts, setCatalysts] = useState([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [sortBy, setSortBy] = useState('name');
   const [filterBy, setFilterBy] = useState('all');
+
+  const fetchAllWeapons = async () => {
+    const token = getToken();
+    if (!token) {
+      console.error('No token found');
+      setError('Authentication token not found.');
+      return;
+    }
+
+    console.log('Testing /weapons/all endpoint...');
+    try {
+      const response = await fetch('https://localhost:8000/weapons/all', {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(`Failed to fetch all weapons: ${response.status} ${response.statusText} - ${errorData.detail || 'Unknown error'}`);
+      }
+      const data = await response.json();
+      console.log('Successfully fetched all weapons data:', data);
+      alert(`Fetched ${data.length} items with instance IDs. Check console for details.`);
+    } catch (err) {
+      console.error('Error fetching all weapons:', err);
+      setError(err.message);
+      alert(`Error fetching weapons: ${err.message}. Check console.`);
+    }
+  };
 
   useEffect(() => {
     const fetchCatalysts = async () => {
@@ -58,7 +94,7 @@ const Dashboard = () => {
     };
     
     fetchCatalysts();
-  }, []);
+  }, [getToken]);
 
   const filteredCatalysts = catalysts
     .filter(catalyst => {
@@ -156,78 +192,91 @@ const Dashboard = () => {
   );
 
   return (
-    <Box>
-      <Paper
-        sx={{
-          p: 2,
-          mb: 3,
-          background: 'rgba(13, 13, 13, 0.8)',
-          backdropFilter: 'blur(10px)',
-        }}
-      >
-        <Grid container spacing={2} alignItems="center">
-          <Grid item xs={12} md={4}>
-            <TextField
-              fullWidth
-              variant="outlined"
-              placeholder="Search catalysts..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              InputProps={{
-                startAdornment: <SearchIcon color="action" sx={{ mr: 1 }} />,
-              }}
-            />
-          </Grid>
-          <Grid item xs={12} md={4}>
-            <FormControl fullWidth>
-              <InputLabel>Sort By</InputLabel>
-              <Select
-                value={sortBy}
-                onChange={(e) => setSortBy(e.target.value)}
-                startAdornment={<SortIcon color="action" sx={{ mr: 1 }} />}
-              >
-                <MenuItem value="name">Name</MenuItem>
-                <MenuItem value="progress">Progress</MenuItem>
-                <MenuItem value="weapon_type">Weapon Type</MenuItem>
-              </Select>
-            </FormControl>
-          </Grid>
-          <Grid item xs={12} md={4}>
-            <FormControl fullWidth>
-              <InputLabel>Filter</InputLabel>
-              <Select
-                value={filterBy}
-                onChange={(e) => setFilterBy(e.target.value)}
-                startAdornment={<FilterIcon color="action" sx={{ mr: 1 }} />}
-              >
-                <MenuItem value="all">All</MenuItem>
-                <MenuItem value="completed">Completed</MenuItem>
-                <MenuItem value="in_progress">In Progress</MenuItem>
-                <MenuItem value="not_started">Not Started</MenuItem>
-              </Select>
-            </FormControl>
-          </Grid>
-        </Grid>
-      </Paper>
-
-      {loading ? (
-        <Box sx={{ display: 'flex', justifyContent: 'center', mt: 4 }}>
-          <LinearProgress sx={{ width: '100%' }} />
-        </Box>
-      ) : error ? (
-        <Typography color="error" align="center">
-          {error}
+    <Layout>
+      <Container maxWidth="md">
+        <Typography variant="h4" gutterBottom>
+          Your Catalyst Progress
         </Typography>
-      ) : (
-        <Grid container spacing={3}>
-          {filteredCatalysts.map((catalyst) => (
-            <Grid item xs={12} md={6} lg={4} key={catalyst.recordHash}>
-              <CatalystCard catalyst={catalyst} />
+
+        <Button 
+          variant="contained" 
+          color="secondary" 
+          onClick={fetchAllWeapons} 
+          sx={{ mb: 2 }}
+        >
+          Test Fetch All Weapons
+        </Button>
+
+        <Paper
+          sx={{
+            p: 2,
+            mb: 3,
+            background: 'rgba(13, 13, 13, 0.8)',
+            backdropFilter: 'blur(10px)',
+          }}
+        >
+          <Grid container spacing={2} alignItems="center">
+            <Grid item xs={12} md={4}>
+              <TextField
+                fullWidth
+                variant="outlined"
+                placeholder="Search catalysts..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                InputProps={{
+                  startAdornment: <SearchIcon color="action" sx={{ mr: 1 }} />,
+                }}
+              />
             </Grid>
-          ))}
-        </Grid>
-      )}
-    </Box>
+            <Grid item xs={12} md={4}>
+              <FormControl fullWidth>
+                <InputLabel>Sort By</InputLabel>
+                <Select
+                  value={sortBy}
+                  onChange={(e) => setSortBy(e.target.value)}
+                  startAdornment={<SortIcon color="action" sx={{ mr: 1 }} />}
+                >
+                  <MenuItem value="name">Name</MenuItem>
+                  <MenuItem value="progress">Progress</MenuItem>
+                  <MenuItem value="weapon_type">Weapon Type</MenuItem>
+                </Select>
+              </FormControl>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <FormControl fullWidth>
+                <InputLabel>Filter</InputLabel>
+                <Select
+                  value={filterBy}
+                  onChange={(e) => setFilterBy(e.target.value)}
+                  startAdornment={<FilterIcon color="action" sx={{ mr: 1 }} />}
+                >
+                  <MenuItem value="all">All</MenuItem>
+                  <MenuItem value="completed">Completed</MenuItem>
+                  <MenuItem value="in_progress">In Progress</MenuItem>
+                  <MenuItem value="not_started">Not Started</MenuItem>
+                </Select>
+              </FormControl>
+            </Grid>
+          </Grid>
+        </Paper>
+
+        {loading ? (
+          <Box sx={{ display: 'flex', justifyContent: 'center', mt: 4 }}>
+            <CircularProgress />
+          </Box>
+        ) : error ? (
+          <Alert severity="error">{error}</Alert>
+        ) : (
+          <Grid container spacing={3}>
+            {filteredCatalysts.map((catalyst) => (
+              <Grid item xs={12} md={6} lg={4} key={catalyst.recordHash}>
+                <CatalystCard catalyst={catalyst} />
+              </Grid>
+            ))}
+          </Grid>
+        )}
+      </Container>
+    </Layout>
   );
 };
 

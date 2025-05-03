@@ -1,8 +1,8 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
@@ -11,7 +11,11 @@ from bungie_oauth import OAuthManager
 from models import init_db, User, Catalyst
 from sqlalchemy.orm import Session
 from catalyst import CatalystAPI
+from weapon_api import WeaponAPI
 import logging
+from enum import Enum
+from typing import Literal
+import ssl
 
 # Load environment variables
 load_dotenv()
@@ -64,6 +68,30 @@ class TokenData(BaseModel):
     access_token: str
     refresh_token: str
     expires_in: int
+
+class WeaponResponse(BaseModel):
+    id: Optional[int] = None
+    item_hash: str
+    instance_id: Optional[str] = None
+    name: str
+    description: str
+    icon_url: str
+    screenshot_url: Optional[str] = None
+    tier_type: int
+    item_type: int
+    item_sub_type: int
+    damage_type: Optional[int] = None
+    damage_type_name: Optional[str] = None
+    ammo_type: Optional[int] = None
+    stats: Optional[Dict[str, Any]] = None
+    perks: Optional[List[Dict[str, Any]]] = None
+    is_equipped: Optional[bool] = None
+    is_in_vault: Optional[bool] = None
+    is_favorite: Optional[bool] = None
+    
+    class Config:
+        orm_mode = True
+        from_attributes = True
 
 def get_current_user(token_header: dict = Depends(oauth_manager.get_headers), db: Session = Depends(get_db)) -> User:
     logger.info("[DEBUG] Entering get_current_user")
@@ -203,6 +231,31 @@ async def get_catalysts(current_user: User = Depends(get_current_user), db: Sess
     except Exception as e:
         logger.error(f"Error in get_catalysts: {e}", exc_info=True)
         # db.rollback() # Optionally rollback on error
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/weapons/all", response_model=List[WeaponResponse])
+async def get_all_user_weapons(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get all weapons for the authenticated user (characters and vault)."""
+    try:
+        weapon_api = WeaponAPI(oauth_manager)
+        
+        membership = weapon_api.get_membership_info()
+        if not membership:
+            raise HTTPException(status_code=500, detail="Failed to get membership info")
+        
+        logger.info("Fetching all weapon data...")
+        weapons_data = weapon_api.get_all_weapons(membership['type'], membership['id'])
+        logger.info(f"Retrieved weapon data (processing pending): {len(weapons_data)}")
+        
+        # Currently returns an empty list as processing is not implemented
+        # When processing is done, this should return the structured list of weapons
+        return weapons_data 
+        
+    except Exception as e:
+        logger.error(f"Error in get_all_user_weapons: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
