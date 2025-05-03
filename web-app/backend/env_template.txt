@@ -1,0 +1,4 @@
+BUNGIE_CLIENT_ID=49527
+BUNGIE_CLIENT_SECRET=your_client_secret
+BUNGIE_API_KEY=your_api_key
+REDIRECT_URI=https://localhost:3000/login 

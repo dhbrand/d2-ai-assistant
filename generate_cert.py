@@ -4,9 +4,13 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 import datetime
+import os
 
 def generate_self_signed_cert(cert_path, key_path):
     """Generate a self-signed certificate and private key for local development"""
+    # Create dev-certs directory if it doesn't exist
+    os.makedirs(os.path.dirname(cert_path), exist_ok=True)
+    
     # Generate private key
     private_key = rsa.generate_private_key(
         public_exponent=65537,
@@ -48,4 +52,4 @@ def generate_self_signed_cert(cert_path, key_path):
         f.write(cert.public_bytes(serialization.Encoding.PEM))
 
 if __name__ == "__main__":
-    generate_self_signed_cert("localhost.crt", "localhost.key") 
+    generate_self_signed_cert("dev-certs/cert.pem", "dev-certs/key.pem") 
