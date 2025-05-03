@@ -207,4 +207,22 @@ async def get_catalysts(current_user: User = Depends(get_current_user), db: Sess
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    
+    # Get the SSL certificate paths from the current directory
+    ssl_certfile = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "cert.pem"))
+    ssl_keyfile = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "key.pem"))
+    
+    # Check if the certificate files exist
+    if os.path.exists(ssl_certfile) and os.path.exists(ssl_keyfile):
+        # Run with HTTPS
+        uvicorn.run(
+            app, 
+            host="0.0.0.0", 
+            port=8000,
+            ssl_certfile=ssl_certfile,
+            ssl_keyfile=ssl_keyfile
+        )
+    else:
+        # Fallback to HTTP
+        print("SSL certificates not found. Running with HTTP only.")
+        uvicorn.run(app, host="0.0.0.0", port=8000) 
