@@ -14,6 +14,7 @@ import sys
 import socket
 import json
 from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -362,66 +363,77 @@ class OAuthManager:
             # Stop the server if it was started
             self.stop_server()
     
-    def refresh_token(self):
+    def refresh_token(self, refresh_token_to_use: Optional[str] = None):
         """Refresh the access token using the refresh token."""
-        if not self.token_data or 'refresh_token' not in self.token_data:
-            logger.error("No refresh token available to refresh.")
-            return False
-        
-        logger.info("Refreshing access token...")
-        
-        # Use Basic Auth for token refresh
-        auth = requests.auth.HTTPBasicAuth(self.client_id, self.client_secret)
+        token_to_refresh = refresh_token_to_use
+        if not token_to_refresh:
+            # Fallback to internal token data if specific one isn't provided
+            if not self.token_data or 'refresh_token' not in self.token_data:
+                logger.error("Refresh token is missing. Cannot refresh.")
+                raise Exception("Missing refresh token")
+            token_to_refresh = self.token_data['refresh_token']
+            logger.info("Refreshing token using internally stored refresh token.")
+        else:
+            logger.info("Refreshing token using provided refresh token.")
+
+        payload = {
+            'grant_type': 'refresh_token',
+            'refresh_token': token_to_refresh,
+            'client_id': self.client_id,
+            'client_secret': self.client_secret
+        }
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
 
         try:
-            response = requests.post(
-                BUNGIE_TOKEN_URL,
-                auth=auth,
-                data={
-                    'grant_type': 'refresh_token',
-                    'refresh_token': self.token_data['refresh_token']
-                },
-                headers={
-                     'Content-Type': 'application/x-www-form-urlencoded',
-                     'X-API-Key': self.api_key
-                 }
-            )
-            
-            response.raise_for_status()  # Raise exception for non-200 status codes
-            
-            # Update token data with the new token
+            response = requests.post(BUNGIE_TOKEN_URL, data=payload, headers=headers)
+            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
             new_token_data = response.json()
-            
-            # Preserve the original refresh token if a new one isn't provided
-            if 'refresh_token' not in new_token_data and 'refresh_token' in self.token_data:
-                 new_token_data['refresh_token'] = self.token_data['refresh_token']
-                 
-            self.token_data = new_token_data
 
-            # Calculate and store new expiry time
-            now = datetime.now()
-            expires_in = timedelta(seconds=self.token_data['expires_in'])
-            self.token_expiry_time = now + expires_in
-            self.token_data['received_at'] = now.isoformat() # Update receive time
+            # Validate response
+            if 'access_token' not in new_token_data or 'refresh_token' not in new_token_data or 'expires_in' not in new_token_data:
+                logger.error(f"Token refresh response missing required fields: {new_token_data}")
+                raise Exception("Incomplete token data received from refresh")
 
+            logger.info("Token refreshed successfully.")
 
-            logger.info(f"Successfully refreshed access token. New expiry: {self.token_expiry_time}")
+            # If we used the internal token, update internal state and save to file
+            if not refresh_token_to_use:
+                self.token_data = new_token_data
+                # Calculate new expiry time for internal tracking
+                expires_in = timedelta(seconds=self.token_data['expires_in'])
+                self.token_expiry_time = datetime.now() + expires_in # Use local time for internal check consistency?
+                self._save_token_data() # Save the updated tokens to file
+                logger.info(f"Internal token state updated. New expiry: {self.token_expiry_time}")
             
-            # Save the updated token data
-            self._save_token_data()
-            
-            return True
+            # Always return the new token data
+            return new_token_data
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Token refresh failed: {e}")
+            logger.error(f"HTTP Error refreshing token: {e}", exc_info=True)
+            # Handle specific errors, e.g., invalid refresh token
             if e.response is not None:
-                 logger.error(f"Response: {e.response.text}")
-            # Handle potential token revocation or other errors
-            # If refresh fails (e.g., invalid grant), clear stored token?
-            # self.token_data = None
-            # self._save_token_data() # Save cleared data
-            # logger.warning("Cleared stored token data due to refresh failure.")
-            return False
+                try:
+                    error_details = e.response.json()
+                    logger.error(f"Bungie API error details: {error_details}")
+                    # If refresh token is invalid, we might need to clear stored tokens and force re-auth
+                    if error_details.get("error") == "invalid_grant":
+                        logger.warning("Refresh token is invalid. Clearing stored tokens.")
+                        # Clear internal state if we were using it
+                        if not refresh_token_to_use:
+                             self.token_data = None
+                             self.token_expiry_time = None
+                             if TOKEN_FILE.exists():
+                                TOKEN_FILE.unlink()
+                        # Raise a specific exception to signal re-authentication is needed
+                        raise InvalidRefreshTokenError("Refresh token rejected by Bungie.")
+                except json.JSONDecodeError:
+                    logger.error("Could not decode error response from Bungie.")
+            raise Exception(f"Failed to refresh token: {e}") from e
+        except Exception as e:
+            logger.error(f"Unexpected error during token refresh: {e}", exc_info=True)
+            raise Exception("An unexpected error occurred while refreshing the token") from e
 
     def refresh_if_needed(self, buffer_seconds=60):
         """Check if the token is expired or close to expiring and refresh it."""
@@ -593,3 +605,7 @@ class OAuthManager:
             self.server.stop()
             self.server = None
             logger.debug("OAuth callback server stopped.") 
+
+# Custom Exception for invalid refresh token
+class InvalidRefreshTokenError(Exception):
+    pass 

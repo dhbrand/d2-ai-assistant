@@ -1,29 +1,27 @@
 import requests
 import logging
-from bungie_oauth import OAuthManager
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
 class WeaponAPI:
-    def __init__(self, oauth_manager: OAuthManager):
-        self.oauth_manager = oauth_manager
+    def __init__(self, api_key: str):
+        self.api_key = api_key
         self.base_url = "https://www.bungie.net/Platform"
 
-    def _get_authenticated_headers(self) -> Dict[str, str]:
+    def _get_authenticated_headers(self, access_token: str) -> Dict[str, str]:
         """Gets the necessary headers for authenticated Bungie API requests."""
-        token = self.oauth_manager.get_access_token() # Assuming OAuthManager handles token refresh
-        if not token:
-            raise Exception("User not authenticated or token expired")
+        if not access_token:
+            raise ValueError("Access token is required for authenticated headers")
         
         return {
-            "Authorization": f"Bearer {token}",
-            "X-API-Key": self.oauth_manager.client_secret # Assuming client_secret holds the API key
+            "Authorization": f"Bearer {access_token}",
+            "X-API-Key": self.api_key
         }
 
-    def get_membership_info(self) -> Optional[Dict[str, Any]]:
+    def get_membership_info(self, access_token: str) -> Optional[Dict[str, Any]]:
         """Gets the user's primary Destiny membership ID and type."""
-        headers = self._get_authenticated_headers()
+        headers = self._get_authenticated_headers(access_token)
         url = f"{self.base_url}/User/GetMembershipsForCurrentUser/"
         
         try:
@@ -58,12 +56,12 @@ class WeaponAPI:
             logger.error(f"Error processing membership info: {e}", exc_info=True)
             return None
 
-    def get_all_weapons(self, membership_type: int, membership_id: str) -> List[Dict[str, Any]]:
+    def get_all_weapons(self, access_token: str, membership_type: int, membership_id: str) -> List[Dict[str, Any]]:
         """
         Fetches all item instances for a given user across characters and vault.
         Currently returns basic info, processing for weapon specifics is pending.
         """
-        headers = self._get_authenticated_headers()
+        headers = self._get_authenticated_headers(access_token)
         # Components: 
         # 102=ProfileInventories (Vault), 201=CharacterInventories, 205=CharacterEquipment
         # 300=ItemInstances

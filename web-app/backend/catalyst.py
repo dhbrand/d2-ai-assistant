@@ -8,7 +8,6 @@ import requests
 import time
 from threading import Event
 from catalyst_hashes import CATALYST_RECORD_HASHES
-from bungie_oauth import OAuthManager
 import hashlib
 import pathlib
 
@@ -28,10 +27,10 @@ class DestinyRecordState:
     CAN_EQUIP_TITLE = 64
 
 class CatalystAPI:
-    def __init__(self, oauth_manager: OAuthManager):
-        """Initialize the Catalyst API with an OAuthManager instance"""
+    def __init__(self, api_key: str):
+        """Initialize the Catalyst API"""
         self.base_url = "https://www.bungie.net/Platform"
-        self.oauth_manager = oauth_manager
+        self.api_key = api_key
         self.session = self._create_session()
         self.definition_cache = {}  # Memory cache for definitions
         self.cache_dir = pathlib.Path("definition_cache")  # Directory for persistent cache
@@ -52,7 +51,16 @@ class CatalystAPI:
         session.mount('https://', adapter)
         return session
         
-    def get_membership_info(self) -> Optional[Dict[str, str]]:
+    def _get_authenticated_headers(self, access_token: str) -> Dict[str, str]:
+        """Gets the necessary headers for authenticated Bungie API requests."""
+        if not access_token:
+            raise ValueError("Access token is required for authenticated headers")
+        return {
+            "Authorization": f"Bearer {access_token}",
+            "X-API-Key": self.api_key
+        }
+        
+    def get_membership_info(self, access_token: str) -> Optional[Dict[str, str]]:
         """Get the current user's membership info"""
         if self.cancel_event.is_set():
             return None
@@ -60,7 +68,7 @@ class CatalystAPI:
         try:
             url = f"{self.base_url}/User/GetMembershipsForCurrentUser/"
             logger.info(f"Fetching membership from: {url}")
-            headers = self.oauth_manager.get_headers()
+            headers = self._get_authenticated_headers(access_token)
             response = self.session.get(url, headers=headers, timeout=8)
             if response.status_code != 200:
                 logger.error(f"Failed to get membership info: {response.status_code} - {response.text}")
@@ -81,7 +89,7 @@ class CatalystAPI:
             logger.error(f"Error getting membership info: {e}")
             return None
             
-    def get_profile(self, membership_type: int, membership_id: str) -> Optional[Dict]:
+    def get_profile(self, access_token: str, membership_type: int, membership_id: str) -> Optional[Dict]:
         """Get the user's profile with records"""
         if self.cancel_event.is_set():
             return None
@@ -105,7 +113,7 @@ class CatalystAPI:
             }
             logger.info("Fetching profile data with components: %s", params["components"])
             
-            headers = self.oauth_manager.get_headers()
+            headers = self._get_authenticated_headers(access_token)
             response = self.session.get(url, headers=headers, params=params, timeout=15)
             logger.info("API URL: %s", response.url)
             
@@ -131,7 +139,7 @@ class CatalystAPI:
             return None
             
     def get_definition(self, table: str, hash_id: int) -> Optional[Dict]:
-        """Get a definition from the Destiny 2 manifest with caching"""
+        """Get a definition from the Destiny 2 manifest (No auth required)"""
         if self.cancel_event.is_set():
             return None
             
@@ -156,7 +164,7 @@ class CatalystAPI:
         # Fetch from API if not in cache
         try:
             url = f"{self.base_url}/Destiny2/Manifest/{table}/{hash_id}/"
-            headers = self.oauth_manager.get_headers()
+            headers = {"X-API-Key": self.api_key}
             response = self.session.get(url, headers=headers, timeout=10)
             if response.status_code != 200:
                 logger.debug(f"Failed to get definition for {table} {hash_id}: {response.status_code}")
@@ -385,20 +393,36 @@ class CatalystAPI:
             logger.error(f"Error in _is_catalyst_by_content: {e}")
             return False
             
-    def get_catalysts(self) -> List[Dict]:
-        """Get all catalysts for the current user using batch requests and caching."""
+    def get_catalysts(self, access_token: str) -> List[Dict]:
+        """Get all known catalyst records for the user."""
+        logger.info("Starting catalyst fetch process...")
+        start_total = time.time()
+        
         if self.cancel_event.is_set():
             return []
-
-        membership_info = self.get_membership_info()
-        if not membership_info:
+            
+        # 1. Get Membership Info
+        start_time = time.time()
+        membership = self.get_membership_info(access_token)
+        if not membership:
+            logger.error("Failed to get membership info.")
             return []
-
-        profile = self.get_profile(membership_info['type'], membership_info['id'])
-        if not profile:
+        elapsed = time.time() - start_time
+        logger.info(f"Got membership in {elapsed:.1f} seconds")
+        
+        if self.cancel_event.is_set():
             return []
-
-        profile_records = profile.get('Response', {}).get('profileRecords', {}).get('data', {}).get('records', {})
+        
+        # 2. Get Profile Data
+        start_time = time.time()
+        profile_data = self.get_profile(access_token, membership['type'], membership['id'])
+        if not profile_data:
+            logger.error("Failed to get profile data.")
+            return []
+        elapsed = time.time() - start_time
+        logger.info(f"Got profile in {elapsed:.1f} seconds")
+        
+        profile_records = profile_data.get('Response', {}).get('profileRecords', {}).get('data', {}).get('records', {})
         self._prefetch_definitions(profile_records)
 
         catalysts = []

@@ -29,7 +29,7 @@ import Layout from '../components/Layout';
 
 const Dashboard = () => {
   const theme = useTheme();
-  const { getToken } = useAuth();
+  const { /* other values you might need from useAuth like isAuthenticated, etc */ } = useAuth();
   const [catalysts, setCatalysts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -38,9 +38,9 @@ const Dashboard = () => {
   const [filterBy, setFilterBy] = useState('all');
 
   const fetchAllWeapons = async () => {
-    const token = getToken();
+    const token = localStorage.getItem('bungie_token');
     if (!token) {
-      console.error('No token found');
+      console.error('No token found in localStorage');
       setError('Authentication token not found.');
       return;
     }
@@ -69,10 +69,17 @@ const Dashboard = () => {
   useEffect(() => {
     const fetchCatalysts = async () => {
       setLoading(true);
+      const token = localStorage.getItem('bungie_token');
+      if (!token) {
+        console.error('Dashboard: No token found for fetching catalysts');
+        setError('Not authenticated.');
+        setLoading(false);
+        return;
+      }
       try {
         const response = await fetch('https://localhost:8000/catalysts', {
-          credentials: 'include',
           headers: {
+            'Authorization': `Bearer ${token}`,
             'Content-Type': 'application/json',
           },
         });
@@ -94,7 +101,7 @@ const Dashboard = () => {
     };
     
     fetchCatalysts();
-  }, [getToken]);
+  }, []);
 
   const filteredCatalysts = catalysts
     .filter(catalyst => {

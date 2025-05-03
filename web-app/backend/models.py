@@ -1,6 +1,8 @@
-from sqlalchemy import Column, Integer, String, Boolean, Float, JSON, ForeignKey, create_engine
+from sqlalchemy import Column, Integer, String, Boolean, Float, JSON, ForeignKey, create_engine, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
+from typing import List, Optional
+from datetime import datetime
 
 Base = declarative_base()
 
@@ -8,9 +10,10 @@ class User(Base):
     __tablename__ = 'users'
 
     id = Column(Integer, primary_key=True)
-    bungie_id = Column(String, unique=True)
+    bungie_id = Column(String, unique=True, index=True)
     access_token = Column(String)
     refresh_token = Column(String)
+    access_token_expires = Column(DateTime)
     token_expiry = Column(Integer)
     catalysts = relationship('Catalyst', back_populates='user')
 
