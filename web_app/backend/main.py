@@ -577,32 +577,20 @@ async def get_all_weapons_for_chat(current_user: User, manifest_manager: Manifes
 @app.post("/api/assistants/chat", response_model=ChatResponse)
 async def assistants_chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user_from_token), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
     """
-    Chat endpoint using OpenAI Assistants API. Maintains a persistent thread per user and injects live Destiny 2 data.
+    Chat endpoint using OpenAI Responses API with web_search tool. Injects live Destiny 2 data and lets the model decide when to use web search.
     """
-    if not OPENAI_API_KEY or not OPENAI_ASSISTANT_ID:
-        logger.error("OpenAI API key or Assistant ID missing.")
-        raise HTTPException(status_code=503, detail="OpenAI API key or Assistant ID not configured")
+    if not OPENAI_API_KEY:
+        logger.error("OpenAI API key missing.")
+        raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
-    # --- Get or create thread for this user ---
-    user_id = str(current_user.id)
-    with user_thread_lock:
-        thread_id = user_thread_map.get(user_id)
     client = OpenAI(api_key=OPENAI_API_KEY)
-    if not thread_id:
-        thread = client.beta.threads.create()
-        thread_id = thread.id
-        with user_thread_lock:
-            user_thread_map[user_id] = thread_id
-        logger.info(f"Created new thread {thread_id} for user {user_id}")
-    else:
-        logger.info(f"Using existing thread {thread_id} for user {user_id}")
 
     # --- Fetch live Destiny 2 data ---
     try:
         weapons = await get_all_weapons_for_chat(current_user, manifest_manager)
         catalysts = await get_all_catalysts_for_chat(current_user, manifest_manager)
     except Exception as e:
-        logger.error(f"Error fetching Destiny 2 data for Assistant context: {e}", exc_info=True)
+        logger.error(f"Error fetching Destiny 2 data for context: {e}", exc_info=True)
         weapons = []
         catalysts = []
 
@@ -627,61 +615,26 @@ async def assistants_chat_endpoint(request: ChatRequest, current_user: User = De
         f"**Catalysts ({len(catalysts)}):**\n{catalyst_context}"
     )
 
-    # --- Add user message and context to thread ---
-    try:
-        # Add context as a user message (Assistants API only allows 'user' or 'assistant')
-        client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",  # changed from 'system' to 'user'
-            content=context_str
-        )
-        # Add user message
-        user_message = request.messages[-1].content if request.messages else ""
-        client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=user_message
-        )
-    except Exception as e:
-        logger.error(f"Error adding messages to thread: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to add messages to Assistant thread")
+    # --- Compose input for the model ---
+    user_message = request.messages[-1].content if request.messages else ""
+    full_input = f"{context_str}\n\nUser: {user_message}"
 
-    # --- Create a Run and poll for completion ---
     try:
-        run = client.beta.threads.runs.create(
-            thread_id=thread_id,
-            assistant_id=OPENAI_ASSISTANT_ID
+        response = client.responses.create(
+            model="gpt-4o",  # or another supported model
+            input=full_input,
+            tools=[{"type": "web_search"}]
         )
-        # Poll for completion
-        import time as pytime
-        for _ in range(60): # Wait up to 60 seconds
-            run_status = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
-            if run_status.status == "completed":
-                break
-            elif run_status.status in ("failed", "cancelled", "expired"):
-                logger.error(f"Assistant run failed with status: {run_status.status}")
-                raise HTTPException(status_code=500, detail=f"Assistant run failed: {run_status.status}")
-            pytime.sleep(1)
-        else:
-            logger.error("Assistant run timed out after 60 seconds.")
-            raise HTTPException(status_code=504, detail="Assistant run timed out.")
-    except Exception as e:
-        logger.error(f"Error running Assistant: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to run Assistant")
-
-    # --- Retrieve latest Assistant message ---
-    try:
-        messages = client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=5)
-        assistant_message = next((m for m in messages.data if m.role == "assistant"), None)
-        if not assistant_message:
-            logger.error("No assistant message found in thread after run.")
-            raise HTTPException(status_code=500, detail="No assistant message found.")
-        content = assistant_message.content[0].text.value if assistant_message.content else "(No content)"
-        ai_message = ChatMessage(role="assistant", content=content)
+        # Extract the first text output, skipping tool/function call objects
+        output_text = next(
+            (out.content[0].text for out in response.output if hasattr(out, "content") and out.content and hasattr(out.content[0], "text")),
+            "(No text response from model.)"
+        )
+        ai_message = ChatMessage(role="assistant", content=output_text)
         return ChatResponse(message=ai_message)
     except Exception as e:
-        logger.error(f"Error retrieving Assistant message: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to retrieve Assistant message")
+        logger.error(f"Error with OpenAI Responses API: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get response from OpenAI")
 
 @app.get("/api/models", response_model=ModelListResponse)
 async def get_available_models():
