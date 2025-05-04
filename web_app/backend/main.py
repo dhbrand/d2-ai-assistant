@@ -11,6 +11,8 @@ import logging
 from jose import JWTError, jwt
 from requests.exceptions import HTTPError
 import requests
+import openai # Uncomment OpenAI import
+import httpx # Import httpx
 
 # Use absolute imports
 from web_app.backend.models import ( # Group imports
@@ -22,6 +24,14 @@ from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError
 from web_app.backend.catalyst import CatalystAPI
 from web_app.backend.weapon_api import WeaponAPI
 from web_app.backend.manifest import ManifestManager
+
+# --- Pydantic Models for Chat (Moved Up) ---
+class ChatMessage(BaseModel):
+    message: str
+
+class ChatResponse(BaseModel):
+    reply: str
+# --- End Moved Models ---
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +45,7 @@ SECRET_KEY = os.getenv("SECRET_KEY", "a_very_secret_key_for_dev_only") # Use env
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30 # Should match Bungie's expiry if possible, but our JWT has its own life
 DATABASE_URL = "sqlite:///./catalysts.db"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # Uncomment
 
 if not all([BUNGIE_CLIENT_ID, BUNGIE_CLIENT_SECRET, BUNGIE_API_KEY]):
     logger.error("Missing one or more Bungie environment variables!")
@@ -359,6 +370,43 @@ async def get_all_weapons(current_user: User = Depends(get_current_user)):
         logger.error(f"Unexpected error fetching weapons for user {current_user.bungie_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch weapons data")
 
+# --- Chat Endpoint ---
+@app.post("/api/chat", response_model=ChatResponse) # Uncomment endpoint
+async def handle_chat(chat_message: ChatMessage):
+    """Handles receiving a user message and getting a reply from OpenAI."""
+    logger.info(f"Received chat message: '{chat_message.message}'")
+    if not OPENAI_API_KEY:
+        logger.error("OpenAI API key not configured.")
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+
+    try:
+        # Explicitly create httpx client ignoring environment variables (like proxies)
+        http_client = httpx.Client(trust_env=False) # Use trust_env=False
+        client = openai.OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+        
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo", # Or another model you prefer
+            messages=[
+                {"role": "system", "content": "You are a helpful Destiny 2 assistant."},
+                {"role": "user", "content": chat_message.message}
+            ]
+        )
+        reply = response.choices[0].message.content
+        logger.info(f"OpenAI reply: '{reply}'")
+        return ChatResponse(reply=reply)
+
+    except openai.APIError as e:
+        logger.error(f"OpenAI API returned an API Error: {e}")
+        raise HTTPException(status_code=500, detail=f"OpenAI API Error: {e}")
+    except openai.APIConnectionError as e:
+        logger.error(f"Failed to connect to OpenAI API: {e}")
+        raise HTTPException(status_code=503, detail="Could not connect to OpenAI")
+    except openai.RateLimitError as e:
+        logger.error(f"OpenAI API request exceeded rate limit: {e}")
+        raise HTTPException(status_code=429, detail="Rate limit exceeded with OpenAI")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during OpenAI chat: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error during chat processing")
 
 # Serve Static Files (React Build)
 # Make sure this path is correct relative to where you run uvicorn

@@ -7,6 +7,7 @@ import Layout from './components/Layout';
 import Dashboard from './pages/Dashboard';
 import Login from './pages/Login';
 import PrivateRoute from './components/PrivateRoute';
+import ChatPage from './pages/ChatPage';
 
 const theme = createTheme({
   palette: {
@@ -67,6 +68,14 @@ function App() {
                 element={
                   <PrivateRoute>
                     <Dashboard />
+                  </PrivateRoute>
+                }
+              />
+              <Route 
+                path="/chat"
+                element={
+                  <PrivateRoute>
+                    <ChatPage />
                   </PrivateRoute>
                 }
               />
