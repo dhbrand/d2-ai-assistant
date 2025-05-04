@@ -145,8 +145,9 @@ if __name__ == "__main__":
         if weapons:
             logger.info("First 5 weapons found:")
             for i, weapon in enumerate(weapons[:5]):
-                 # Log relevant info, avoiding overly verbose fields like description
-                 logger.info(f"  {i+1}. Name: {weapon.name}, Type: {weapon.item_type}, Tier: {weapon.tier_type}, Hash: {weapon.item_hash}, InstanceId: {weapon.instance_id}, Location: {weapon.location}")
+                 # Log relevant info, including perks
+                 perks_str = ", ".join(weapon.perks) if weapon.perks else "None"
+                 logger.info(f"  {i+1}. Name: {weapon.name}\n     Type: {weapon.item_type}, Tier: {weapon.tier_type}\n     Location: {weapon.location}\n     Perks: {perks_str}")
         else:
             logger.warning("No weapons were processed. Check previous logs for potential errors in API calls or manifest lookups within WeaponAPI.")
 

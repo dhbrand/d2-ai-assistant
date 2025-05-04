@@ -46,6 +46,7 @@ class Weapon(BaseModel):
     location: Optional[str] = None
     is_equipped: Optional[bool] = False
     damage_type: Optional[str] = "None"
+    perks: List[str] = []
     
     class Config:
         orm_mode = False
@@ -65,7 +66,8 @@ class Weapon(BaseModel):
             "item_sub_type": raw_data.get("item_sub_type", ""),
             "location": raw_data.get("location", ""),
             "is_equipped": raw_data.get("is_equipped", False),
-            "damage_type": raw_data.get("damage_type", "None")
+            "damage_type": raw_data.get("damage_type", "None"),
+            "perks": raw_data.get("perks", [])
         }
         return cls(**weapon_data)
 

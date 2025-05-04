@@ -15,6 +15,7 @@ import socket
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -42,6 +43,12 @@ logger.debug(f"Using Redirect URI: {REDIRECT_URI}")
 
 # Define token file path
 TOKEN_FILE = Path("token.json")
+
+# Pydantic model for token data (excluding refresh token for security)
+class TokenData(BaseModel):
+    access_token: str
+    expires_in: int
+    bungie_id: Optional[str] = None # Optional: Can be useful to associate token with user
 
 class OAuthCallbackHandler(socketserver.BaseRequestHandler):
     def __init__(self, request, client_address, server):

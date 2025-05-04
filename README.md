@@ -59,6 +59,31 @@ python generate_cert.py
 - Node.js 16+
 - Bungie.net API key (obtain from [Bungie Developer Portal](https://www.bungie.net/en/Application))
 
+## Authentication Flow
+
+The web application uses the standard OAuth 2.0 Authorization Code flow with PKCE (Proof Key for Code Exchange) disabled for interaction with the Bungie.net API. Here's a breakdown of how tokens are handled:
+
+1.  **Initial Login:** The user clicks "Login with Bungie", gets redirected to Bungie.net to authorize the application, and is then redirected back to the application's callback URL (`/auth/callback` on the backend).
+2.  **Token Exchange:** The backend exchanges the received authorization code for an **Access Token** and a **Refresh Token** directly with Bungie.
+3.  **Token Storage:**
+    *   **Access Token:** Short-lived (1 hour). Sent to the frontend and stored in `localStorage` along with its expiry time. It's used in the `Authorization: Bearer <token>` header for most authenticated API calls from the frontend to the backend.
+    *   **Refresh Token:** Long-lived (90 days). Stored securely *only* on the backend (associated with the user in the database). It is *never* sent to the frontend.
+4.  **Frontend Check on Startup:** When the frontend loads, it checks `localStorage`:
+    *   If no access token exists, the user is considered logged out.
+    *   If an access token exists, the frontend checks its expiry time locally. If it's expired, the token is removed from `localStorage` and the user is considered logged out locally. This is expected behavior, as the frontend cannot use an expired access token.
+5.  **Backend Refresh on Demand:**
+    *   When the frontend makes an authenticated API call to the backend, the backend validates the provided Access Token.
+    *   If the Access Token is valid, the call proceeds.
+    *   If the Access Token is *invalid* or *expired*, the backend automatically attempts to use the stored Refresh Token to get a *new* Access Token (and potentially a new Refresh Token) from Bungie.
+    *   If the refresh is successful, the backend updates the tokens stored for the user and proceeds with the original API request using the new Access Token.
+    *   If the refresh *fails* (e.g., the Refresh Token itself has expired after 90 days or been revoked), the backend returns an authentication error, and the user will typically need to log in again via the Bungie website.
+
+**Why this approach?**
+
+*   **Security:** Keeps the long-lived, powerful refresh token secure on the backend.
+*   **Separation of Concerns:** Frontend manages the usable access token; backend manages the refresh process.
+*   **Simplicity:** Avoids complex frontend logic to trigger refresh checks and securely identify the user to the backend without a valid access token.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
