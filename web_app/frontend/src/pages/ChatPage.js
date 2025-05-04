@@ -2,6 +2,7 @@ import React, { useState, useEffect, useContext } from 'react';
 import { Box, TextField, Button, Paper, Typography, List, ListItem, ListItemText, CircularProgress } from '@mui/material';
 import { AuthContext, useAuth } from '../contexts/AuthContext';
 import ReactMarkdown from 'react-markdown';
+import AdvancedMarkdownRenderer from '../components/AdvancedMarkdownRenderer';
 
 function ChatPage() {
   const { token } = useAuth();
@@ -107,8 +108,13 @@ function ChatPage() {
         <List>
           {messages.map((msg, index) => (
             <ListItem key={index} sx={{ textAlign: msg.role === 'user' ? 'right' : 'left' }}>
+              {/* Optionally add avatars here for user/assistant */}
               <ListItemText
-                primary={msg.role === 'assistant' ? <ReactMarkdown>{msg.content}</ReactMarkdown> : msg.content}
+                primary={
+                  msg.role === 'assistant'
+                    ? <AdvancedMarkdownRenderer markdown={msg.content} />
+                    : <span className="markdown-body">{msg.content}</span>
+                }
                 sx={{
                   bgcolor: msg.role === 'user' ? 'grey.700' : 'transparent',
                   color: 'text.primary',
