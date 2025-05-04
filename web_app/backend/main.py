@@ -28,6 +28,7 @@ from web_app.backend.manifest import ManifestManager
 # --- Pydantic Models for Chat (Moved Up) ---
 class ChatMessage(BaseModel):
     message: str
+    catalyst_context: Optional[List[CatalystData]] = None # Add optional context field
 
 class ChatResponse(BaseModel):
     reply: str
@@ -372,22 +373,42 @@ async def get_all_weapons(current_user: User = Depends(get_current_user)):
 
 # --- Chat Endpoint ---
 @app.post("/api/chat", response_model=ChatResponse) # Uncomment endpoint
-async def handle_chat(chat_message: ChatMessage):
-    """Handles receiving a user message and getting a reply from OpenAI."""
+async def handle_chat(chat_message: ChatMessage): # Updated model
+    """Handles receiving a user message and getting a reply from OpenAI, using catalyst context if provided."""
     logger.info(f"Received chat message: '{chat_message.message}'")
     if not OPENAI_API_KEY:
         logger.error("OpenAI API key not configured.")
         raise HTTPException(status_code=500, detail="OpenAI API key not configured")
 
     try:
+        # Construct system prompt
+        system_content = "You are a helpful Destiny 2 assistant."
+        if chat_message.catalyst_context:
+            logger.info("Received catalyst context, adding to system prompt.")
+            # Simple summarization - could be improved
+            completed_catalysts = [c.name for c in chat_message.catalyst_context if c.complete]
+            incomplete_catalysts = [f"{c.name} ({c.progress:.0f}%)" for c in chat_message.catalyst_context if not c.complete]
+            
+            context_summary = "\n\nUser's Catalyst Status:\n"
+            if completed_catalysts:
+                context_summary += f"- Completed: {', '.join(completed_catalysts)}\n"
+            if incomplete_catalysts:
+                context_summary += f"- In Progress: {', '.join(incomplete_catalysts)}\n"
+            if not completed_catalysts and not incomplete_catalysts:
+                 context_summary += "- No catalyst data available or none tracked.\n"
+                 
+            system_content += context_summary
+        else:
+            logger.info("No catalyst context received.")
+
         # Explicitly create httpx client ignoring environment variables (like proxies)
         http_client = httpx.Client(trust_env=False) # Use trust_env=False
         client = openai.OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
         
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo", # Or another model you prefer
+            model="gpt-3.5-turbo", 
             messages=[
-                {"role": "system", "content": "You are a helpful Destiny 2 assistant."},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": chat_message.message}
             ]
         )

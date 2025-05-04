@@ -1,10 +1,50 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useContext } from 'react';
 import { Box, TextField, Button, Paper, Typography, List, ListItem, ListItemText, CircularProgress } from '@mui/material';
+import { AuthContext, useAuth } from '../contexts/AuthContext';
 
 function ChatPage() {
+  const { token } = useAuth();
   const [messages, setMessages] = useState([]); // Stores { sender: 'user'/'assistant', text: 'message' }
   const [newMessage, setNewMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [catalystData, setCatalystData] = useState(null); // State to hold catalyst data
+  const [initialContextSent, setInitialContextSent] = useState(false); // Flag to send context only once
+
+  // Fetch catalyst data on component mount
+  useEffect(() => {
+    console.log('ChatPage useEffect triggered. Token:', token ? `${token.substring(0,5)}...` : 'null'); // Log effect start
+    
+    const fetchCatalysts = async () => {
+      console.log('fetchCatalysts called. Token:', token ? `${token.substring(0,5)}...` : 'null'); // Log function start
+      if (!token) {
+          console.log('fetchCatalysts: No token found, exiting.');
+          return; // Don't fetch if not logged in
+      }
+      setIsLoading(true); // Show loading indicator while fetching initial data
+      try {
+        const response = await fetch('https://localhost:8000/catalysts/all', {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+          },
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP error fetching catalysts! status: ${response.status}`);
+        }
+        const data = await response.json();
+        setCatalystData(data);
+        console.log("Catalyst data loaded for chat context:", data);
+      } catch (error) {
+        console.error('Error fetching catalyst data for chat:', error);
+        // Optionally add a message to the chat indicating failure to load context
+        const errorMessage = { sender: 'assistant', text: `Sorry, failed to load your catalyst data. Details: ${error.message}` };
+        setMessages(prevMessages => [...prevMessages, errorMessage]);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    fetchCatalysts();
+  }, [token]); // Re-fetch if token changes (e.g., after login)
 
   const handleSendMessage = async () => {
     if (!newMessage.trim()) return;
@@ -15,13 +55,24 @@ function ChatPage() {
     setIsLoading(true);
 
     try {
+      // Prepare request body
+      const requestBody = { 
+        message: userMessage.text 
+      };
+
+      // Add context only if it exists and hasn't been sent yet
+      if (catalystData && !initialContextSent) {
+        requestBody.catalyst_context = catalystData;
+        setInitialContextSent(true); // Mark context as sent
+        console.log("Sending initial catalyst context with message.");
+      }
+
       const response = await fetch('https://localhost:8000/api/chat', { // Use absolute path
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          // Add authentication headers if needed by your backend
         },
-        body: JSON.stringify({ message: userMessage.text }) // Send message in correct format
+        body: JSON.stringify(requestBody) // Send updated body with optional context
       });
 
       if (!response.ok) {
@@ -31,12 +82,6 @@ function ChatPage() {
       const data = await response.json();
       const assistantMessage = { sender: 'assistant', text: data.reply };
       setMessages(prevMessages => [...prevMessages, assistantMessage]);
-
-      // --- Placeholder Reply (Remove when API call is implemented) --- REMOVED
-      // await new Promise(resolve => setTimeout(resolve, 1000)); // Simulate network delay
-      // const placeholderReply = { sender: 'assistant', text: `Echo: ${userMessage.text}` };
-      // setMessages(prevMessages => [...prevMessages, placeholderReply]);
-      // --- End Placeholder ---
 
     } catch (error) {
       console.error('Error sending message:', error);
