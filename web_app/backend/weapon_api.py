@@ -96,8 +96,8 @@ class WeaponAPI:
                 access_token,
                 membership_type,
                 destiny_membership_id,
-                # Request vault, character inventories, instances, and sockets
-                [201, 205, 300, 305]  # 201=ProfileInv, 205=CharInv, 300=ItemInstances, 305=ItemSockets
+                # Request vault, character inventories, equipment, and sockets
+                [102, 201, 205, 305]  # 102=Vault, 201=CharInv, 205=CharEquip, 305=ItemSockets
             )
             
             if not profile_components_data:
