@@ -330,16 +330,19 @@ class CatalystAPI:
             elif "Launcher" in name:
                 weapon_type = "Launcher"
             
+            # Calculate overall progress
+            total_progress = sum(obj['progress'] for obj in objectives)
+            total_completion = sum(obj['completion'] for obj in objectives)
+            overall_progress = (total_progress / total_completion * 100) if total_completion > 0 else (100.0 if state['complete'] else 0.0)
+            
             return {
                 'name': name,
                 'description': description,
-                'icon': icon,
                 'objectives': objectives,
                 'complete': state['complete'],
-                'unlocked': state['unlocked'],
-                'recordHash': record_hash,
-                'discovered': self.discovery_mode and record_hash not in CATALYST_RECORD_HASHES,
-                'weaponType': weapon_type  # Add weaponType to the return value
+                'record_hash': str(record_hash),
+                'weapon_type': weapon_type,
+                'progress': overall_progress
             }
         except Exception as e:
             logger.error(f"Error getting catalyst info for record {record_hash}: {e}")

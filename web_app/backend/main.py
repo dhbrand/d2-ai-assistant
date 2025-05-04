@@ -4,12 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 from datetime import datetime, timedelta, timezone
 import os
 import logging
 from jose import JWTError, jwt
 from requests.exceptions import HTTPError
+import requests
 
 # Use absolute imports
 from web_app.backend.models import ( # Group imports
@@ -71,6 +72,11 @@ logger.info("Initializing WeaponAPI...")
 weapon_api = WeaponAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
 logger.info("WeaponAPI initialized.")
 
+# --- Globals & Setup ---
+
+# --- Caching Setup ---
+CACHE_DURATION = timedelta(minutes=5)
+_catalyst_cache: Dict[str, Tuple[datetime, List[CatalystData]]] = {}
 
 # --- Dependency Functions ---
 def get_db():
@@ -269,76 +275,50 @@ async def verify_token(current_user: User = Depends(get_current_user)):
 
 @app.get("/catalysts/all", response_model=List[CatalystData])
 async def get_all_catalysts(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Get all catalysts for the authenticated user"""
+    """Get all catalysts for the authenticated user, using a 5-minute cache."""
+    bungie_id = current_user.bungie_id
+    now = datetime.now(timezone.utc)
+
+    # Check cache
+    if bungie_id in _catalyst_cache:
+        cache_time, cached_data = _catalyst_cache[bungie_id]
+        if now - cache_time < CACHE_DURATION:
+            logger.info(f"Returning cached catalyst data for user {bungie_id}")
+            return cached_data
+        else:
+            logger.info(f"Cache expired for user {bungie_id}")
+
+    logger.info(f"Fetching fresh catalyst data for user {bungie_id}")
     try:
-        # Initialize CatalystAPI with API Key
-        logger.info("Initializing CatalystAPI...")
-        catalyst_api = CatalystAPI(api_key=BUNGIE_API_KEY)
-        
         # Get current access token from the authenticated user object
+        # The get_current_user dependency ensures this token is valid/refreshed
         access_token = current_user.access_token
         if not access_token:
-             # This shouldn't happen if get_current_user succeeded, but check defensively
-             logger.error(f"No access token found for user {current_user.id} after auth check.")
-             raise HTTPException(status_code=401, detail="Missing access token for request.")
+            # This should ideally not happen if get_current_user worked, but check defensively
+            logger.error(f"No access token available for user {bungie_id} in get_all_catalysts")
 
-        # Fetch catalysts from Bungie API, passing the token
+        # Fetch data from Bungie API via CatalystAPI
         logger.info("Fetching catalysts from Bungie API...")
+        # Note: catalyst_api is initialized globally now
         catalysts_data = catalyst_api.get_catalysts(access_token=access_token)
         logger.info(f"Retrieved {len(catalysts_data)} catalysts from API")
-        
-        # Update database with new catalyst data
-        updated_catalysts = []
-        for catalyst_data in catalysts_data:
-            try:
-                logger.debug(f"Processing catalyst: {catalyst_data.get('name', 'Unknown')}")
-                
-                # Debug the structure of a catalyst
-                if len(updated_catalysts) == 0:
-                    logger.debug(f"First catalyst data: {catalyst_data}")
-                
-                catalyst = db.query(Catalyst).filter(
-                    Catalyst.record_hash == str(catalyst_data['recordHash']),
-                    Catalyst.user_id == current_user.id
-                ).first()
-                
-                if not catalyst:
-                    logger.debug(f"Creating new catalyst entry for {catalyst_data['name']}")
-                    catalyst = Catalyst(
-                        user_id=current_user.id,
-                        record_hash=str(catalyst_data['recordHash']),
-                        name=catalyst_data['name'],
-                        description=catalyst_data['description'],
-                        weapon_type=catalyst_data.get('weaponType', 'Unknown'),
-                        objectives=catalyst_data['objectives'],
-                        complete=catalyst_data.get('complete', False),
-                        progress=catalyst_data.get('progress', 0.0)
-                    )
-                    db.add(catalyst)
-                else:
-                    logger.debug(f"Updating existing catalyst entry for {catalyst_data['name']}")
-                    # Update existing catalyst
-                    catalyst.name = catalyst_data['name']
-                    catalyst.description = catalyst_data['description']
-                    catalyst.weapon_type = catalyst_data.get('weaponType', 'Unknown')
-                    catalyst.objectives = catalyst_data['objectives']
-                    catalyst.complete = catalyst_data.get('complete', False)
-                    catalyst.progress = catalyst_data.get('progress', 0.0)
-                
-                updated_catalysts.append(catalyst)
-            except Exception as inner_e:
-                logger.error(f"Error processing individual catalyst: {inner_e}", exc_info=True)
-                # Continue processing other catalysts instead of failing
-                continue
-        
-        db.commit()
-        logger.info(f"Successfully processed {len(updated_catalysts)} catalysts")
-        return updated_catalysts
-        
+
+        # Convert raw dicts to Pydantic models (FastAPI does this automatically if returning raw list)
+        # We need to do it here if we want to cache the Pydantic models
+        processed_catalysts = [CatalystData.model_validate(c) for c in catalysts_data]
+
+        logger.info(f"Successfully processed {len(processed_catalysts)} catalysts")
+
+        # Update cache
+        _catalyst_cache[bungie_id] = (now, processed_catalysts)
+        logger.info(f"Updated cache for user {bungie_id}")
+
+        return processed_catalysts
+
     except Exception as e:
-        logger.error(f"Error in get_catalysts: {e}", exc_info=True)
-        # db.rollback() # Optionally rollback on error
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error fetching catalysts for user {bungie_id}: {e}", exc_info=True)
+        # Consider more specific error handling based on exception type
+        raise HTTPException(status_code=500, detail=f"Failed to fetch catalyst data: {str(e)}")
 
 @app.get("/weapons/all", response_model=List[Weapon]) # Use Weapon Pydantic model
 async def get_all_weapons(current_user: User = Depends(get_current_user)):
