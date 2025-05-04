@@ -97,15 +97,10 @@ class CatalystAPI:
         try:
             url = f"{self.base_url}/Destiny2/{membership_type}/Profile/{membership_id}/"
             
-            # Request all relevant components for triumphs and records
+            # Request only components relevant to catalyst records/collectibles
             components = [
-                "100",  # Profile info
-                "102",  # Profile inventory
-                "200",  # Characters
-                "201",  # Character inventories 
-                "202",  # Character progressions
-                "800",  # Profile collectibles
-                "900"   # Profile records
+                "800",  # Profile collectibles (Might be needed to check weapon ownership?)
+                "900"   # Profile records (Essential for catalyst status)
             ]
             
             params = {
