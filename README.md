@@ -111,6 +111,8 @@ python desktop_app.py
 
 **Important Note:** For local development, both the backend and frontend must run over **HTTPS** due to Bungie API requirements. The recommended way to handle local HTTPS is using `mkcert`.
 
+**Python Version:** As of [Current Date], there appear to be package compatibility issues with Python 3.13 on some systems (e.g., macOS ARM) involving SQLAlchemy/Pydantic. **It is strongly recommended to use Python 3.11 or 3.12 for the backend virtual environment.**
+
 1.  **Install `mkcert` (if not already done):**
     Follow the instructions for your OS at [https://github.com/FiloSottile/mkcert#installation](https://github.com/FiloSottile/mkcert#installation). For macOS with Homebrew:
     ```bash

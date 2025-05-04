@@ -8,42 +8,58 @@ function ChatPage() {
   const [newMessage, setNewMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [catalystData, setCatalystData] = useState(null); // State to hold catalyst data
+  const [weaponData, setWeaponData] = useState(null); // State to hold weapon data
   const [initialContextSent, setInitialContextSent] = useState(false); // Flag to send context only once
 
-  // Fetch catalyst data on component mount
+  // Fetch catalyst and weapon data on component mount
   useEffect(() => {
     console.log('ChatPage useEffect triggered. Token:', token ? `${token.substring(0,5)}...` : 'null'); // Log effect start
     
-    const fetchCatalysts = async () => {
-      console.log('fetchCatalysts called. Token:', token ? `${token.substring(0,5)}...` : 'null'); // Log function start
-      if (!token) {
-          console.log('fetchCatalysts: No token found, exiting.');
-          return; // Don't fetch if not logged in
-      }
-      setIsLoading(true); // Show loading indicator while fetching initial data
-      try {
-        const response = await fetch('https://localhost:8000/catalysts/all', {
-          headers: {
-            'Authorization': `Bearer ${token}`,
-          },
-        });
-        if (!response.ok) {
-          throw new Error(`HTTP error fetching catalysts! status: ${response.status}`);
+    const fetchAllContextData = async () => {
+        console.log('fetchAllContextData called. Token:', token ? `${token.substring(0,5)}...` : 'null'); 
+        if (!token) {
+            console.log('fetchAllContextData: No token found, exiting.');
+            return; 
         }
-        const data = await response.json();
-        setCatalystData(data);
-        console.log("Catalyst data loaded for chat context:", data);
-      } catch (error) {
-        console.error('Error fetching catalyst data for chat:', error);
-        // Optionally add a message to the chat indicating failure to load context
-        const errorMessage = { sender: 'assistant', text: `Sorry, failed to load your catalyst data. Details: ${error.message}` };
-        setMessages(prevMessages => [...prevMessages, errorMessage]);
-      } finally {
-        setIsLoading(false);
-      }
+        setIsLoading(true); 
+        try {
+            // Fetch catalysts and weapons in parallel
+            const [catalystResponse, weaponResponse] = await Promise.all([
+                fetch('https://localhost:8000/catalysts/all', {
+                    headers: { 'Authorization': `Bearer ${token}` },
+                }),
+                fetch('https://localhost:8000/weapons/all', {
+                    headers: { 'Authorization': `Bearer ${token}` },
+                })
+            ]);
+
+            // Process catalyst data
+            if (!catalystResponse.ok) {
+                throw new Error(`HTTP error fetching catalysts! status: ${catalystResponse.status}`);
+            }
+            const catalystResult = await catalystResponse.json();
+            setCatalystData(catalystResult);
+            console.log("Catalyst data loaded for chat context:", catalystResult);
+
+            // Process weapon data
+            if (!weaponResponse.ok) {
+                throw new Error(`HTTP error fetching weapons! status: ${weaponResponse.status}`);
+            }
+            const weaponResult = await weaponResponse.json();
+            setWeaponData(weaponResult);
+            console.log("Weapon data loaded for chat context:", weaponResult);
+
+        } catch (error) {
+            console.error('Error fetching context data for chat:', error);
+            const errorMessage = { sender: 'assistant', text: `Sorry, failed to load context data. Details: ${error.message}` };
+            setMessages(prevMessages => [...prevMessages, errorMessage]);
+        } finally {
+            setIsLoading(false);
+        }
     };
 
-    fetchCatalysts();
+    fetchAllContextData();
+
   }, [token]); // Re-fetch if token changes (e.g., after login)
 
   const handleSendMessage = async () => {
@@ -55,17 +71,18 @@ function ChatPage() {
     setIsLoading(true);
 
     try {
-      // Prepare request body
-      const requestBody = { 
-        message: userMessage.text 
-      };
+        // Prepare request body
+        const requestBody = { 
+            message: userMessage.text 
+        };
 
-      // Add context only if it exists and hasn't been sent yet
-      if (catalystData && !initialContextSent) {
-        requestBody.catalyst_context = catalystData;
-        setInitialContextSent(true); // Mark context as sent
-        console.log("Sending initial catalyst context with message.");
-      }
+        // Add context only if it exists and hasn't been sent yet
+        if (!initialContextSent && (catalystData || weaponData)) { // Check if either data exists
+            if (catalystData) requestBody.catalyst_context = catalystData;
+            if (weaponData) requestBody.weapon_context = weaponData; // Add weapon data
+            setInitialContextSent(true); // Mark context as sent
+            console.log("Sending initial context (catalysts/weapons) with message.");
+        }
 
       const response = await fetch('https://localhost:8000/api/chat', { // Use absolute path
         method: 'POST',
