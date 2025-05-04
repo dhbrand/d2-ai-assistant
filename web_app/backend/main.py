@@ -29,6 +29,7 @@ from web_app.backend.manifest import ManifestManager
 class ChatMessage(BaseModel):
     message: str
     catalyst_context: Optional[List[CatalystData]] = None # Add optional context field
+    weapon_context: Optional[List[Weapon]] = None # Add optional weapon context
 
 class ChatResponse(BaseModel):
     reply: str
@@ -89,6 +90,9 @@ logger.info("WeaponAPI initialized.")
 # --- Caching Setup ---
 CACHE_DURATION = timedelta(minutes=5)
 _catalyst_cache: Dict[str, Tuple[datetime, List[CatalystData]]] = {}
+
+WEAPON_CACHE_DURATION = timedelta(minutes=10) # Add weapon cache duration
+_weapon_cache: Dict[str, Tuple[datetime, List[Weapon]]] = {} # Add weapon cache dict
 
 # --- Dependency Functions ---
 def get_db():
@@ -334,8 +338,20 @@ async def get_all_catalysts(current_user: User = Depends(get_current_user), db: 
 
 @app.get("/weapons/all", response_model=List[Weapon]) # Use Weapon Pydantic model
 async def get_all_weapons(current_user: User = Depends(get_current_user)):
-    """Endpoint to fetch all weapons for the authenticated user."""
-    logger.info(f"Fetching weapons for user: {current_user.bungie_id}")
+    """Endpoint to fetch all weapons for the authenticated user, using a 10-minute cache."""
+    bungie_id = current_user.bungie_id
+    now = datetime.now(timezone.utc)
+
+    # Check cache
+    if bungie_id in _weapon_cache:
+        cache_time, cached_data = _weapon_cache[bungie_id]
+        if now - cache_time < WEAPON_CACHE_DURATION:
+            logger.info(f"Returning cached weapon data for user {bungie_id}")
+            return cached_data
+        else:
+            logger.info(f"Weapon cache expired for user {bungie_id}")
+
+    logger.info(f"Fetching fresh weapon data for user: {bungie_id}")
     
     # Ensure we have a valid access token (refreshed by get_current_user if needed)
     access_token = current_user.access_token 
@@ -360,9 +376,14 @@ async def get_all_weapons(current_user: User = Depends(get_current_user)):
         weapons = weapon_api.get_all_weapons(
             access_token=access_token,
             membership_type=membership_type,
-            membership_id=membership_id
+            destiny_membership_id=membership_id # Correct keyword argument name
         )
         logger.info(f"Successfully fetched {len(weapons)} weapons for user {current_user.bungie_id}")
+        
+        # Update cache before returning
+        _weapon_cache[bungie_id] = (now, weapons)
+        logger.info(f"Updated weapon cache for user {bungie_id}")
+        
         return weapons
         
     except HTTPException as http_exc: # Re-raise known HTTP exceptions
@@ -372,9 +393,9 @@ async def get_all_weapons(current_user: User = Depends(get_current_user)):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch weapons data")
 
 # --- Chat Endpoint ---
-@app.post("/api/chat", response_model=ChatResponse) # Uncomment endpoint
+@app.post("/api/chat", response_model=ChatResponse)
 async def handle_chat(chat_message: ChatMessage): # Updated model
-    """Handles receiving a user message and getting a reply from OpenAI, using catalyst context if provided."""
+    """Handles receiving a user message and getting a reply from OpenAI, using catalyst and weapon context if provided."""
     logger.info(f"Received chat message: '{chat_message.message}'")
     if not OPENAI_API_KEY:
         logger.error("OpenAI API key not configured.")
@@ -382,27 +403,44 @@ async def handle_chat(chat_message: ChatMessage): # Updated model
 
     try:
         # Construct system prompt
-        system_content = "You are a helpful Destiny 2 assistant."
+        system_content = "You are a helpful Destiny 2 assistant." 
+        context_summary = "" # Initialize context summary
+
+        # Add Catalyst Context
         if chat_message.catalyst_context:
             logger.info("Received catalyst context, adding to system prompt.")
-            # Simple summarization - could be improved
             completed_catalysts = [c.name for c in chat_message.catalyst_context if c.complete]
             incomplete_catalysts = [f"{c.name} ({c.progress:.0f}%)" for c in chat_message.catalyst_context if not c.complete]
             
-            context_summary = "\n\nUser's Catalyst Status:\n"
+            context_summary += "\n\nUser's Catalyst Status:\n"
             if completed_catalysts:
                 context_summary += f"- Completed: {', '.join(completed_catalysts)}\n"
             if incomplete_catalysts:
                 context_summary += f"- In Progress: {', '.join(incomplete_catalysts)}\n"
             if not completed_catalysts and not incomplete_catalysts:
                  context_summary += "- No catalyst data available or none tracked.\n"
-                 
-            system_content += context_summary
         else:
             logger.info("No catalyst context received.")
+            
+        # Add Weapon Context
+        if chat_message.weapon_context:
+            logger.info("Received weapon context, adding to system prompt.")
+            # Simple summary - just list names for now. Could be much more detailed.
+            weapon_names = [w.name for w in chat_message.weapon_context]
+            context_summary += "\n\nUser's Weapons (Inventory Sample):\n"
+            if weapon_names:
+                context_summary += f"- {', '.join(weapon_names)}\n"
+            else:
+                context_summary += "- No weapon data available.\n"
+        else:
+            logger.info("No weapon context received.")
+
+        # Append summary to system content if it exists
+        if context_summary:
+            system_content += context_summary
 
         # Explicitly create httpx client ignoring environment variables (like proxies)
-        http_client = httpx.Client(trust_env=False) # Use trust_env=False
+        http_client = httpx.Client(trust_env=False) 
         client = openai.OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
         
         response = client.chat.completions.create(
