@@ -37,7 +37,7 @@ function ChatPage() {
         headers: {
           'Content-Type': 'application/json',
           // Include token if your API needs authentication for chat
-          // 'Authorization': `Bearer ${token}` 
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify(requestBody) 
       });
