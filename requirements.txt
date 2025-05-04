@@ -8,4 +8,6 @@ pydantic==2.8.2
 # Add OpenAI library
 openai==1.35.13 # Re-enabled for chat feature
 # Add httpx explicitly
-httpx==0.28.1 
+httpx==0.28.1
+# Add dotenv for test script
+python-dotenv==1.0.1 

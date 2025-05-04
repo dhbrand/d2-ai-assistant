@@ -13,6 +13,7 @@ from requests.exceptions import HTTPError
 import requests
 import openai # Uncomment OpenAI import
 import httpx # Import httpx
+import json
 
 # Use absolute imports
 from web_app.backend.models import ( # Group imports
@@ -265,6 +266,22 @@ async def handle_auth_callback(callback_data: CallbackData, request: Request, db
         
         db.commit()
         logger.info(f"Successfully stored/updated tokens for user {bungie_id}")
+
+        # --- Save token to file for test script/external use ---
+        try:
+            token_file_data = {
+                'access_token': access_token,
+                'refresh_token': refresh_token, # Optional, but useful for debugging
+                'expires_in': expires_in,
+                'fetched_at': now_utc.timestamp(), # Store fetch time as Unix timestamp
+                'bungie_id': bungie_id # Also useful
+            }
+            with open("token.json", 'w') as f:
+                json.dump(token_file_data, f, indent=4)
+            logger.info("Successfully wrote token data to token.json")
+        except Exception as file_err:
+            logger.error(f"Failed to write token data to token.json: {file_err}")
+        # --- End save token to file ---
 
         # Return only access token and expiry to frontend
         return {

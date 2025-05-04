@@ -120,28 +120,45 @@ class WeaponAPI:
                         
                         if "itemHash" in item:
                             # Get item definition from manifest
-                            # This is where you'd use self.manifest.get_definition("DestinyInventoryItemDefinition", item["itemHash"])
-                            # For now, we'll just create a dummy weapon with the hash
+                            item_def = self.manifest.get_definition("DestinyInventoryItemDefinition", item["itemHash"])
                             
-                            # Create a basic weapon object with available data
-                            raw_weapon = {
-                                "item_hash": item.get("itemHash"),
-                                "instance_id": item.get("itemInstanceId"),
-                                "location": f"equipped_{character_id}" if item.get("isEquipped") else f"inventory_{character_id}",
-                                "is_equipped": item.get("isEquipped", False),
-                                "damage_type": item.get("damageType", 0),
-                                # These would come from the manifest in a real implementation
-                                "name": f"Weapon {item.get('itemHash')}",
-                                "description": f"A weapon with hash {item.get('itemHash')}",
-                                "icon_url": "https://www.bungie.net/common/destiny2_content/icons/e4a1a5aaeb9f65cc5276fd4d86799103.jpg",
-                                "tier_type": "Legendary",
-                                "item_type": "Auto Rifle",
-                                "item_sub_type": "Precision Frame"
-                            }
-                            
-                            # Use the from_dict method to create a valid Weapon object
-                            weapon = Weapon.from_dict(raw_weapon)
-                            weapons.append(weapon)
+                            # Check if it's a weapon (itemType=3)
+                            if item_def and item_def.get('itemType') == ITEM_TYPE_WEAPON:
+                                # Extract real data from definition
+                                display_props = item_def.get('displayProperties', {})
+                                name = display_props.get('name', f"Unknown Weapon {item.get('itemHash')}")
+                                description = display_props.get('description', '')
+                                icon_url = "https://www.bungie.net" + display_props.get('icon', '') if display_props.get('icon') else ''
+                                tier_type = item_def.get('inventory', {}).get('tierTypeName', 'Unknown')
+                                item_type = item_def.get('itemTypeDisplayName', 'Unknown Weapon Type')
+                                item_sub_type = item_def.get('itemSubTypeDisplayName', '')
+                                
+                                # Convert damage type integer to string name
+                                damage_type_int = item.get("damageType", 0)
+                                damage_type_str = DAMAGE_TYPE_MAP.get(damage_type_int, "Unknown")
+                                
+                                # Create a weapon object with real data, ensuring correct types
+                                raw_weapon = {
+                                    "item_hash": str(item.get("itemHash")), # Convert hash to string
+                                    "instance_id": item.get("itemInstanceId"),
+                                    "location": f"equipped_{character_id}" if item.get("isEquipped") else f"inventory_{character_id}",
+                                    "is_equipped": item.get("isEquipped", False),
+                                    "damage_type": damage_type_str, # Use string name
+                                    "name": name,
+                                    "description": description,
+                                    "icon_url": icon_url,
+                                    "tier_type": tier_type,
+                                    "item_type": item_type,
+                                    "item_sub_type": item_sub_type
+                                }
+                                
+                                # Use Pydantic's validation method
+                                try:
+                                    weapon = Weapon.model_validate(raw_weapon)
+                                    weapons.append(weapon)
+                                except Exception as val_err:
+                                     logger.warning(f"Pydantic validation failed for weapon {name} ({item.get('itemHash')}): {val_err}")
+                            # End of weapon check
             
             # Process profile inventory (vault)
             if "profileInventory" in profile_components_data.get("Response", {}):
@@ -149,24 +166,40 @@ class WeaponAPI:
                 
                 for item in profile_inventory.get("items", []):
                     if "itemHash" in item:
-                        raw_weapon = {
-                            "item_hash": item.get("itemHash"),
-                            "instance_id": item.get("itemInstanceId"),
-                            "location": "vault",
-                            "is_equipped": False,
-                            "damage_type": item.get("damageType", 0),
-                            # These would come from the manifest in a real implementation
-                            "name": f"Vault Weapon {item.get('itemHash')}",
-                            "description": f"A weapon in the vault with hash {item.get('itemHash')}",
-                            "icon_url": "https://www.bungie.net/common/destiny2_content/icons/e4a1a5aaeb9f65cc5276fd4d86799103.jpg",
-                            "tier_type": "Legendary",
-                            "item_type": "Hand Cannon",
-                            "item_sub_type": "Adaptive Frame"
-                        }
+                        item_def = self.manifest.get_definition("DestinyInventoryItemDefinition", item["itemHash"])
                         
-                        # Use the from_dict method to create a valid Weapon object
-                        weapon = Weapon.from_dict(raw_weapon)
-                        weapons.append(weapon)
+                        if item_def and item_def.get('itemType') == ITEM_TYPE_WEAPON:
+                            display_props = item_def.get('displayProperties', {})
+                            name = display_props.get('name', f"Unknown Weapon {item.get('itemHash')}")
+                            description = display_props.get('description', '')
+                            icon_url = "https://www.bungie.net" + display_props.get('icon', '') if display_props.get('icon') else ''
+                            tier_type = item_def.get('inventory', {}).get('tierTypeName', 'Unknown')
+                            item_type = item_def.get('itemTypeDisplayName', 'Unknown Weapon Type')
+                            item_sub_type = item_def.get('itemSubTypeDisplayName', '')
+                                
+                            # Convert damage type integer to string name
+                            damage_type_int = item.get("damageType", 0)
+                            damage_type_str = DAMAGE_TYPE_MAP.get(damage_type_int, "Unknown")
+                                
+                            raw_weapon = {
+                                "item_hash": str(item.get("itemHash")), # Convert hash to string
+                                "instance_id": item.get("itemInstanceId"),
+                                "location": "vault",
+                                "is_equipped": False,
+                                "damage_type": damage_type_str, # Use string name
+                                "name": name,
+                                "description": description,
+                                "icon_url": icon_url,
+                                "tier_type": tier_type,
+                                "item_type": item_type,
+                                "item_sub_type": item_sub_type
+                            }
+                            
+                            try:
+                                weapon = Weapon.model_validate(raw_weapon)
+                                weapons.append(weapon)
+                            except Exception as val_err:
+                                logger.warning(f"Pydantic validation failed for vault weapon {name} ({item.get('itemHash')}): {val_err}")
                         
             logger.info(f"Found {len(weapons)} weapons")
             return weapons
