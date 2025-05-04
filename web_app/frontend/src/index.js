@@ -4,6 +4,7 @@ import App from './App';
 import { ThemeProvider } from '@mui/material/styles';
 import { theme } from './theme';
 import { AuthProvider } from './contexts/AuthContext';
+import './index.css';
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(

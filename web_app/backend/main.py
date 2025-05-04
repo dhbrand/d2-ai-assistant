@@ -30,6 +30,7 @@ from web_app.backend.models import ( # Group imports
 from web_app.backend.catalyst import CatalystAPI
 from web_app.backend.weapon_api import WeaponAPI
 from web_app.backend.manifest import ManifestManager
+from web_app.backend.voice import router as voice_router
 
 # --- Pydantic Models for Chat (Moved Up) ---
 class ChatMessage(BaseModel):
@@ -38,11 +39,13 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
-    token_data: Optional[TokenData] = None # Allow frontend to send token if needed
-    model_name: Optional[str] = None # Add field for model selection
+    previous_response_id: Optional[str] = None
+    token_data: Optional[TokenData] = None
+    model_name: Optional[str] = None
 
 class ChatResponse(BaseModel):
     message: ChatMessage
+    response_id: Optional[str] = None
 
 # --- Pydantic model for listing models ---
 class ModelInfo(BaseModel):
@@ -336,7 +339,7 @@ async def handle_auth_callback(callback_data: CallbackData, request: Request, db
         #     }
         # }
         return {
-            "status": "success",
+            "status": "success", 
             "access_token": encoded_jwt, # Send the JWT
             "token_type": "bearer",
             "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60 # Send JWT expiry in seconds
@@ -389,7 +392,7 @@ async def get_all_catalysts_endpoint(current_user: User = Depends(get_current_us
         catalyst_api_instance = CatalystAPI(api_key=BUNGIE_API_KEY)
         catalysts_data = catalyst_api_instance.get_catalysts(access_token=access_token)
         logger.info(f"Retrieved {len(catalysts_data)} catalysts from API")
-
+        
         # Convert raw dicts to Pydantic models (FastAPI does this automatically if returning raw list)
         # We need to do it here if we want to cache the Pydantic models
         processed_catalysts = [CatalystData.model_validate(c) for c in catalysts_data]
@@ -401,7 +404,7 @@ async def get_all_catalysts_endpoint(current_user: User = Depends(get_current_us
         logger.info(f"Updated cache for user {bungie_id}")
 
         return processed_catalysts
-
+        
     except Exception as e:
         logger.error(f"Error fetching catalysts for user {bungie_id}: {e}", exc_info=True)
         # Consider more specific error handling based on exception type
@@ -623,15 +626,15 @@ async def assistants_chat_endpoint(request: ChatRequest, current_user: User = De
         response = client.responses.create(
             model="gpt-4o",  # or another supported model
             input=full_input,
-            tools=[{"type": "web_search"}]
+            tools=[{"type": "web_search"}],
+            previous_response_id=request.previous_response_id if request.previous_response_id else None
         )
-        # Extract the first text output, skipping tool/function call objects
         output_text = next(
             (out.content[0].text for out in response.output if hasattr(out, "content") and out.content and hasattr(out.content[0], "text")),
             "(No text response from model.)"
         )
         ai_message = ChatMessage(role="assistant", content=output_text)
-        return ChatResponse(message=ai_message)
+        return ChatResponse(message=ai_message, response_id=response.id)
     except Exception as e:
         logger.error(f"Error with OpenAI Responses API: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to get response from OpenAI")
@@ -681,6 +684,8 @@ else:
 def shutdown_event():
     logger.info("Closing manifest database connection...")
     manifest_manager.close()
+
+app.include_router(voice_router)
 
 if __name__ == "__main__":
     import uvicorn

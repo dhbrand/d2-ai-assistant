@@ -11,6 +11,7 @@ import {
 } from '@mui/material';
 import { useAuth } from '../contexts/AuthContext';
 import AdvancedMarkdownRenderer from '../components/AdvancedMarkdownRenderer';
+import VoiceInputButton from '../components/VoiceInputButton';
 
 function ChatPage() {
   const { token } = useAuth();
@@ -18,6 +19,7 @@ function ChatPage() {
   const [newMessage, setNewMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
+  const [previousResponseId, setPreviousResponseId] = useState(null);
   const messagesEndRef = useRef(null);
   const messageListRef = useRef(null);
 
@@ -66,6 +68,7 @@ function ChatPage() {
             role: msg.role,
             content: msg.content,
           })),
+          previous_response_id: previousResponseId,
         }),
       });
 
@@ -83,6 +86,7 @@ function ChatPage() {
       const data = JSON.parse(responseText);
       const assistantMessage = { role: 'assistant', content: data.message.content };
       setMessages(prev => [...prev, assistantMessage]);
+      setPreviousResponseId(data.response_id);
     } catch (error) {
       console.error(error);
       setMessages(prev => [
@@ -208,6 +212,7 @@ function ChatPage() {
         >
           Send
         </Button>
+        <VoiceInputButton onTranscription={setNewMessage} />
       </Box>
     </Box>
   );
