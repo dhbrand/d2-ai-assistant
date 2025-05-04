@@ -30,9 +30,9 @@ function ChatPage() {
         };
 
         // Log the body being sent for debugging
-        console.log("Sending request to /api/chat with body:", JSON.stringify(requestBody));
+        console.log("Sending request to /api/assistants/chat with body:", JSON.stringify(requestBody));
 
-      const response = await fetch('https://localhost:8000/api/chat', { 
+      const response = await fetch('https://localhost:8000/api/assistants/chat', { 
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

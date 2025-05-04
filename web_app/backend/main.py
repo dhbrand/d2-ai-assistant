@@ -17,6 +17,8 @@ import json
 import time
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+import threading
+from collections import defaultdict
 
 # Use absolute imports
 from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError, TokenData # Import TokenData here
@@ -64,6 +66,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30 # Should match Bungie's expiry if possible, but our JWT has its own life
 DATABASE_URL = "sqlite:///./catalysts.db"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # Uncomment
+OPENAI_ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID")
 
 if not all([BUNGIE_CLIENT_ID, BUNGIE_CLIENT_SECRET, BUNGIE_API_KEY]):
     logger.error("Missing one or more Bungie environment variables!")
@@ -120,6 +123,10 @@ _catalyst_cache: Dict[str, Tuple[datetime, List[CatalystData]]] = {}
 
 WEAPON_CACHE_DURATION = timedelta(minutes=10) # Add weapon cache duration
 _weapon_cache: Dict[str, Tuple[datetime, List[Weapon]]] = {} # Add weapon cache dict
+
+# In-memory mapping: user_id -> thread_id (for demo; replace with DB for production)
+user_thread_map = defaultdict(str)
+user_thread_lock = threading.Lock()
 
 # --- Dependency Functions ---
 def get_db():
@@ -567,127 +574,114 @@ async def get_all_weapons_for_chat(current_user: User, manifest_manager: Manifes
         logger.error(f"Unexpected error fetching weapons for user {current_user.bungie_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch weapons data")
 
-@app.post("/api/chat", response_model=ChatResponse)
-# Inject manifest_manager via dependency as well
-# Update dependency to use the new function name
-async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user_from_token), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
-    # --- Initialize OpenAI Client within endpoint (for debugging NameError) ---
-    logger.info("Initializing OpenAI client...")
-    local_openai_client = None
-    if not OPENAI_API_KEY:
-        logger.error("OpenAI API Key is missing. Cannot initialize client.")
-        raise HTTPException(status_code=503, detail="OpenAI API key not configured")
+@app.post("/api/assistants/chat", response_model=ChatResponse)
+async def assistants_chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user_from_token), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
+    """
+    Chat endpoint using OpenAI Assistants API. Maintains a persistent thread per user and injects live Destiny 2 data.
+    """
+    if not OPENAI_API_KEY or not OPENAI_ASSISTANT_ID:
+        logger.error("OpenAI API key or Assistant ID missing.")
+        raise HTTPException(status_code=503, detail="OpenAI API key or Assistant ID not configured")
+
+    # --- Get or create thread for this user ---
+    user_id = str(current_user.id)
+    with user_thread_lock:
+        thread_id = user_thread_map.get(user_id)
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    if not thread_id:
+        thread = client.beta.threads.create()
+        thread_id = thread.id
+        with user_thread_lock:
+            user_thread_map[user_id] = thread_id
+        logger.info(f"Created new thread {thread_id} for user {user_id}")
+    else:
+        logger.info(f"Using existing thread {thread_id} for user {user_id}")
+
+    # --- Fetch live Destiny 2 data ---
     try:
-        # Initialize httpx client without the problematic 'proxies' argument
-        http_client = httpx.Client(trust_env=False)
-        local_openai_client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
-        logger.info("OpenAI client initialized successfully within endpoint (trust_env=False).")
-    except Exception as e_init:
-        logger.error(f"Failed to initialize OpenAI client within endpoint: {e_init}", exc_info=True)
-        raise HTTPException(status_code=503, detail="Failed to initialize AI assistant client")
-    # --- End Per-Request Initialization ---
-
-    # Use the locally initialized client
-    if not local_openai_client:
-        # This condition should technically be unreachable if the try/except above works,
-        # but kept for robustness.
-        raise HTTPException(status_code=503, detail="OpenAI client could not be initialized")
-
-    user_message = request.messages[-1] # Get the latest user message
-    conversation_history = request.messages # Include previous messages if sent
-
-    # --- Fetch Context Data ---
-    context_str = "No additional Destiny 2 data available."
-    try:
-        # Fetch data using the current_user and injected manifest_manager object
-        # Call the correctly named helper functions
-        logger.info(f"Fetching context data for user {current_user.bungie_id}...")
         weapons = await get_all_weapons_for_chat(current_user, manifest_manager)
         catalysts = await get_all_catalysts_for_chat(current_user, manifest_manager)
-
-        # Format data for the prompt (simple string representation)
-        weapon_details = []
-        for w in weapons:
-            # Format perks list, handle empty list
-            perks_str = ", ".join(w.perks) if w.perks else "No specific perks found"
-            detail = (
-                f"- {w.name} ({w.tier_type} {w.item_type} - {w.item_sub_type}, {w.damage_type} Damage)\n"
-                f"  Location: {w.location or 'Unknown'}, Equipped: {w.is_equipped}"
-                f"\n  Perks: {perks_str}"
-                # Optionally add hash/instance ID:
-                # f"\n  Hash: {w.item_hash}, Instance: {w.instance_id or 'N/A'}"
-            )
-            weapon_details.append(detail)
-        weapon_context = "\n\n".join(weapon_details) # Add extra newline between weapons
-
-        catalyst_context = "\n".join([
-            f"- {c.name}: {'Complete' if c.complete else 'Incomplete'} ({'/'.join([f'{o.description}: {o.progress}/{o.completion}' for o in c.objectives])})"
-            for c in catalysts
-        ])
-
-        context_str = (
-            f"Here is the user's current Destiny 2 weapon and catalyst information:\n\n"
-            f"**Weapons ({len(weapons)}):**\n{weapon_context}\n\n"
-            f"**Catalysts ({len(catalysts)}):**\n{catalyst_context}"
-        )
-        logger.info(f"Generated context string with {len(weapons)} weapons and {len(catalysts)} catalysts for user {current_user.bungie_id}.")
-
-    except HTTPException as e:
-        # Log HTTP errors during context fetching but continue
-        logger.error(f"Failed to fetch context data for user {current_user.bungie_id} due to HTTPException: {e.detail}")
-        context_str = "Could not retrieve current Destiny 2 data. Answer based on general knowledge."
     except Exception as e:
-        # Log other unexpected errors during context fetching but continue
-        logger.error(f"An unexpected error occurred fetching context data for user {current_user.bungie_id}: {e}", exc_info=True)
-        context_str = "An error occurred retrieving current Destiny 2 data. Answer based on general knowledge."
+        logger.error(f"Error fetching Destiny 2 data for Assistant context: {e}", exc_info=True)
+        weapons = []
+        catalysts = []
 
-    # --- Prepare messages for OpenAI ---
-    system_prompt = ChatMessage(
-        role="system",
-        content=(
-            "You are a helpful assistant knowledgeable about Destiny 2. "
-            "Use the provided player inventory information to answer questions accurately. "
-            "The provided weapon list includes items across all characters and the vault. Use the 'Location' field to distinguish if needed. "
-            "Answer each question based *only* on the current request and the provided data. Do not assume filters or context from previous questions unless the user explicitly restates them. "
-            "If the user asks about their weapons, catalysts, or progress, refer to the data below. "
-            "If the user asks to see weapons/catalysts matching certain criteria (e.g., rarity, type, location, perk), list the items from the data that match. "
-            "When asked for counts, provide the total count based on the provided lists. "
-            "If the data is unavailable or doesn't contain the answer (e.g., specific stats, power level), say so explicitly. "
-            "Keep your answers concise and relevant to Destiny 2.\n\n"
-            f"{context_str}"
+    # --- Format context string ---
+    weapon_details = []
+    for w in weapons:
+        perks_str = ", ".join(w.perks) if w.perks else "No specific perks found"
+        detail = (
+            f"- {w.name} ({w.tier_type} {w.item_type} - {w.item_sub_type}, {w.damage_type} Damage)\n"
+            f"  Location: {w.location or 'Unknown'}, Equipped: {w.is_equipped}"
+            f"\n  Perks: {perks_str}"
         )
+        weapon_details.append(detail)
+    weapon_context = "\n\n".join(weapon_details)
+    catalyst_context = "\n".join([
+        f"- {c.name}: {'Complete' if c.complete else 'Incomplete'} ({'/'.join([f'{o.description}: {o.progress}/{o.completion}' for o in c.objectives])})"
+        for c in catalysts
+    ])
+    context_str = (
+        f"Here is the user's current Destiny 2 weapon and catalyst information:\n\n"
+        f"**Weapons ({len(weapons)}):**\n{weapon_context}\n\n"
+        f"**Catalysts ({len(catalysts)}):**\n{catalyst_context}"
     )
 
-    messages_for_api = [system_prompt.model_dump()] + [msg.model_dump() for msg in conversation_history]
-
+    # --- Add user message and context to thread ---
     try:
-        logger.info(f"Sending {len(messages_for_api)} messages to OpenAI API.")
-        # logger.debug(f"Messages for API: {messages_for_api}") # Potentially very verbose
-
-        # Determine which model to use
-        # Use requested model or default to gpt-4o
-        model_to_use = request.model_name if request.model_name else "gpt-4o"
-        logger.info(f"Using OpenAI model: {model_to_use}")
-
-        # Use the local client instance
-        chat_completion = local_openai_client.chat.completions.create(
-            model=model_to_use, # Use the selected model
-            messages=messages_for_api,
+        # Add context as a user message (Assistants API only allows 'user' or 'assistant')
+        client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",  # changed from 'system' to 'user'
+            content=context_str
         )
-        response_content = chat_completion.choices[0].message.content
-        logger.info("Received response from OpenAI API.")
-        # logger.debug(f"OpenAI Response: {response_content}")
-
-        ai_message = ChatMessage(role="assistant", content=response_content or "...") # Ensure content is not None
-
-        return ChatResponse(message=ai_message)
-
+        # Add user message
+        user_message = request.messages[-1].content if request.messages else ""
+        client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=user_message
+        )
     except Exception as e:
-        logger.error(f"Error calling OpenAI API: {e}", exc_info=True)
-        # Check for specific OpenAI errors if needed (e.g., AuthenticationError)
-        if "AuthenticationError" in str(type(e)):
-             raise HTTPException(status_code=401, detail=f"OpenAI Authentication Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get response from AI assistant: {e}")
+        logger.error(f"Error adding messages to thread: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to add messages to Assistant thread")
+
+    # --- Create a Run and poll for completion ---
+    try:
+        run = client.beta.threads.runs.create(
+            thread_id=thread_id,
+            assistant_id=OPENAI_ASSISTANT_ID
+        )
+        # Poll for completion
+        import time as pytime
+        for _ in range(60): # Wait up to 60 seconds
+            run_status = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+            if run_status.status == "completed":
+                break
+            elif run_status.status in ("failed", "cancelled", "expired"):
+                logger.error(f"Assistant run failed with status: {run_status.status}")
+                raise HTTPException(status_code=500, detail=f"Assistant run failed: {run_status.status}")
+            pytime.sleep(1)
+        else:
+            logger.error("Assistant run timed out after 60 seconds.")
+            raise HTTPException(status_code=504, detail="Assistant run timed out.")
+    except Exception as e:
+        logger.error(f"Error running Assistant: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to run Assistant")
+
+    # --- Retrieve latest Assistant message ---
+    try:
+        messages = client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=5)
+        assistant_message = next((m for m in messages.data if m.role == "assistant"), None)
+        if not assistant_message:
+            logger.error("No assistant message found in thread after run.")
+            raise HTTPException(status_code=500, detail="No assistant message found.")
+        content = assistant_message.content[0].text.value if assistant_message.content else "(No content)"
+        ai_message = ChatMessage(role="assistant", content=content)
+        return ChatResponse(message=ai_message)
+    except Exception as e:
+        logger.error(f"Error retrieving Assistant message: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to retrieve Assistant message")
 
 @app.get("/api/models", response_model=ModelListResponse)
 async def get_available_models():
