@@ -107,22 +107,48 @@ The setup script will:
 python desktop_app.py
 ```
 
-### Web Application
+### Web Application (Recommended)
 
-1. Start the backend server:
-```bash
-cd web-app/backend
-source venv/bin/activate  # On Windows: .\venv\Scripts\activate
-uvicorn main:app --reload
-```
+**Important Note:** For local development, both the backend and frontend must run over **HTTPS** due to Bungie API requirements. The recommended way to handle local HTTPS is using `mkcert`.
 
-2. Start the frontend development server:
-```bash
-cd web-app/frontend
-npm run dev
-```
+1.  **Install `mkcert` (if not already done):**
+    Follow the instructions for your OS at [https://github.com/FiloSottile/mkcert#installation](https://github.com/FiloSottile/mkcert#installation). For macOS with Homebrew:
+    ```bash
+    brew install mkcert
+    # Then install the local CA (only needs to be done once per machine)
+    mkcert -install
+    ```
 
-The web application will be available at `http://localhost:3000`
+2.  **Generate Certificates:**
+    From the project root directory:
+    ```bash
+    # This command creates web_app/cert.pem and web_app/key.pem trusted for localhost
+    mkcert -cert-file web_app/cert.pem -key-file web_app/key.pem localhost 127.0.0.1 ::1
+    ```
+
+3.  **Start the Backend Server (using Uvicorn):**
+    In a terminal, from the **project root** directory (`destiny2_catalysts/`):
+    ```bash
+    # Activate virtual environment
+    source venv/bin/activate
+    
+    # Set PYTHONPATH and run Uvicorn with SSL (using mkcert-generated files)
+    PYTHONPATH=. uvicorn web_app.backend.main:app --reload --ssl-keyfile=web_app/key.pem --ssl-certfile=web_app/cert.pem --port 8000
+    ```
+    Keep this terminal running.
+
+4.  **Start the Frontend Development Server:**
+    In a *separate* terminal, navigate to the frontend directory:
+    ```bash
+    cd web_app/frontend
+    npm start
+    ```
+    *(The `start` script in `package.json` should be configured to use `web_app/cert.pem` and `web_app/key.pem` via `SSL_CRT_FILE` and `SSL_KEY_FILE` env vars)*
+
+5.  **Access the Application:**
+    *   Open your web browser and navigate directly to the frontend application: `https://localhost:3000`.
+    *   You should **not** see a browser security warning if `mkcert` setup was successful.
+    *   The first time you log in, you will be redirected to Bungie.net for authorization.
 
 ## Testing
 
