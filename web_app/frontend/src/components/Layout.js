@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import {
   AppBar,
   Box,
@@ -21,6 +21,7 @@ const Layout = ({ children }) => {
   const theme = useTheme();
   const { isAuthenticated, logout } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [isDark, setIsDark] = useState(true);
 
   const handleThemeToggle = () => {
@@ -33,14 +34,19 @@ const Layout = ({ children }) => {
     navigate('/login');
   };
 
+  // If on chat page, render only children (no header/footer/container)
+  if (location.pathname === '/') {
+    return children;
+  }
+
+  // For all other pages, render header, container, and footer
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
-      <AppBar position="static" sx={{ background: 'transparent', backdropFilter: 'blur(10px)' }}>
+      <AppBar position="sticky" sx={{ background: 'transparent', backdropFilter: 'blur(10px)' }}>
         <Toolbar>
           <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
-            Destiny 2 Catalyst Tracker
+            Ghost Terminal
           </Typography>
-          
           {isAuthenticated && (
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
               <Button
@@ -57,7 +63,6 @@ const Layout = ({ children }) => {
               </Button>
             </Box>
           )}
-
           <IconButton
             color="inherit"
             onClick={handleThemeToggle}
@@ -67,11 +72,9 @@ const Layout = ({ children }) => {
           </IconButton>
         </Toolbar>
       </AppBar>
-
       <Container component="main" sx={{ mt: 4, mb: 4, flex: 1 }}>
         {children}
       </Container>
-
       <Box
         component="footer"
         sx={{

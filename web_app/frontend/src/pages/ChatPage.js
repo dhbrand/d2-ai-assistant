@@ -1,149 +1,203 @@
-import React, { useState, useEffect, useContext } from 'react';
-import { Box, TextField, Button, Paper, Typography, List, ListItem, ListItemText, CircularProgress } from '@mui/material';
-import { AuthContext, useAuth } from '../contexts/AuthContext';
-import ReactMarkdown from 'react-markdown';
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Box,
+  TextField,
+  Button,
+  Paper,
+  List,
+  ListItem,
+  ListItemText,
+  CircularProgress,
+} from '@mui/material';
+import { useAuth } from '../contexts/AuthContext';
 import AdvancedMarkdownRenderer from '../components/AdvancedMarkdownRenderer';
 
 function ChatPage() {
   const { token } = useAuth();
-  const [messages, setMessages] = useState([]); // Stores { sender: 'user'/'assistant', text: 'message' }
+  const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [showScrollButton, setShowScrollButton] = useState(false);
+  const messagesEndRef = useRef(null);
+  const messageListRef = useRef(null);
+
+  useEffect(() => {
+    if (!showScrollButton) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages, showScrollButton]);
+
+  useEffect(() => {
+    const el = messageListRef.current;
+    if (!el) return;
+
+    const handleScroll = () => {
+      const nearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 50;
+      setShowScrollButton(!nearBottom);
+    };
+
+    el.addEventListener('scroll', handleScroll);
+    return () => el.removeEventListener('scroll', handleScroll);
+  }, []);
+
+  const handleScrollToBottom = () => {
+    messageListRef.current?.scrollTo({ top: messageListRef.current.scrollHeight, behavior: 'smooth' });
+    setShowScrollButton(false);
+  };
 
   const handleSendMessage = async () => {
     if (!newMessage.trim()) return;
 
-    const userMessage = { role: 'user', content: newMessage }; // Use role/content structure
-    const currentMessages = [...messages, userMessage]; // Capture current state before async call
+    const userMessage = { role: 'user', content: newMessage };
+    const currentMessages = [...messages, userMessage];
     setMessages(currentMessages);
     setNewMessage('');
     setIsLoading(true);
 
     try {
-        // Prepare request body according to backend model
-        const requestBody = { 
-            messages: currentMessages.map(msg => ({
-                role: msg.role, // Map sender to role
-                content: msg.content // Map text to content
-            }))
-            // No need to send token_data unless backend specifically requires it
-            // token_data: token ? JSON.parse(localStorage.getItem('tokenData')) : undefined
-        };
-
-        // Log the body being sent for debugging
-        console.log("Sending request to /api/assistants/chat with body:", JSON.stringify(requestBody));
-
-      const response = await fetch('https://localhost:8000/api/assistants/chat', { 
+      const response = await fetch('https://localhost:8000/api/assistants/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          // Include token if your API needs authentication for chat
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${token}`,
         },
-        body: JSON.stringify(requestBody) 
+        body: JSON.stringify({
+          messages: currentMessages.map(msg => ({
+            role: msg.role,
+            content: msg.content,
+          })),
+        }),
       });
 
-      // Log raw response for debugging
-      const responseText = await response.text(); 
-      console.log("Raw response text:", responseText);
+      const responseText = await response.text();
 
       if (!response.ok) {
-        // Try to parse error details if JSON
         let errorDetail = responseText;
         try {
-            const errorJson = JSON.parse(responseText);
-            errorDetail = errorJson.detail || JSON.stringify(errorJson);
-        } catch (parseError) {
-            // Ignore if not JSON
-        }
-        throw new Error(`HTTP error! status: ${response.status}, details: ${errorDetail}`);
+          const json = JSON.parse(responseText);
+          errorDetail = json.detail || JSON.stringify(json);
+        } catch (_) {}
+        throw new Error(`HTTP error ${response.status}: ${errorDetail}`);
       }
 
-      // Parse the JSON response
       const data = JSON.parse(responseText);
-      console.log("Parsed response data:", data);
-
-      // Expecting { message: { role: 'assistant', content: '...' } }
-      if (!data.message || !data.message.content) {
-          throw new Error("Invalid response structure received from backend.");
-      }
-      // Store assistant message consistently with role/content
-      const assistantMessage = { role: 'assistant', content: data.message.content }; 
-      setMessages(prevMessages => [...prevMessages, assistantMessage]);
-
+      const assistantMessage = { role: 'assistant', content: data.message.content };
+      setMessages(prev => [...prev, assistantMessage]);
     } catch (error) {
-      console.error('Error sending message:', error);
-      // Store error message consistently with role/content
-      const errorMessage = { role: 'assistant', content: `Sorry, something went wrong fetching the reply. Details: ${error.message}` }; 
-      setMessages(prevMessages => [...prevMessages, errorMessage]);
+      console.error(error);
+      setMessages(prev => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: `Error: ${error.message}`,
+        },
+      ]);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleInputChange = (event) => {
-    setNewMessage(event.target.value);
-  };
+  const handleInputChange = (e) => setNewMessage(e.target.value);
 
-  const handleKeyPress = (event) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
-      event.preventDefault(); // Prevent newline on Enter
+  const handleKeyPress = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
       handleSendMessage();
     }
   };
 
-  useEffect(() => {
-    // Optional: Scroll to the bottom of the message list when new messages arrive
-    const messageList = document.getElementById('message-list-container');
-    if (messageList) {
-      messageList.scrollTop = messageList.scrollHeight;
-    }
-  }, [messages]);
-
   return (
-    <Box sx={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 64px)', // Adjust height based on your layout/AppBar
-              maxWidth: '800px', margin: 'auto', p: 2 }}>
-      <Typography variant="h4" gutterBottom>Destiny Chat Assistant</Typography>
-      <Paper elevation={3} sx={{ flexGrow: 1, overflowY: 'auto', mb: 2, p: 2 }} id="message-list-container">
-        <List>
-          {messages.map((msg, index) => (
-            <ListItem key={index} sx={{ textAlign: msg.role === 'user' ? 'right' : 'left' }}>
-              {/* Optionally add avatars here for user/assistant */}
-              <ListItemText
-                primary={
-                  msg.role === 'assistant'
-                    ? <AdvancedMarkdownRenderer markdown={msg.content} />
-                    : <span className="markdown-body">{msg.content}</span>
-                }
-                sx={{
-                  bgcolor: msg.role === 'user' ? 'grey.700' : 'transparent',
-                  color: 'text.primary',
-                  borderRadius: msg.role === 'user' ? '10px' : 0,
-                  p: msg.role === 'user' ? 1 : 0,
-                  display: 'inline-block',
-                  maxWidth: '75%',
-                }}
-              />
-            </ListItem>
-          ))}
-          {isLoading && (
-            <ListItem sx={{ justifyContent: 'center' }}>
-              <CircularProgress size={24} />
-            </ListItem>
-          )}
-        </List>
-      </Paper>
-      <Box sx={{ display: 'flex', mt: 'auto' }}>
+    <Box
+      sx={{
+        height: '100vh',
+        width: '100%',
+        maxWidth: '100%',
+        overflow: 'hidden',
+        display: 'flex',
+        flexDirection: 'column',
+        backgroundColor: 'background.default',
+      }}
+    >
+      <Box
+        ref={messageListRef}
+        sx={{
+          flex: 1,
+          overflowY: 'auto',
+          px: 3,
+          py: 2,
+          width: '100%',
+          maxWidth: '100%',
+          boxSizing: 'border-box',
+        }}
+      >
+        <Paper
+          elevation={3}
+          sx={{
+            width: '100%',
+            maxWidth: '100%',
+            boxSizing: 'border-box',
+            p: 2,
+            backgroundColor: 'background.paper',
+            m: 0,
+          }}
+        >
+          <List sx={{ width: '100%', maxWidth: '100%', pb: 0 }}>
+            {messages.map((msg, index) => (
+              <ListItem key={index} sx={{ textAlign: msg.role === 'user' ? 'right' : 'left', width: '100%' }}>
+                <ListItemText
+                  primary={
+                    msg.role === 'assistant'
+                      ? <AdvancedMarkdownRenderer markdown={msg.content} />
+                      : <span className="markdown-body">{msg.content}</span>
+                  }
+                  sx={{
+                    width: '100%',
+                    maxWidth: '100%',
+                    overflowWrap: 'break-word',
+                    bgcolor: msg.role === 'user' ? 'grey.700' : 'transparent',
+                    color: 'text.primary',
+                    borderRadius: msg.role === 'user' ? '10px' : 0,
+                    p: msg.role === 'user' ? 1 : 0,
+                    display: 'inline-block',
+                  }}
+                />
+              </ListItem>
+            ))}
+            {isLoading && (
+              <ListItem sx={{ justifyContent: 'center', width: '100%' }}>
+                <CircularProgress size={24} />
+              </ListItem>
+            )}
+            <div ref={messagesEndRef} />
+          </List>
+        </Paper>
+      </Box>
+      <Box
+        sx={{
+          position: 'sticky',
+          bottom: 0,
+          width: '100%',
+          maxWidth: '100%',
+          px: 3,
+          py: 2,
+          borderTop: '1px solid #333',
+          backgroundColor: 'background.paper',
+          zIndex: 1000,
+          display: 'flex',
+          alignItems: 'center',
+          boxSizing: 'border-box',
+        }}
+      >
         <TextField
           fullWidth
-          variant="outlined"
           placeholder="Ask about your gear, quests, or Destiny..."
+          variant="outlined"
           value={newMessage}
           onChange={handleInputChange}
           onKeyPress={handleKeyPress}
-          disabled={isLoading}
           multiline
-          maxRows={4} // Allow some vertical expansion
+          maxRows={4}
+          disabled={isLoading}
         />
         <Button
           variant="contained"
