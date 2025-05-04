@@ -1,108 +1,79 @@
 import React, { useState, useEffect, useContext } from 'react';
 import { Box, TextField, Button, Paper, Typography, List, ListItem, ListItemText, CircularProgress } from '@mui/material';
 import { AuthContext, useAuth } from '../contexts/AuthContext';
+import ReactMarkdown from 'react-markdown';
 
 function ChatPage() {
   const { token } = useAuth();
   const [messages, setMessages] = useState([]); // Stores { sender: 'user'/'assistant', text: 'message' }
   const [newMessage, setNewMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [catalystData, setCatalystData] = useState(null); // State to hold catalyst data
-  const [weaponData, setWeaponData] = useState(null); // State to hold weapon data
-  const [initialContextSent, setInitialContextSent] = useState(false); // Flag to send context only once
-
-  // Fetch catalyst and weapon data on component mount
-  useEffect(() => {
-    console.log('ChatPage useEffect triggered. Token:', token ? `${token.substring(0,5)}...` : 'null'); // Log effect start
-    
-    const fetchAllContextData = async () => {
-        console.log('fetchAllContextData called. Token:', token ? `${token.substring(0,5)}...` : 'null'); 
-        if (!token) {
-            console.log('fetchAllContextData: No token found, exiting.');
-            return; 
-        }
-        setIsLoading(true); 
-        try {
-            // Fetch catalysts and weapons in parallel
-            const [catalystResponse, weaponResponse] = await Promise.all([
-                fetch('https://localhost:8000/catalysts/all', {
-                    headers: { 'Authorization': `Bearer ${token}` },
-                }),
-                fetch('https://localhost:8000/weapons/all', {
-                    headers: { 'Authorization': `Bearer ${token}` },
-                })
-            ]);
-
-            // Process catalyst data
-            if (!catalystResponse.ok) {
-                throw new Error(`HTTP error fetching catalysts! status: ${catalystResponse.status}`);
-            }
-            const catalystResult = await catalystResponse.json();
-            setCatalystData(catalystResult);
-            console.log("Catalyst data loaded for chat context:", catalystResult);
-
-            // Process weapon data
-            if (!weaponResponse.ok) {
-                throw new Error(`HTTP error fetching weapons! status: ${weaponResponse.status}`);
-            }
-            const weaponResult = await weaponResponse.json();
-            setWeaponData(weaponResult);
-            console.log("Weapon data loaded for chat context:", weaponResult);
-
-        } catch (error) {
-            console.error('Error fetching context data for chat:', error);
-            const errorMessage = { sender: 'assistant', text: `Sorry, failed to load context data. Details: ${error.message}` };
-            setMessages(prevMessages => [...prevMessages, errorMessage]);
-        } finally {
-            setIsLoading(false);
-        }
-    };
-
-    fetchAllContextData();
-
-  }, [token]); // Re-fetch if token changes (e.g., after login)
 
   const handleSendMessage = async () => {
     if (!newMessage.trim()) return;
 
-    const userMessage = { sender: 'user', text: newMessage };
-    setMessages(prevMessages => [...prevMessages, userMessage]);
+    const userMessage = { role: 'user', content: newMessage }; // Use role/content structure
+    const currentMessages = [...messages, userMessage]; // Capture current state before async call
+    setMessages(currentMessages);
     setNewMessage('');
     setIsLoading(true);
 
     try {
-        // Prepare request body
+        // Prepare request body according to backend model
         const requestBody = { 
-            message: userMessage.text 
+            messages: currentMessages.map(msg => ({
+                role: msg.role, // Map sender to role
+                content: msg.content // Map text to content
+            }))
+            // No need to send token_data unless backend specifically requires it
+            // token_data: token ? JSON.parse(localStorage.getItem('tokenData')) : undefined
         };
 
-        // Add context only if it exists and hasn't been sent yet
-        if (!initialContextSent && (catalystData || weaponData)) { // Check if either data exists
-            if (catalystData) requestBody.catalyst_context = catalystData;
-            if (weaponData) requestBody.weapon_context = weaponData; // Add weapon data
-            setInitialContextSent(true); // Mark context as sent
-            console.log("Sending initial context (catalysts/weapons) with message.");
-        }
+        // Log the body being sent for debugging
+        console.log("Sending request to /api/chat with body:", JSON.stringify(requestBody));
 
-      const response = await fetch('https://localhost:8000/api/chat', { // Use absolute path
+      const response = await fetch('https://localhost:8000/api/chat', { 
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          // Include token if your API needs authentication for chat
+          // 'Authorization': `Bearer ${token}` 
         },
-        body: JSON.stringify(requestBody) // Send updated body with optional context
+        body: JSON.stringify(requestBody) 
       });
 
+      // Log raw response for debugging
+      const responseText = await response.text(); 
+      console.log("Raw response text:", responseText);
+
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        // Try to parse error details if JSON
+        let errorDetail = responseText;
+        try {
+            const errorJson = JSON.parse(responseText);
+            errorDetail = errorJson.detail || JSON.stringify(errorJson);
+        } catch (parseError) {
+            // Ignore if not JSON
+        }
+        throw new Error(`HTTP error! status: ${response.status}, details: ${errorDetail}`);
       }
 
-      const data = await response.json();
-      const assistantMessage = { sender: 'assistant', text: data.reply };
+      // Parse the JSON response
+      const data = JSON.parse(responseText);
+      console.log("Parsed response data:", data);
+
+      // Expecting { message: { role: 'assistant', content: '...' } }
+      if (!data.message || !data.message.content) {
+          throw new Error("Invalid response structure received from backend.");
+      }
+      // Store assistant message consistently with role/content
+      const assistantMessage = { role: 'assistant', content: data.message.content }; 
       setMessages(prevMessages => [...prevMessages, assistantMessage]);
 
     } catch (error) {
       console.error('Error sending message:', error);
-      const errorMessage = { sender: 'assistant', text: `Sorry, something went wrong fetching the reply. Details: ${error.message}` };
+      // Store error message consistently with role/content
+      const errorMessage = { role: 'assistant', content: `Sorry, something went wrong fetching the reply. Details: ${error.message}` }; 
       setMessages(prevMessages => [...prevMessages, errorMessage]);
     } finally {
       setIsLoading(false);
@@ -135,14 +106,14 @@ function ChatPage() {
       <Paper elevation={3} sx={{ flexGrow: 1, overflowY: 'auto', mb: 2, p: 2 }} id="message-list-container">
         <List>
           {messages.map((msg, index) => (
-            <ListItem key={index} sx={{ textAlign: msg.sender === 'user' ? 'right' : 'left' }}>
+            <ListItem key={index} sx={{ textAlign: msg.role === 'user' ? 'right' : 'left' }}>
               <ListItemText
-                primary={msg.text}
+                primary={msg.role === 'assistant' ? <ReactMarkdown>{msg.content}</ReactMarkdown> : msg.content}
                 sx={{
-                  bgcolor: msg.sender === 'user' ? 'grey.700' : 'transparent', 
+                  bgcolor: msg.role === 'user' ? 'grey.700' : 'transparent',
                   color: 'text.primary',
-                  borderRadius: msg.sender === 'user' ? '10px' : 0,
-                  p: msg.sender === 'user' ? 1 : 0,
+                  borderRadius: msg.role === 'user' ? '10px' : 0,
+                  p: msg.role === 'user' ? 1 : 0,
                   display: 'inline-block',
                   maxWidth: '75%',
                 }}

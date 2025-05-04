@@ -67,15 +67,15 @@ function App() {
                 path="/"
                 element={
                   <PrivateRoute>
-                    <Dashboard />
+                    <ChatPage />
                   </PrivateRoute>
                 }
               />
               <Route 
-                path="/chat"
+                path="/dashboard"
                 element={
                   <PrivateRoute>
-                    <ChatPage />
+                    <Dashboard />
                   </PrivateRoute>
                 }
               />
