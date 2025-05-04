@@ -66,6 +66,10 @@ dist/
 *.sqlite
 *.sqlite3
 
+# Generated/Cached Data
+manifest_data/
+definition_cache/
+
 # Logs
 logs/
 *.log
