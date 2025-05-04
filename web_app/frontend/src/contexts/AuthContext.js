@@ -45,10 +45,12 @@ export const AuthProvider = ({ children }) => {
   // Function to check if token expiry stored in localStorage is past
   const isTokenExpired = useCallback(() => {
     console.log('AuthContext: isTokenExpired check started.');
-    const expiryTime = localStorage.getItem('token_expiry');
+    // Check for JWT expiry
+    const expiryTime = localStorage.getItem('jwt_expiry'); 
     if (!expiryTime) {
-      console.log('AuthContext [isTokenExpired]: No expiry time found in localStorage, assuming not expired (will verify).');
-      return false; // If no expiry stored, rely on backend verification
+      // If no expiry stored, assume expired for JWT (as it SHOULD have an expiry)
+      console.log('AuthContext [isTokenExpired]: No JWT expiry time found in localStorage, assuming expired.');
+      return true; 
     }
     const now = new Date().getTime();
     const expiryTimestamp = parseInt(expiryTime, 10);
@@ -65,9 +67,11 @@ export const AuthProvider = ({ children }) => {
 
   const logout = useCallback(() => {
     console.log("AuthContext: Logging out.");
-    localStorage.removeItem('bungie_token');
+    localStorage.removeItem('bungie_token'); // Keep removing old one just in case
+    localStorage.removeItem('token_expiry'); // Keep removing old one just in case
+    localStorage.removeItem('app_jwt'); // Remove JWT
+    localStorage.removeItem('jwt_expiry'); // Remove JWT expiry
     localStorage.removeItem('oauth_state');
-    localStorage.removeItem('token_expiry');
     localStorage.removeItem('last_auth_attempt');
     localStorage.removeItem('auth_redirect_time');
     setIsAuthenticated(false);
@@ -96,10 +100,11 @@ export const AuthProvider = ({ children }) => {
     setIsLoading(true);
     console.log(`AuthContext: checkAuthStatus started (Attempt ${currentRetry + 1}).`);
 
-    const currentToken = localStorage.getItem('bungie_token'); // Check localStorage directly
+    // Check for JWT in localStorage
+    const currentToken = localStorage.getItem('app_jwt'); 
 
     if (!currentToken) {
-      console.log('AuthContext [checkAuthStatus]: No token found in localStorage.');
+      console.log('AuthContext [checkAuthStatus]: No JWT found in localStorage.');
       // If logout hasn't already cleared state, do it now
       if (isAuthenticated || token) {
           logout();
@@ -108,90 +113,27 @@ export const AuthProvider = ({ children }) => {
       isCheckingAuth.current = false;
       return;
     }
-    console.log('AuthContext [checkAuthStatus]: Token found in localStorage.');
+    console.log('AuthContext [checkAuthStatus]: JWT found in localStorage.');
 
-    // Check expiry using memoized function
+    // Check expiry using memoized function (now checks jwt_expiry)
     if (isTokenExpired()) {
-      console.log('AuthContext [checkAuthStatus]: Token deemed expired by frontend check.');
+      console.log('AuthContext [checkAuthStatus]: JWT deemed expired by frontend check.');
       logout(); // Logout clears state and localStorage
       setIsLoading(false);
       isCheckingAuth.current = false;
       return;
     }
-    console.log('AuthContext [checkAuthStatus]: Token not expired by frontend, verifying with backend...');
+    console.log('AuthContext [checkAuthStatus]: JWT not expired by frontend, considering user authenticated.');
 
-    try {
-      const response = await axios.get(`${API_URL}/auth/verify`, {
-        headers: { Authorization: `Bearer ${currentToken}` }
-      });
-      console.log('AuthContext [checkAuthStatus]: Backend verification response:', response.status, response.data);
+    // If JWT exists and is not expired locally, set authenticated state
+    console.log('AuthContext [checkAuthStatus]: Setting isAuthenticated = true based on local JWT.');
+    setIsAuthenticated(true);
+    setToken(currentToken); // Ensure token state matches localStorage
+    setError(null);
+    setIsLoading(false);
+    isCheckingAuth.current = false;
 
-      if (response.data && response.data.status === 'valid') {
-        console.log('AuthContext [checkAuthStatus]: Backend verification successful.');
-        setIsAuthenticated(true);
-        setToken(currentToken); // Ensure state reflects the valid token from localStorage
-        setError(null);
-        // Reset retry logic on success
-        isCheckingAuth.current = false; // Done checking
-        setIsLoading(false); // Success, finished loading
-      } else {
-        console.log('AuthContext [checkAuthStatus]: Backend verification failed (invalid response). Logging out.');
-        logout();
-        isCheckingAuth.current = false;
-        setIsLoading(false);
-      }
-    } catch (err) {
-      console.error(`AuthContext [checkAuthStatus]: Error during attempt ${currentRetry + 1}:`, err);
-      let shouldStopLoading = true; // Assume we stop loading unless a retry is scheduled
-      let shouldStopChecking = true; // Assume we stop the check sequence
-
-      if (err.response) {
-        // Handle specific backend errors
-        if (err.response.status === 401 || err.response.status === 403) {
-          console.log('AuthContext [checkAuthStatus]: Received 401/403, logging out.');
-          logout();
-        } else if (err.response.status === 503) {
-          // Handle retries for 503 (Service Unavailable)
-          if (currentRetry < MAX_AUTH_RETRIES - 1) {
-            const nextRetry = currentRetry + 1;
-            setError(`Unable to verify session (Bungie API unavailable?). Retrying ${nextRetry}/${MAX_AUTH_RETRIES}...`);
-            console.log(`AuthContext [checkAuthStatus]: Received 503, scheduling retry ${nextRetry} in ${RETRY_DELAY_MS}ms.`);
-            // Schedule the next attempt
-             setTimeout(() => checkAuthStatus(nextRetry), RETRY_DELAY_MS);
-             shouldStopLoading = false; // Don't stop loading, retry scheduled
-             shouldStopChecking = false; // Don't stop checking sequence, retry scheduled
-          } else {
-            console.log(`AuthContext [checkAuthStatus]: Received 503, max retries (${MAX_AUTH_RETRIES}) reached. Logging out.`);
-            setError(`Failed to verify session after ${MAX_AUTH_RETRIES} attempts (Bungie API unavailable?). Please try logging in again.`);
-            logout();
-          }
-        } else {
-           // Handle other unexpected backend errors
-           console.log(`AuthContext [checkAuthStatus]: Received unexpected backend error: ${err.response.status}. Logging out.`);
-           setError(`An unexpected server error (${err.response.status}) occurred during verification.`);
-           logout();
-        }
-      } else {
-        // Handle network errors (request didn't reach server)
-        console.log('AuthContext [checkAuthStatus]: Network error during verification. Cannot verify status.');
-        setError('Network error trying to verify session. Please check connection.');
-        // Keep current auth state on network error? Or logout? Logout is safer.
-        logout();
-      }
-
-      // Update state based on decisions above
-      if (shouldStopChecking) {
-          isCheckingAuth.current = false;
-      }
-       if (shouldStopLoading) {
-          setIsLoading(false);
-           console.log('AuthContext: checkAuthStatus sequence finished (isLoading set to false).');
-       } else {
-            console.log('AuthContext: checkAuthStatus attempt finished, but retrying...');
-       }
-    }
-    // Removed finally block, handling state updates within catch/try success branches
-  }, [isTokenExpired, logout, token, isAuthenticated]); // Added token/isAuthenticated dependencies
+  }, [isTokenExpired, logout]); // Dependencies: isTokenExpired, logout
 
 
   // Effect runs on initial mount to check auth status
@@ -279,25 +221,31 @@ export const AuthProvider = ({ children }) => {
       console.log('AuthContext: Making callback request to backend...');
       const response = await axios.post(`${API_URL}/auth/callback`, { code });
 
-      if (response.data && response.data.token_data && response.data.token_data.access_token) {
-        const receivedToken = response.data.token_data.access_token;
-        localStorage.setItem('bungie_token', receivedToken);
-        setToken(receivedToken); // Update state
+      // -- Updated logic for JWT response --
+      if (response.data && response.data.access_token && response.data.token_type === 'bearer') {
+        const receivedJwt = response.data.access_token;
+        localStorage.setItem('app_jwt', receivedJwt);
+        setToken(receivedJwt); // Update state with JWT
 
-        if (response.data.token_data.expires_in) {
-          const expiryTime = new Date().getTime() + (response.data.token_data.expires_in * 1000);
-          localStorage.setItem('token_expiry', expiryTime.toString());
+        if (response.data.expires_in) {
+          // Calculate expiry based on current time + expires_in (seconds)
+          const expiryTimestamp = new Date().getTime() + (response.data.expires_in * 1000);
+          localStorage.setItem('jwt_expiry', expiryTimestamp.toString());
+          console.log(`AuthContext: Stored JWT expiry: ${new Date(expiryTimestamp)}`);
         } else {
-             localStorage.removeItem('token_expiry'); // Clear expiry if not provided
+             console.warn('AuthContext: JWT received but no expires_in value provided by backend.');
+             localStorage.removeItem('jwt_expiry'); // Clear expiry if not provided
         }
 
         setIsAuthenticated(true);
         setError(null);
-        console.log("AuthContext: Callback successful, user authenticated.");
+        console.log("AuthContext: Callback successful, user authenticated with JWT.");
       } else {
-         console.error('AuthContext: Invalid token data received from callback:', response.data);
+         console.error('AuthContext: Invalid JWT data received from callback:', response.data);
         throw new Error('Invalid token data received from server.');
       }
+      // -- End updated logic --
+
     } catch (err) {
       console.error('AuthContext: Callback error:', err);
       setError(`Authentication failed: ${err.message || 'Unknown error'}`);

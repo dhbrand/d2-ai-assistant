@@ -37,9 +37,18 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
     token_data: Optional[TokenData] = None # Allow frontend to send token if needed
+    model_name: Optional[str] = None # Add field for model selection
 
 class ChatResponse(BaseModel):
     message: ChatMessage
+
+# --- Pydantic model for listing models ---
+class ModelInfo(BaseModel):
+    id: str
+
+class ModelListResponse(BaseModel):
+    models: List[ModelInfo]
+
 # --- End Moved Models ---
 
 # Configure logging
@@ -121,99 +130,91 @@ def get_db():
         db.close()
 
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token") # Dummy URL, we use /auth/callback
+# oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token") # Dummy URL, we use /auth/callback
+# Use the standard scheme but expect the JWT in the Authorization header
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/dummy_token_url") 
 
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    """Dependency to get the current user, handling token refresh if necessary."""
-    logger.info("[DEBUG] Entering get_current_user")
+
+# async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+# Update function signature to reflect it's getting the JWT
+async def get_current_user_from_token(jwt_token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    """Dependency to get the current user from a JWT, without calling Bungie for validation."""
+    # logger.info("[DEBUG] Entering get_current_user") - Old logging
+    logger.info("[DEBUG] Entering get_current_user_from_token")
     
-    # Token is now directly injected by Depends(oauth2_scheme)
-    access_token = token 
-    logger.debug(f"[DEBUG] Received access token via dependency: {access_token[:10]}...")
-    
-    # 2. Get Bungie ID (REQUIRED to find user)
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    # 1. Decode and Validate JWT
     try:
-        bungie_id = oauth_manager.get_bungie_id(access_token)
-        if not bungie_id: # Should not happen if get_bungie_id raises correctly
-             logger.error(f"[DEBUG] get_bungie_id failed unexpectedly without exception for token {access_token[:10]}...")
-             raise HTTPException(status_code=401, detail="Token validation failed (unexpected)")
-        logger.debug(f"[DEBUG] Got bungie_id: {bungie_id}")
-
-    except requests.exceptions.HTTPError as http_err: # Catch specific HTTP errors from Bungie
-        status_code = http_err.response.status_code if http_err.response is not None else 500
-        logger.error(f"[DEBUG] HTTP error {status_code} calling get_bungie_id: {http_err}", exc_info=False)
-        if 500 <= status_code <= 599: # Check if it's a 5xx server error
-             raise HTTPException(status_code=503, detail=f"Bungie API unavailable ({status_code})")
-        else: # Assume other errors (4xx) mean the token is invalid
-             raise HTTPException(status_code=401, detail=f"Token rejected by Bungie ({status_code})")
-
-    except Exception as e: # Catch other errors from get_bungie_id
-        logger.error(f"[DEBUG] Non-HTTP exception calling get_bungie_id for token {access_token[:10]}... Error: {e}", exc_info=True)
-        raise HTTPException(status_code=401, detail=f"Token validation failed: {e}")
+        logger.debug(f"[DEBUG] Decoding JWT: {jwt_token[:10]}...")
+        payload = jwt.decode(jwt_token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub") # Get user ID (subject) from JWT payload
+        bungie_id: str = payload.get("bng") # Get Bungie ID from JWT payload
         
-    # 3. Find User in Database (Now we definitely have bungie_id)
-    user = db.query(User).filter(User.bungie_id == bungie_id).first()
+        if user_id is None or bungie_id is None:
+            logger.error("[DEBUG] JWT missing 'sub' or 'bng' claim.", extra={"payload": payload})
+            raise credentials_exception
+        
+        logger.debug(f"[DEBUG] JWT decoded successfully. User DB ID: {user_id}, Bungie ID: {bungie_id}")
+        
+    except JWTError as e:
+        logger.error(f"[DEBUG] JWTError decoding token: {e}", exc_info=True)
+        raise credentials_exception
+    except Exception as e: # Catch any other decoding errors
+        logger.error(f"[DEBUG] Unexpected error decoding JWT: {e}", exc_info=True)
+        raise credentials_exception
+
+
+    # --- REMOVED BUNGIE VALIDATION CALL ---
+    # # 2. Get Bungie ID (REQUIRED to find user) - NO LONGER NEEDED FOR VALIDATION
+    # try:
+    #     bungie_id = oauth_manager.get_bungie_id(access_token)
+    #     if not bungie_id: # Should not happen if get_bungie_id raises correctly
+    #          logger.error(f"[DEBUG] get_bungie_id failed unexpectedly without exception for token {access_token[:10]}...")
+    #          raise HTTPException(status_code=401, detail="Token validation failed (unexpected)")
+    #     logger.debug(f"[DEBUG] Got bungie_id: {bungie_id}")
+    # 
+    # except requests.exceptions.HTTPError as http_err: # Catch specific HTTP errors from Bungie
+    #     status_code = http_err.response.status_code if http_err.response is not None else 500
+    #     logger.error(f"[DEBUG] HTTP error {status_code} calling get_bungie_id: {http_err}", exc_info=False)
+    #     if 500 <= status_code <= 599: # Check if it's a 5xx server error
+    #          raise HTTPException(status_code=503, detail=f"Bungie API unavailable ({status_code})")
+    #     else: # Assume other errors (4xx) mean the token is invalid
+    #          raise HTTPException(status_code=401, detail=f"Token rejected by Bungie ({status_code})")
+    # 
+    # except Exception as e: # Catch other errors from get_bungie_id
+    #     logger.error(f"[DEBUG] Non-HTTP exception calling get_bungie_id for token {access_token[:10]}... Error: {e}", exc_info=True)
+    #     raise HTTPException(status_code=401, detail=f"Token validation failed: {e}")
+    # --- END REMOVED BUNGIE VALIDATION CALL ---
+        
+        
+    # 2. Find User in Database using ID from JWT
+    user = db.query(User).filter(User.id == int(user_id)).first() # Find by DB primary key
     if not user:
-        logger.error(f"[DEBUG] User with bungie_id {bungie_id} not found in DB for a validated token.")
-        raise HTTPException(status_code=401, detail="User profile not found. Please login again.")
-
-    logger.debug(f"[DEBUG] Found user in DB with ID: {user.id}")
-
-    # 4. Check Token Expiry and Refresh if Needed
-    refresh_needed = False
-    if not user.access_token_expires:
-        logger.warning(f"[DEBUG] User {user.id} has no token expiry time stored. Assuming refresh needed.")
-        refresh_needed = True
-    else:
-        # Compare expiry (UTC) with current time (UTC), add buffer
-        buffer = timedelta(seconds=60)
-        expires = user.access_token_expires
-        if expires.tzinfo is None:
-            # Assume UTC if naive
-            expires = expires.replace(tzinfo=timezone.utc)
-        if expires <= (datetime.now(timezone.utc) + buffer):
-            logger.info(f"[DEBUG] Access token for user {user.id} expired or expiring soon. Refresh needed.")
-            refresh_needed = True
-        else:
-            logger.debug(f"[DEBUG] Access token for user {user.id} is still valid.")
-
-    if refresh_needed:
-        if not user.refresh_token:
-            logger.error(f"[DEBUG] Refresh needed for user {user.id}, but no refresh token stored!")
-            raise HTTPException(status_code=401, detail="Authentication expired, please log in again.")
+        # This implies the user existed when the JWT was issued but is now gone, 
+        # or the JWT is somehow invalid/forged despite passing signature check.
+        logger.error(f"[DEBUG] User with DB ID {user_id} (from JWT) not found in DB.")
+        raise credentials_exception
         
-        logger.info(f"[DEBUG] Attempting token refresh for user {user.id}...")
-        try:
-            new_token_data = oauth_manager.refresh_token(user.refresh_token)
-            
-            # Update user with new tokens
-            user.access_token = new_token_data['access_token']
-            user.refresh_token = new_token_data['refresh_token'] # Bungie might issue a new refresh token
-            new_expires_in = new_token_data['expires_in']
-            user.access_token_expires = datetime.now(timezone.utc) + timedelta(seconds=new_expires_in)
-            
-            db.commit()
-            logger.info(f"[DEBUG] Successfully refreshed token for user {user.id}. New expiry: {user.access_token_expires}")
-            
-            # Update the token the rest of THIS request might try to use
-            # This is slightly hacky. A better DI system might be needed long term.
-            # We now return the user, API clients should use user.access_token ideally.
-            access_token = user.access_token 
+    # Optional: Double-check Bungie ID matches just in case
+    if str(user.bungie_id) != bungie_id:
+         logger.error(f"[DEBUG] JWT Bungie ID ({bungie_id}) mismatch with DB Bungie ID ({user.bungie_id}) for user DB ID {user_id}")
+         raise credentials_exception
 
-        except InvalidRefreshTokenError as ire:
-            logger.error(f"[DEBUG] Refresh token for user {user.id} was invalid: {ire}")
-            user.access_token = None
-            user.refresh_token = None
-            user.access_token_expires = None
-            db.commit()
-            raise HTTPException(status_code=401, detail="Authentication invalid, please log in again.")
-        except Exception as e:
-            logger.error(f"[DEBUG] Token refresh failed for user {user.id}: {e}", exc_info=True)
-            raise HTTPException(status_code=401, detail="Could not refresh authentication token.")
+    logger.debug(f"[DEBUG] Found user in DB with ID: {user.id} using JWT claims.")
 
-    # 5. Return the User object
-    # Make sure the user object has the LATEST access token if a refresh happened
-    # The code above already updates user.access_token before returning
+    # --- SIMPLIFIED/REMOVED REFRESH LOGIC FOR NOW ---
+    # The JWT validation handles expiry. Refreshing the *Bungie* token 
+    # should ideally happen via a separate refresh endpoint or when a 
+    # downstream Bungie API call fails due to an expired *Bungie* token.
+    # We still return the user object which contains the *currently stored* Bungie tokens.
+    # --- END SIMPLIFIED REFRESH LOGIC ---
+
+    # 3. Return the User object
     logger.debug(f"[DEBUG] Returning user object for ID: {user.id}")
     return user
 
@@ -285,6 +286,7 @@ async def handle_auth_callback(callback_data: CallbackData, request: Request, db
         logger.info(f"Successfully stored/updated tokens for user {bungie_id}")
 
         # --- Save token to file for test script/external use ---
+        # Keep this part for now for testing test_weapon_api.py
         try:
             token_file_data = {
                 'access_token': access_token,
@@ -300,18 +302,42 @@ async def handle_auth_callback(callback_data: CallbackData, request: Request, db
             logger.error(f"Failed to write token data to token.json: {file_err}")
         # --- End save token to file ---
 
-        # Return only access token and expiry to frontend
-        return {
-            "status": "success", 
-            "token_data": {
-                "access_token": access_token,
-                "expires_in": expires_in
-                # DO NOT send refresh_token to frontend
-            }
+        # --- Create JWT ---
+        jwt_expires = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        # Use the user ID from the database record we just committed
+        db.refresh(user) # Ensure we have the ID if it was a new user
+        user_id = user.id 
+        
+        jwt_payload = {
+            "sub": str(user_id), # Subject (standard claim), use database user ID
+            "bng": str(bungie_id), # Custom claim for Bungie ID
+            "exp": jwt_expires   # Expiration time (standard claim)
         }
+        
+        encoded_jwt = jwt.encode(jwt_payload, SECRET_KEY, algorithm=ALGORITHM)
+        logger.info(f"Generated JWT for user ID {user_id} (Bungie ID {bungie_id})")
+        # --- End Create JWT ---
+
+        # --- Return JWT to frontend ---
+        # Return only access token and expiry to frontend - OLD RETURN
+        # return {
+        #     "status": "success", 
+        #     "token_data": {
+        #         "access_token": access_token,
+        #         "expires_in": expires_in
+        #         # DO NOT send refresh_token to frontend
+        #     }
+        # }
+        return {
+            "status": "success",
+            "access_token": encoded_jwt, # Send the JWT
+            "token_type": "bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60 # Send JWT expiry in seconds
+        }
+        # --- End Return JWT ---
 
     except HTTPException as http_exc: # Log FastAPI exceptions before re-raising
-        logger.error(f"HTTPException during auth callback: {http_exc.status_code} - {http_exc.detail}", exc_info=True)
+        logger.error(f"HTTPException during auth callback: {http_exc.status_code} - {http_exc.detail}", exc_info=False) # Don't need full trace for expected exceptions
         raise http_exc
     except Exception as e:
         logger.error(f"Unexpected error in auth_callback for code {code[:5]}...: {e}", exc_info=True) # Log other exceptions
@@ -319,12 +345,15 @@ async def handle_auth_callback(callback_data: CallbackData, request: Request, db
         raise HTTPException(status_code=400, detail=f"Authentication callback failed: {str(e)}")
 
 @app.get("/auth/verify", response_model=UserResponse) # Use UserResponse
-async def verify_token(current_user: User = Depends(get_current_user)):
-    """Verify the authentication token"""
+# Update dependency to use the new function name
+async def verify_token(current_user: User = Depends(get_current_user_from_token)):
+    """Verify the authentication token (JWT)"""
+    # Keep current_user parameter name for consistency in endpoint signature if desired
     return {"status": "valid", "bungie_id": current_user.bungie_id}
 
 @app.get("/catalysts/all", response_model=List[CatalystData])
-async def get_all_catalysts_endpoint(current_user: User = Depends(get_current_user), db: Session = Depends(get_db), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
+# Update dependency to use the new function name
+async def get_all_catalysts_endpoint(current_user: User = Depends(get_current_user_from_token), db: Session = Depends(get_db), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
     """Get all catalysts for the authenticated user, using a 5-minute cache."""
     bungie_id = current_user.bungie_id
     now = datetime.now(timezone.utc)
@@ -372,7 +401,8 @@ async def get_all_catalysts_endpoint(current_user: User = Depends(get_current_us
         raise HTTPException(status_code=500, detail=f"Failed to fetch catalyst data: {str(e)}")
 
 @app.get("/weapons/all", response_model=List[Weapon]) # Use Weapon Pydantic model
-async def get_all_weapons_endpoint(current_user: User = Depends(get_current_user), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
+# Update dependency to use the new function name
+async def get_all_weapons_endpoint(current_user: User = Depends(get_current_user_from_token), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
     """Endpoint to fetch all weapons for the authenticated user, using a 10-minute cache."""
     bungie_id = current_user.bungie_id
     now = datetime.now(timezone.utc)
@@ -539,8 +569,10 @@ async def get_all_weapons_for_chat(current_user: User, manifest_manager: Manifes
 
 @app.post("/api/chat", response_model=ChatResponse)
 # Inject manifest_manager via dependency as well
-async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
+# Update dependency to use the new function name
+async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user_from_token), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
     # --- Initialize OpenAI Client within endpoint (for debugging NameError) ---
+    logger.info("Initializing OpenAI client...")
     local_openai_client = None
     if not OPENAI_API_KEY:
         logger.error("OpenAI API Key is missing. Cannot initialize client.")
@@ -615,8 +647,12 @@ async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_c
         content=(
             "You are a helpful assistant knowledgeable about Destiny 2. "
             "Use the provided player inventory information to answer questions accurately. "
+            "The provided weapon list includes items across all characters and the vault. Use the 'Location' field to distinguish if needed. "
+            "Answer each question based *only* on the current request and the provided data. Do not assume filters or context from previous questions unless the user explicitly restates them. "
             "If the user asks about their weapons, catalysts, or progress, refer to the data below. "
-            "If the data is unavailable or doesn't contain the answer, say so explicitly. "
+            "If the user asks to see weapons/catalysts matching certain criteria (e.g., rarity, type, location, perk), list the items from the data that match. "
+            "When asked for counts, provide the total count based on the provided lists. "
+            "If the data is unavailable or doesn't contain the answer (e.g., specific stats, power level), say so explicitly. "
             "Keep your answers concise and relevant to Destiny 2.\n\n"
             f"{context_str}"
         )
@@ -628,9 +664,14 @@ async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_c
         logger.info(f"Sending {len(messages_for_api)} messages to OpenAI API.")
         # logger.debug(f"Messages for API: {messages_for_api}") # Potentially very verbose
 
+        # Determine which model to use
+        # Use requested model or default to gpt-4o
+        model_to_use = request.model_name if request.model_name else "gpt-4o"
+        logger.info(f"Using OpenAI model: {model_to_use}")
+
         # Use the local client instance
         chat_completion = local_openai_client.chat.completions.create(
-            model="gpt-4o", # Or your preferred model
+            model=model_to_use, # Use the selected model
             messages=messages_for_api,
         )
         response_content = chat_completion.choices[0].message.content
@@ -647,6 +688,33 @@ async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_c
         if "AuthenticationError" in str(type(e)):
              raise HTTPException(status_code=401, detail=f"OpenAI Authentication Error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get response from AI assistant: {e}")
+
+@app.get("/api/models", response_model=ModelListResponse)
+async def get_available_models():
+    """Endpoint to fetch available models from OpenAI."""
+    local_openai_client = None
+    if not OPENAI_API_KEY:
+        logger.error("OpenAI API Key is missing. Cannot list models.")
+        raise HTTPException(status_code=503, detail="OpenAI API key not configured")
+    try:
+        # Initialize client (consider moving to dependency injection later for efficiency)
+        http_client = httpx.Client(trust_env=False)
+        local_openai_client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+        logger.info("OpenAI client initialized for model listing.")
+        
+        model_list = local_openai_client.models.list()
+        # Filter for models typically used for chat? Or just return all?
+        # Let's return models containing 'gpt' for now to keep it relevant.
+        gpt_models = [ModelInfo(id=model.id) for model in model_list if 'gpt' in model.id.lower()]
+        # Sort models (optional, e.g., by name)
+        gpt_models.sort(key=lambda m: m.id)
+
+        logger.info(f"Returning {len(gpt_models)} GPT models.")
+        return ModelListResponse(models=gpt_models)
+
+    except Exception as e:
+        logger.error(f"Error fetching models from OpenAI: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to fetch models from AI provider: {e}")
 
 # Serve Static Files (React Build)
 # Make sure this path is correct relative to where you run uvicorn
