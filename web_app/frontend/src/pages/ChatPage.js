@@ -77,10 +77,10 @@ function ChatPage() {
               <ListItemText
                 primary={msg.text}
                 sx={{
-                  bgcolor: msg.sender === 'user' ? 'primary.light' : 'grey.200',
-                  color: msg.sender === 'user' ? 'primary.contrastText' : 'text.primary',
-                  borderRadius: '10px',
-                  p: 1,
+                  bgcolor: msg.sender === 'user' ? 'grey.700' : 'transparent', 
+                  color: 'text.primary',
+                  borderRadius: msg.sender === 'user' ? '10px' : 0,
+                  p: msg.sender === 'user' ? 1 : 0,
                   display: 'inline-block',
                   maxWidth: '75%',
                 }}
