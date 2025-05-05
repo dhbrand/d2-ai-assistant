@@ -112,7 +112,7 @@ logger.info("ManifestManager initialized.")
 
 oauth_manager = OAuthManager()
 
-catalyst_api = CatalystAPI(api_key=BUNGIE_API_KEY)
+catalyst_api = CatalystAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
 
 logger.info("Initializing WeaponAPI...")
 weapon_api = WeaponAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
@@ -389,7 +389,7 @@ async def get_all_catalysts_endpoint(current_user: User = Depends(get_current_us
         # Fetch data from Bungie API via CatalystAPI
         logger.info("Fetching catalysts from Bungie API...")
         # Use injected manifest_manager
-        catalyst_api_instance = CatalystAPI(api_key=BUNGIE_API_KEY)
+        catalyst_api_instance = CatalystAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
         catalysts_data = catalyst_api_instance.get_catalysts(access_token=access_token)
         logger.info(f"Retrieved {len(catalysts_data)} catalysts from API")
         
@@ -498,7 +498,7 @@ async def get_all_catalysts_for_chat(current_user: User, manifest_manager: Manif
         # Fetch data from Bungie API via CatalystAPI
         logger.info("Fetching catalysts from Bungie API...")
         # Use injected manifest_manager
-        catalyst_api_instance = CatalystAPI(api_key=BUNGIE_API_KEY)
+        catalyst_api_instance = CatalystAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
         catalysts_data = catalyst_api_instance.get_catalysts(access_token=access_token)
         logger.info(f"Retrieved {len(catalysts_data)} catalysts from API")
 

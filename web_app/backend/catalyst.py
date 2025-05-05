@@ -27,16 +27,14 @@ class DestinyRecordState:
     CAN_EQUIP_TITLE = 64
 
 class CatalystAPI:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, manifest_manager):
         """Initialize the Catalyst API"""
         self.base_url = "https://www.bungie.net/Platform"
         self.api_key = api_key
         self.session = self._create_session()
-        self.definition_cache = {}  # Memory cache for definitions
-        self.cache_dir = pathlib.Path("definition_cache")  # Directory for persistent cache
-        self.cache_dir.mkdir(exist_ok=True)  # Create cache directory if it doesn't exist
         self.cancel_event = Event()  # For cancelling operations
         self.discovery_mode = False  # Default to standard mode (known catalysts only)
+        self.manifest_manager = manifest_manager
         
     def _create_session(self) -> requests.Session:
         """Create a requests session with retry logic"""
@@ -134,54 +132,11 @@ class CatalystAPI:
             return None
             
     def get_definition(self, table: str, hash_id: int) -> Optional[Dict]:
-        """Get a definition from the Destiny 2 manifest (No auth required)"""
+        """Get a definition from the Destiny 2 manifest (local only)"""
         if self.cancel_event.is_set():
             return None
-            
-        # Check memory cache first
-        cache_key = f"{table}_{hash_id}"
-        if cache_key in self.definition_cache:
-            return self.definition_cache[cache_key]
+        return self.manifest_manager.get_definition(table, hash_id)
         
-        # Check disk cache
-        cache_file = self.cache_dir / f"{cache_key}.json"
-        if cache_file.exists():
-            try:
-                with open(cache_file, 'r') as f:
-                    definition = json.load(f)
-                # Store in memory cache too
-                self.definition_cache[cache_key] = definition
-                return definition
-            except Exception as e:
-                logger.debug(f"Error reading cache file {cache_file}: {e}")
-                # Continue to fetch from API if cache read fails
-            
-        # Fetch from API if not in cache
-        try:
-            url = f"{self.base_url}/Destiny2/Manifest/{table}/{hash_id}/"
-            headers = {"X-API-Key": self.api_key}
-            response = self.session.get(url, headers=headers, timeout=10)
-            if response.status_code != 200:
-                logger.debug(f"Failed to get definition for {table} {hash_id}: {response.status_code}")
-                return None
-            definition = response.json()['Response']
-            
-            # Store in memory cache
-            self.definition_cache[cache_key] = definition
-            
-            # Store on disk
-            try:
-                with open(cache_file, 'w') as f:
-                    json.dump(definition, f)
-            except Exception as e:
-                logger.debug(f"Error writing to cache file {cache_file}: {e}")
-                # Continue even if we can't write to cache
-                
-            return definition
-        except Exception as e:
-            logger.debug(f"Error getting definition for {table} {hash_id}: {e}")
-            return None
-            
     def _prefetch_definitions(self, profile_records: Dict) -> None:
         """Pre-fetch all needed definitions"""
         logger.info("Pre-fetching definitions...")
