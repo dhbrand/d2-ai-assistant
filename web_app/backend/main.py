@@ -11,7 +11,6 @@ import logging
 from jose import JWTError, jwt
 from requests.exceptions import HTTPError
 import requests
-from openai import OpenAI
 import httpx # Import httpx
 import json
 import time
@@ -31,6 +30,7 @@ from web_app.backend.catalyst import CatalystAPI
 from web_app.backend.weapon_api import WeaponAPI
 from web_app.backend.manifest import ManifestManager
 from web_app.backend.voice import router as voice_router
+from web_app.backend.agent_service import DestinyAgentService
 
 # --- Pydantic Models for Chat (Moved Up) ---
 class ChatMessage(BaseModel):
@@ -117,6 +117,22 @@ catalyst_api = CatalystAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_man
 logger.info("Initializing WeaponAPI...")
 weapon_api = WeaponAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
 logger.info("WeaponAPI initialized.")
+
+# ---> ADDED: Initialize Agent Service <---
+logger.info("Initializing DestinyAgentService...")
+try:
+    agent_service = DestinyAgentService(
+        bungie_api_key=BUNGIE_API_KEY,
+        openai_api_key=OPENAI_API_KEY,
+        manifest_manager=manifest_manager
+    )
+    logger.info("DestinyAgentService initialized.")
+except ValueError as e:
+    logger.error(f"Failed to initialize DestinyAgentService: {e}")
+    agent_service = None # Set to None if initialization fails
+except Exception as e:
+    logger.error(f"Unexpected error initializing DestinyAgentService: {e}", exc_info=True)
+    agent_service = None
 
 # --- Globals & Setup ---
 
@@ -295,23 +311,6 @@ async def handle_auth_callback(callback_data: CallbackData, request: Request, db
         db.commit()
         logger.info(f"Successfully stored/updated tokens for user {bungie_id}")
 
-        # --- Save token to file for test script/external use ---
-        # Keep this part for now for testing test_weapon_api.py
-        try:
-            token_file_data = {
-                'access_token': access_token,
-                'refresh_token': refresh_token, # Optional, but useful for debugging
-                'expires_in': expires_in,
-                'fetched_at': now_utc.timestamp(), # Store fetch time as Unix timestamp
-                'bungie_id': bungie_id # Also useful
-            }
-            with open("token.json", 'w') as f:
-                json.dump(token_file_data, f, indent=4)
-            logger.info("Successfully wrote token data to token.json")
-        except Exception as file_err:
-            logger.error(f"Failed to write token data to token.json: {file_err}")
-        # --- End save token to file ---
-
         # --- Create JWT ---
         jwt_expires = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         # Use the user ID from the database record we just committed
@@ -469,175 +468,42 @@ async def get_all_weapons_endpoint(current_user: User = Depends(get_current_user
         logger.error(f"Unexpected error fetching weapons for user {current_user.bungie_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch weapons data")
 
-# --- Helper Functions for Data Fetching (for Chat) ---
-# Update definitions to accept current_user and manifest_manager
-async def get_all_catalysts_for_chat(current_user: User, manifest_manager: ManifestManager) -> List[CatalystData]:
-    """Fetches catalyst data for chat context, using cache if valid."""
-    # Use bungie_id from the user object for caching
-    bungie_id = current_user.bungie_id
-    now = datetime.now(timezone.utc)
-
-    # Check cache
-    if bungie_id in _catalyst_cache:
-        cache_time, cached_data = _catalyst_cache[bungie_id]
-        if now - cache_time < CACHE_DURATION:
-            logger.info(f"Returning cached catalyst data for user {bungie_id}")
-            return cached_data
-        else:
-            logger.info(f"Cache expired for user {bungie_id}")
-
-    logger.info(f"Fetching fresh catalyst data for user {bungie_id}")
-    try:
-        # Get current access token from the authenticated user object
-        # The get_current_user dependency ensures this token is valid/refreshed
-        access_token = current_user.access_token
-        if not access_token:
-            # This should ideally not happen if get_current_user worked, but check defensively
-            logger.error(f"No access token available for user {bungie_id} in get_all_catalysts_for_chat")
-
-        # Fetch data from Bungie API via CatalystAPI
-        logger.info("Fetching catalysts from Bungie API...")
-        # Use injected manifest_manager
-        catalyst_api_instance = CatalystAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
-        catalysts_data = catalyst_api_instance.get_catalysts(access_token=access_token)
-        logger.info(f"Retrieved {len(catalysts_data)} catalysts from API")
-
-        # Convert raw dicts to Pydantic models (FastAPI does this automatically if returning raw list)
-        processed_catalysts = [CatalystData.model_validate(c) for c in catalysts_data]
-
-        logger.info(f"Successfully processed {len(processed_catalysts)} catalysts")
-
-        # Update cache
-        _catalyst_cache[bungie_id] = (now, processed_catalysts)
-        logger.info(f"Updated cache for user {bungie_id}")
-
-        return processed_catalysts
-
-    except Exception as e:
-        logger.error(f"Error fetching catalysts for user {bungie_id}: {e}", exc_info=True)
-        # Consider more specific error handling based on exception type
-        raise HTTPException(status_code=500, detail=f"Failed to fetch catalyst data: {str(e)}")
-
-# Update definitions to accept current_user and manifest_manager
-async def get_all_weapons_for_chat(current_user: User, manifest_manager: ManifestManager) -> List[Weapon]:
-    """Fetches weapon data for chat context, using cache if valid."""
-    # Use bungie_id from the user object for caching
-    bungie_id = current_user.bungie_id
-    now = datetime.now(timezone.utc)
-
-    # Check cache
-    if bungie_id in _weapon_cache:
-        cache_time, cached_data = _weapon_cache[bungie_id]
-        if now - cache_time < WEAPON_CACHE_DURATION:
-            logger.info(f"Returning cached weapon data for user {bungie_id}")
-            return cached_data
-        else:
-            logger.info(f"Weapon cache expired for user {bungie_id}")
-
-    logger.info(f"Fetching fresh weapon data for user: {bungie_id}")
-    
-    # Ensure we have a valid access token (refreshed by get_current_user if needed)
-    access_token = current_user.access_token 
-    if not access_token:
-        logger.error(f"No valid access token found for user {current_user.bungie_id} after get_current_user")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token")
-
-    try:
-        # Use injected manifest_manager
-        weapon_api_instance = WeaponAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
-        # 1. Get Membership Info
-        logger.info(f"Fetching membership info for user {current_user.bungie_id}")
-        membership_info = weapon_api_instance.get_membership_info(access_token)
-        if not membership_info:
-            logger.error(f"Could not retrieve membership info for user {current_user.bungie_id}")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Could not find Destiny membership info")
-        
-        membership_type = membership_info['type']
-        membership_id = membership_info['id']
-        logger.info(f"Found membership Type: {membership_type}, ID: {membership_id}")
-
-        # 2. Fetch Weapons using WeaponAPI instance
-        logger.info(f"Calling weapon_api.get_all_weapons for {membership_type}/{membership_id}")
-        weapons = weapon_api_instance.get_all_weapons(
-            access_token=access_token,
-            membership_type=membership_type,
-            destiny_membership_id=membership_id # Correct keyword argument name
-        )
-        logger.info(f"Successfully fetched {len(weapons)} weapons for user {current_user.bungie_id}")
-        
-        # Update cache before returning
-        _weapon_cache[bungie_id] = (now, weapons)
-        logger.info(f"Updated weapon cache for user {bungie_id}")
-        
-        return weapons
-        
-    except HTTPException as http_exc: # Re-raise known HTTP exceptions
-        raise http_exc 
-    except Exception as e:
-        logger.error(f"Unexpected error fetching weapons for user {current_user.bungie_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch weapons data")
-
+# --- REWRITTEN: Chat Endpoint <--- 
 @app.post("/api/assistants/chat", response_model=ChatResponse)
-async def assistants_chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user_from_token), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
+async def assistants_chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user_from_token)):
     """
-    Chat endpoint using OpenAI Responses API with web_search tool. Injects live Destiny 2 data and lets the model decide when to use web search.
+    Chat endpoint using the agent service to handle interaction and tool calls.
     """
+    if not agent_service:
+        logger.error("Chat request failed: DestinyAgentService not available.")
+        raise HTTPException(status_code=503, detail="Chat service is currently unavailable.")
+        
     if not OPENAI_API_KEY:
         logger.error("OpenAI API key missing.")
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    # --- Fetch live Destiny 2 data ---
-    try:
-        weapons = await get_all_weapons_for_chat(current_user, manifest_manager)
-        catalysts = await get_all_catalysts_for_chat(current_user, manifest_manager)
-    except Exception as e:
-        logger.error(f"Error fetching Destiny 2 data for context: {e}", exc_info=True)
-        weapons = []
-        catalysts = []
-
-    # --- Format context string ---
-    weapon_details = []
-    for w in weapons:
-        perks_str = ", ".join(w.perks) if w.perks else "No specific perks found"
-        detail = (
-            f"- {w.name} ({w.tier_type} {w.item_type} - {w.item_sub_type}, {w.damage_type} Damage)\n"
-            f"  Location: {w.location or 'Unknown'}, Equipped: {w.is_equipped}"
-            f"\n  Perks: {perks_str}"
-        )
-        weapon_details.append(detail)
-    weapon_context = "\n\n".join(weapon_details)
-    catalyst_context = "\n".join([
-        f"- {c.name}: {'Complete' if c.complete else 'Incomplete'} ({'/'.join([f'{o.description}: {o.progress}/{o.completion}' for o in c.objectives])})"
-        for c in catalysts
-    ])
-    context_str = (
-        f"Here is the user's current Destiny 2 weapon and catalyst information:\n\n"
-        f"**Weapons ({len(weapons)}):**\n{weapon_context}\n\n"
-        f"**Catalysts ({len(catalysts)}):**\n{catalyst_context}"
-    )
-
-    # --- Compose input for the model ---
     user_message = request.messages[-1].content if request.messages else ""
-    full_input = f"{context_str}\n\nUser: {user_message}"
+    if not user_message:
+        raise HTTPException(status_code=400, detail="No message content provided.")
+
+    access_token = current_user.access_token # Get token from authenticated user
+    if not access_token:
+         logger.error(f"No access token found for user {current_user.id} ({current_user.bungie_id})")
+         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token for user.")
 
     try:
-        response = client.responses.create(
-            model="gpt-4o",  # or another supported model
-            input=full_input,
-            tools=[{"type": "web_search"}],
-            previous_response_id=request.previous_response_id if request.previous_response_id else None
-        )
-        output_text = next(
-            (out.content[0].text for out in response.output if hasattr(out, "content") and out.content and hasattr(out.content[0], "text")),
-            "(No text response from model.)"
-        )
-        ai_message = ChatMessage(role="assistant", content=output_text)
-        return ChatResponse(message=ai_message, response_id=response.id)
+        logger.info(f"Passing chat request to agent service for user {current_user.bungie_id}")
+        agent_response_text = await agent_service.run_chat(prompt=user_message, access_token=access_token)
+        
+        # Format the response according to ChatResponse model
+        ai_message = ChatMessage(role="assistant", content=agent_response_text)
+        # Note: We don't have a response_id from the agent service's run_chat currently
+        return ChatResponse(message=ai_message, response_id=None) 
+
     except Exception as e:
-        logger.error(f"Error with OpenAI Responses API: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to get response from OpenAI")
+        logger.error(f"Error in assistants_chat_endpoint: {e}", exc_info=True)
+        # Return a generic error message, agent_service.run_chat should log specifics
+        raise HTTPException(status_code=500, detail="An error occurred while processing your chat request.")
 
 @app.get("/api/models", response_model=ModelListResponse)
 async def get_available_models():
