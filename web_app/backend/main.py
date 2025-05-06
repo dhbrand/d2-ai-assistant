@@ -18,13 +18,21 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 import threading
 from collections import defaultdict
+import uuid
+import asyncio # <-- Import asyncio
+from openai import AsyncOpenAI # <-- Import OpenAI client
 
 # Use absolute imports
 from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError, TokenData # Import TokenData here
 from web_app.backend.models import ( # Group imports
     init_db, User, Catalyst, CatalystData, 
     CatalystObjective, Weapon, UserResponse,
-    CallbackData # Add CallbackData
+    CallbackData, # Add CallbackData
+    init_chat_history_db, # <-- Import new init function
+    # Add imports for chat history models and session
+    Conversation, Message, 
+    ConversationSchema, ChatMessageSchema, ConversationCreate, ChatMessageBase,
+    ChatHistorySessionLocal 
 )
 from web_app.backend.catalyst import CatalystAPI
 from web_app.backend.weapon_api import WeaponAPI
@@ -42,10 +50,12 @@ class ChatRequest(BaseModel):
     previous_response_id: Optional[str] = None
     token_data: Optional[TokenData] = None
     model_name: Optional[str] = None
+    conversation_id: Optional[uuid.UUID] = None # Add conversation ID
 
 class ChatResponse(BaseModel):
     message: ChatMessage
     response_id: Optional[str] = None
+    conversation_id: uuid.UUID # Always return conversation ID
 
 # --- Pydantic model for listing models ---
 class ModelInfo(BaseModel):
@@ -136,6 +146,31 @@ except Exception as e:
 
 # --- Globals & Setup ---
 
+# --- FastAPI Startup Event ---
+@app.on_event("startup")
+async def startup_event():
+    """Run initialization tasks when the application starts."""
+    logger.info("Running application startup tasks...")
+
+    # Initialize the Chat History Database
+    try:
+        logger.info("Initializing chat history database...")
+        init_chat_history_db() # Create chat history tables if they don't exist
+        logger.info("Chat history database initialization complete.")
+    except Exception as e:
+        logger.error(f"Failed to initialize chat history database during startup: {e}", exc_info=True)
+        # Decide if the app should proceed without chat history db
+
+    # Optional: Initialize the old catalysts.db if still needed
+    # try:
+    #     logger.info("Initializing main database (catalysts.db)...")
+    #     init_db(DATABASE_URL) 
+    #     logger.info("Main database initialization complete.")
+    # except Exception as e:
+    #     logger.error(f"Failed to initialize main database during startup: {e}", exc_info=True)
+
+    logger.info("Application startup tasks finished.")
+
 # --- Caching Setup ---
 CACHE_DURATION = timedelta(minutes=5)
 _catalyst_cache: Dict[str, Tuple[datetime, List[CatalystData]]] = {}
@@ -155,6 +190,15 @@ def get_db():
     finally:
         db.close()
 
+# --- NEW Dependency Function for Chat History DB ---
+def get_chat_db():
+    """Dependency to get a session for the chat history database."""
+    db = ChatHistorySessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+# --- End NEW Dependency Function ---
 
 # oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token") # Dummy URL, we use /auth/callback
 # Use the standard scheme but expect the JWT in the Authorization header
@@ -358,7 +402,7 @@ async def handle_auth_callback(callback_data: CallbackData, request: Request, db
 async def verify_token(current_user: User = Depends(get_current_user_from_token)):
     """Verify the authentication token (JWT)"""
     # Keep current_user parameter name for consistency in endpoint signature if desired
-    return {"status": "valid", "bungie_id": current_user.bungie_id}
+    return {"status": "ok", "bungie_id": current_user.bungie_id}
 
 @app.get("/catalysts/all", response_model=List[CatalystData])
 # Update dependency to use the new function name
@@ -468,11 +512,168 @@ async def get_all_weapons_endpoint(current_user: User = Depends(get_current_user
         logger.error(f"Unexpected error fetching weapons for user {current_user.bungie_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch weapons data")
 
+# --- NEW Chat History Endpoints ---
+
+@app.get("/api/conversations", response_model=List[ConversationSchema])
+async def list_conversations(
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_chat_db) # Use chat history DB session
+):
+    """Lists all conversations for the currently authenticated user."""
+    user_bungie_id = current_user.bungie_id
+    if not user_bungie_id:
+        # Should not happen if get_current_user_from_token worked
+        raise HTTPException(status_code=401, detail="User Bungie ID not found in token")
+
+    conversations = (
+        db.query(Conversation)
+        .filter(Conversation.user_bungie_id == str(user_bungie_id))
+        .order_by(Conversation.updated_at.desc()) # Show most recent first
+        .all()
+    )
+    return conversations
+
+@app.get("/api/conversations/{conversation_id}/messages", response_model=List[ChatMessageSchema])
+async def get_conversation_messages(
+    conversation_id: uuid.UUID,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_chat_db) # Use chat history DB session
+):
+    """Gets all messages for a specific conversation, verifying ownership."""
+    user_bungie_id = current_user.bungie_id
+    if not user_bungie_id:
+        raise HTTPException(status_code=401, detail="User Bungie ID not found in token")
+
+    # First, verify the conversation exists and belongs to the user
+    conversation = (
+        db.query(Conversation)
+        .filter(
+            Conversation.id == conversation_id,
+            Conversation.user_bungie_id == str(user_bungie_id)
+        )
+        .first()
+    )
+
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found or access denied")
+
+    # Fetch messages ordered by their index
+    messages = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.order_index.asc())
+        .all()
+    )
+    return messages
+
+# --- End NEW Chat History Endpoints ---
+
+# --- NEW Title Generation Function ---
+
+# Initialize OpenAI client globally? Or per request? 
+# For background task, creating it inside might be safer/simpler.
+# Ensure OPENAI_API_KEY is available
+if OPENAI_API_KEY:
+    try:
+        # Using AsyncOpenAI for async function
+        openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        logger.info("OpenAI client initialized for title generation.")
+    except Exception as e:
+        logger.error(f"Failed to initialize OpenAI client: {e}", exc_info=True)
+        openai_client = None
+else:
+    logger.warning("OPENAI_API_KEY not set. Title generation will be disabled.")
+    openai_client = None
+
+async def generate_and_save_title(conversation_id: uuid.UUID):
+    """Fetches first messages, calls OpenAI to generate a title, and saves it."""
+    logger.info(f"Starting title generation task for conversation {conversation_id}")
+    if not openai_client:
+        logger.error(f"Cannot generate title for {conversation_id}: OpenAI client not available.")
+        return
+
+    db = None # Initialize db to None
+    try:
+        # Get a new DB session for this task
+        db = ChatHistorySessionLocal()
+        
+        # Fetch first user message (index 0) and first assistant message (index 1)
+        user_msg = db.query(Message).filter(
+            Message.conversation_id == conversation_id, 
+            Message.order_index == 0,
+            Message.role == 'user' 
+        ).first()
+        
+        assistant_msg = db.query(Message).filter(
+            Message.conversation_id == conversation_id, 
+            Message.order_index == 1, 
+            Message.role == 'assistant'
+        ).first()
+        
+        conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+
+        if not conversation:
+            logger.error(f"Title gen failed: Conversation {conversation_id} not found.")
+            return
+        if conversation.title:
+            logger.info(f"Title already exists for conversation {conversation_id}. Skipping generation.")
+            return
+        if not user_msg or not assistant_msg:
+            logger.warning(f"Could not find first user/assistant message for conv {conversation_id}. Cannot generate title.")
+            return
+
+        # Construct prompt
+        prompt = (
+            f"Generate a concise title (5 words maximum, plain text only) for the following conversation start:\n\n"
+            f"User: {user_msg.content}\n"
+            f"Assistant: {assistant_msg.content}\n\n"
+            f"Title:"
+        )
+        
+        logger.info(f"Calling OpenAI for title generation (model: gpt-4o) for conv {conversation_id}")
+        try:
+            completion = await openai_client.chat.completions.create(
+                model="gpt-4o", # <-- Switch to gpt-4o
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=20, # Limit tokens for title
+                temperature=0.5, # Slightly creative but not too random
+                n=1,
+                stop=None
+            )
+            generated_title = completion.choices[0].message.content.strip().strip('"') # Clean up quotes/whitespace
+            logger.info(f"Generated title for {conversation_id}: '{generated_title}'")
+            
+            # Save the title
+            conversation.title = generated_title
+            db.commit()
+            logger.info(f"Successfully saved title for conversation {conversation_id}")
+            
+        except Exception as api_err:
+            # Log API error - could be invalid model, rate limit, etc.
+            logger.error(f"OpenAI API error during title generation for conv {conversation_id}: {api_err}", exc_info=True)
+            # Optionally try a fallback model here?
+            # For now, just log and exit.
+            pass # Don't save title if API failed
+            
+    except Exception as e:
+        logger.error(f"Error in title generation task for conversation {conversation_id}: {e}", exc_info=True)
+        if db: # Rollback if any other error occurred
+             db.rollback()
+    finally:
+        if db: # Ensure session is closed
+            db.close()
+
+# --- End Title Generation Function ---
+
 # --- REWRITTEN: Chat Endpoint <--- 
 @app.post("/api/assistants/chat", response_model=ChatResponse)
-async def assistants_chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user_from_token)):
+async def assistants_chat_endpoint(
+    request: ChatRequest, 
+    current_user: User = Depends(get_current_user_from_token),
+    chat_db: Session = Depends(get_chat_db) # Inject chat history DB session
+):
     """
-    Chat endpoint using the agent service to handle interaction and tool calls.
+    Chat endpoint using the agent service, handling conversation history.
     """
     if not agent_service:
         logger.error("Chat request failed: DestinyAgentService not available.")
@@ -482,28 +683,143 @@ async def assistants_chat_endpoint(request: ChatRequest, current_user: User = De
         logger.error("OpenAI API key missing.")
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
-    user_message = request.messages[-1].content if request.messages else ""
-    if not user_message:
-        raise HTTPException(status_code=400, detail="No message content provided.")
+    user_message_content = request.messages[-1].content if request.messages else ""
+    if not user_message_content:
+        raise HTTPException(status_code=400, detail="No message content provided")
 
-    access_token = current_user.access_token # Get token from authenticated user
-    if not access_token:
-         logger.error(f"No access token found for user {current_user.id} ({current_user.bungie_id})")
-         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token for user.")
+    access_token = current_user.access_token
+    bungie_id = current_user.bungie_id # Get bungie_id from the user object
+    conversation_id = request.conversation_id # Get from request, could be None
+    
+    if not access_token or not bungie_id:
+        logger.error(f"Auth info missing for user {current_user.id} (Token: {'Present' if access_token else 'Missing'}, BungieID: {'Present' if bungie_id else 'Missing'})")
+        raise HTTPException(status_code=401, detail="Authentication token or user ID missing")
 
-    try:
-        logger.info(f"Passing chat request to agent service for user {current_user.bungie_id}")
-        agent_response_text = await agent_service.run_chat(prompt=user_message, access_token=access_token)
+    conversation_history = []
+    current_conversation: Conversation | None = None
+    next_order_index = 0
+
+    # --- Handle Existing vs New Conversation ---
+    if conversation_id:
+        # Load existing conversation and history
+        logger.info(f"Continuing existing conversation: {conversation_id}")
+        current_conversation = (
+            chat_db.query(Conversation)
+            .filter(
+                Conversation.id == conversation_id,
+                Conversation.user_bungie_id == str(bungie_id)
+            )
+            .first()
+        )
+        if not current_conversation:
+            logger.warning(f"Attempt to access non-existent or unauthorized conversation {conversation_id} by user {bungie_id}")
+            raise HTTPException(status_code=404, detail="Conversation not found or access denied")
         
-        # Format the response according to ChatResponse model
-        ai_message = ChatMessage(role="assistant", content=agent_response_text)
-        # Note: We don't have a response_id from the agent service's run_chat currently
-        return ChatResponse(message=ai_message, response_id=None) 
+        # Load history (already ordered by relationship/query)
+        db_messages = current_conversation.messages 
+        conversation_history = [
+            {"role": msg.role, "content": msg.content} 
+            for msg in db_messages
+        ]
+        next_order_index = len(db_messages) # Next index is current length
 
+    else:
+        # Start new conversation
+        logger.info(f"Starting new conversation for user {bungie_id}")
+        current_conversation = Conversation(user_bungie_id=str(bungie_id))
+        chat_db.add(current_conversation)
+        # We need the ID, so flush to get it assigned by the DB/UUID default
+        try:
+            chat_db.flush()
+            conversation_id = current_conversation.id # Get the newly assigned ID
+            logger.info(f"Created new conversation with ID: {conversation_id}")
+        except Exception as e:
+            logger.error(f"Error flushing new conversation for user {bungie_id}: {e}", exc_info=True)
+            chat_db.rollback()
+            raise HTTPException(status_code=500, detail="Failed to create new conversation record")
+        next_order_index = 0 # First message
+        
+    # --- Save User Message ---
+    user_db_message = Message(
+        conversation_id=conversation_id,
+        role="user",
+        content=user_message_content,
+        order_index=next_order_index
+    )
+    chat_db.add(user_db_message)
+    next_order_index += 1
+
+    # --- Prepare for Agent Call ---
+    # Add current user message to history *before* calling agent
+    conversation_history.append({"role": "user", "content": user_message_content})
+    
+    logger.info(f"Passing chat request to agent service for user {bungie_id}, conversation {conversation_id}")
+    
+    # --- Call Agent Service (Modify agent_service later to accept history) ---
+    # Call the updated run_chat method with history
+    run_result = await agent_service.run_chat(
+        prompt=user_message_content, # Pass the latest user message as prompt
+        access_token=access_token, 
+        bungie_id=str(bungie_id),
+        history=conversation_history # Pass the constructed history
+    )
+    
+    # --- Process Agent Response ---
+    if isinstance(run_result, dict) and 'error' in run_result:
+        logger.error(f"Agent service returned error for conv {conversation_id}: {run_result['error']}")
+        # Don't commit the user message if agent failed? Or commit anyway?
+        # Let's commit the user message but not the failed assistant response.
+        try:
+             current_conversation.updated_at = datetime.now(timezone.utc) # Update timestamp even on error
+             chat_db.commit()
+        except Exception as commit_err:
+             logger.error(f"Error committing user message after agent error for conv {conversation_id}: {commit_err}", exc_info=True)
+             chat_db.rollback()
+        raise HTTPException(status_code=500, detail=run_result['error'])
+    
+    elif hasattr(run_result, 'final_output'): 
+        agent_response_content = run_result.final_output
+    else:
+        logger.warning(f"Unexpected result type from agent service for conv {conversation_id}: {type(run_result)}")
+        try:
+             current_conversation.updated_at = datetime.now(timezone.utc)
+             chat_db.commit()
+        except Exception as commit_err:
+             logger.error(f"Error committing user message after unexpected agent result for conv {conversation_id}: {commit_err}", exc_info=True)
+             chat_db.rollback()
+        raise HTTPException(status_code=500, detail="Received unexpected response from agent service.")
+
+    # --- Save Assistant Message ---
+    assistant_db_message = Message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content=agent_response_content,
+        order_index=next_order_index # Use the incremented index
+    )
+    chat_db.add(assistant_db_message)
+
+    # --- Update Conversation Timestamp and Commit ---
+    current_conversation.updated_at = datetime.now(timezone.utc)
+    next_order_index += 1 # <-- Increment index AFTER adding assistant message
+    try:
+        chat_db.commit() # Commit user msg, assistant msg, and timestamp update
+        logger.info(f"Successfully saved user and assistant messages for conversation {conversation_id}")
     except Exception as e:
-        logger.error(f"Error in assistants_chat_endpoint: {e}", exc_info=True)
-        # Return a generic error message, agent_service.run_chat should log specifics
-        raise HTTPException(status_code=500, detail="An error occurred while processing your chat request.")
+        logger.error(f"Failed to commit conversation {conversation_id} updates: {e}", exc_info=True)
+        chat_db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to save conversation history")
+
+    # --- Prepare and Return Response ---
+    response_message = ChatMessage(role="assistant", content=agent_response_content)
+    
+    # Trigger title generation if it was a new chat and first exchange (next_order_index would be 2 after saving assistant msg)
+    if not request.conversation_id and next_order_index == 2: # If it was a new chat AND we just saved the first assistant message
+        logger.info(f"Condition met for title generation for new conversation {conversation_id}.") # Add specific log
+        # Call the async background task
+        asyncio.create_task(generate_and_save_title(conversation_id))
+        logger.info(f"Background task for title generation for {conversation_id} scheduled.")
+
+    return ChatResponse(message=response_message, conversation_id=conversation_id)
 
 @app.get("/api/models", response_model=ModelListResponse)
 async def get_available_models():
@@ -548,10 +864,17 @@ else:
 # Optional: Add shutdown event to close manifest DB connection
 @app.on_event("shutdown")
 def shutdown_event():
-    logger.info("Closing manifest database connection...")
-    manifest_manager.close()
+    logger.info("Application shutting down...")
+    # Add any cleanup logic here if needed
+    # manifest_manager.close_db() # Example if manifest manager held a DB connection
+    logger.info("Shutdown complete.")
 
 app.include_router(voice_router)
+
+# Add a root endpoint for basic check
+@app.get("/")
+def read_root():
+    return {"message": "Destiny 2 Assistant Backend is running."}
 
 if __name__ == "__main__":
     import uvicorn
