@@ -7,7 +7,6 @@ import {
   ListItemButton,
   ListItemText,
   Divider,
-  Typography,
   Button,
   TextField,
   CircularProgress,
@@ -46,7 +45,6 @@ function ChatPage() {
   const [newMessage, setNewMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
-  const [previousResponseId, setPreviousResponseId] = useState(null);
   const [conversations, setConversations] = useState([]);
   const [currentConversationId, setCurrentConversationId] = useState(null);
   const messagesEndRef = useRef(null);
@@ -161,13 +159,11 @@ function ChatPage() {
   const handleNewChat = () => {
     setCurrentConversationId(null);
     setMessages([]); // Clear messages for new chat
-    setPreviousResponseId(null); // Reset any old response ID
   };
 
   const handleSelectConversation = async (id) => {
     if (id !== currentConversationId) {
       setCurrentConversationId(id);
-      setPreviousResponseId(null);
       setMessages([]);
       setNewMessage('');
       setIsLoading(true);
@@ -249,8 +245,6 @@ function ChatPage() {
         // Start polling for title update
         pollForTitleUpdate(data.conversation_id);
       } 
-      
-      setPreviousResponseId(data.response_id);
 
     } catch (error) {
       console.error(error);
