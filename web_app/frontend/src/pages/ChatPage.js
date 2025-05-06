@@ -15,6 +15,17 @@ import {
 import { useAuth } from '../contexts/AuthContext';
 import AdvancedMarkdownRenderer from '../components/AdvancedMarkdownRenderer';
 import VoiceInputButton from '../components/VoiceInputButton';
+import DeleteIcon from '@mui/icons-material/Delete';
+import ArchiveIcon from '@mui/icons-material/Archive';
+import EditIcon from '@mui/icons-material/Edit';
+import CheckIcon from '@mui/icons-material/Check';
+import CloseIcon from '@mui/icons-material/Close';
+import Switch from '@mui/material/Switch';
+import FormControlLabel from '@mui/material/FormControlLabel';
+import IconButton from '@mui/material/IconButton';
+import Menu from '@mui/material/Menu';
+import MenuItem from '@mui/material/MenuItem';
+import Tooltip from '@mui/material/Tooltip';
 
 // --- NEW Type Definitions for Chat History (using JSDoc for .js file) ---
 /**
@@ -49,39 +60,41 @@ function ChatPage() {
   const [currentConversationId, setCurrentConversationId] = useState(null);
   const messagesEndRef = useRef(null);
   const messageListRef = useRef(null);
+  const [editingTitleId, setEditingTitleId] = useState(null);
+  const [editingTitleValue, setEditingTitleValue] = useState('');
+  const [showArchived, setShowArchived] = useState(false);
+  const [contextMenu, setContextMenu] = useState(null); // { mouseX, mouseY, convId }
+  const [contextConvId, setContextConvId] = useState(null);
 
   // --- NEW Functions for Chat History API Calls ---
 
   const fetchConversations = useCallback(async () => {
-    // Check token presence directly
     if (!token) {
-        console.log("Fetch conversations: No token found.");
-        return [];
+      console.log("Fetch conversations: No token found.");
+      return [];
     }
     try {
-      console.log("Fetching conversations..."); // Log start
-      const response = await fetch('https://localhost:8000/api/conversations', {
+      let url = 'https://localhost:8000/api/conversations';
+      if (showArchived) url += '?archived=1';
+      const response = await fetch(url, {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${token}`,
           'Accept': 'application/json',
         },
       });
-      console.log("Fetch conversations response status:", response.status); // Log status
       if (!response.ok) {
         const errorText = await response.text();
         console.error('Failed to fetch conversations:', response.statusText, errorText);
         return [];
       }
-      /** @type {Conversation[]} */
       const data = await response.json();
-      console.log("Fetched conversations data:", data); // Log data
       return data;
     } catch (error) {
       console.error('Error fetching conversations:', error);
       return [];
     }
-  }, [token]); // Dependency on token
+  }, [token, showArchived]);
 
   const fetchMessagesForConversation = useCallback(async (conversationId) => {
      // Check token presence directly
@@ -269,6 +282,64 @@ function ChatPage() {
     }
   };
 
+  // --- API Calls for Delete, Archive, Rename ---
+  const deleteConversation = async (id) => {
+    if (!token) return;
+    await fetch(`https://localhost:8000/api/conversations/${id}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    const updated = await fetchConversations();
+    setConversations(updated || []);
+    if (id === currentConversationId) handleNewChat();
+  };
+  const archiveConversation = async (id) => {
+    if (!token) return;
+    await fetch(`https://localhost:8000/api/conversations/${id}/archive`, {
+      method: 'PATCH',
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    const updated = await fetchConversations();
+    setConversations(updated || []);
+    if (id === currentConversationId) handleNewChat();
+  };
+  const renameConversation = async (id, newTitle) => {
+    if (!token) return;
+    await fetch(`https://localhost:8000/api/conversations/${id}/rename`, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ title: newTitle }),
+    });
+    setEditingTitleId(null);
+    setEditingTitleValue('');
+    const updated = await fetchConversations();
+    setConversations(updated || []);
+  };
+
+  // --- Context Menu Handlers ---
+  const handleContextMenu = (event, convId) => {
+    event.preventDefault();
+    setContextMenu(
+      contextMenu === null
+        ? { mouseX: event.clientX - 2, mouseY: event.clientY - 4 }
+        : null,
+    );
+    setContextConvId(convId);
+  };
+  const handleCloseContextMenu = (cb) => {
+    setContextMenu(null);
+    setContextConvId(null);
+    if (typeof cb === 'function') {
+      setTimeout(cb, 0); // Defer to after menu closes
+    } else {
+      setEditingTitleId(null);
+      setEditingTitleValue('');
+    }
+  };
+
   return (
     <Box
       sx={{
@@ -295,24 +366,59 @@ function ChatPage() {
                 New Chat
               </Button>
             </ListItem>
+            <ListItem>
+              <FormControlLabel
+                control={<Switch checked={showArchived} onChange={e => setShowArchived(e.target.checked)} />}
+                label="Show Archived"
+              />
+            </ListItem>
             <Divider />
             {conversations.length === 0 && (
                <ListItem><ListItemText primary="No conversations yet." /></ListItem>
             )}
             {conversations.map((conv) => (
-              <ListItem key={conv.id} disablePadding>
+              <ListItem key={conv.id} disablePadding
+                onContextMenu={e => handleContextMenu(e, conv.id)}
+                sx={{ alignItems: 'center', minHeight: 56 }}
+              >
                 <ListItemButton 
                   selected={currentConversationId === conv.id} 
                   onClick={() => handleSelectConversation(conv.id)}
+                  sx={{ minHeight: 56 }}
                 >
                   <ListItemText 
-                     primary={conv.title || 'New Conversation'} 
-                     secondary={`Updated: ${new Date(conv.updated_at).toLocaleString()}`}
-                     primaryTypographyProps={{ 
-                       overflow: 'hidden',
-                       textOverflow: 'ellipsis',
-                       whiteSpace: 'nowrap' 
-                     }}
+                    primary={editingTitleId === conv.id ? (
+                      <TextField
+                        size="small"
+                        value={editingTitleValue}
+                        onChange={e => setEditingTitleValue(e.target.value)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') renameConversation(conv.id, editingTitleValue);
+                          if (e.key === 'Escape') setEditingTitleId(null);
+                        }}
+                        autoFocus
+                        sx={{ width: 200, maxWidth: 250 }}
+                        inputProps={{ maxLength: 100 }}
+                      />
+                    ) : (
+                      <Tooltip title={conv.title || 'New Conversation'} placement="right" arrow>
+                        <span style={{
+                          display: 'inline-block',
+                          maxWidth: 200,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                          verticalAlign: 'middle',
+                        }}>{conv.title || 'New Conversation'}</span>
+                      </Tooltip>
+                    )}
+                    secondary={`Updated: ${new Date(conv.updated_at).toLocaleString()}`}
+                    primaryTypographyProps={{
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      maxWidth: 200,
+                    }}
                   />
                 </ListItemButton>
               </ListItem>
@@ -418,6 +524,25 @@ function ChatPage() {
           <VoiceInputButton onTranscription={setNewMessage} />
         </Box>
       </Box>
+
+      {/* Context Menu for Conversation Actions */}
+      <Menu
+        open={contextMenu !== null}
+        onClose={() => handleCloseContextMenu()}
+        anchorReference="anchorPosition"
+        anchorPosition={
+          contextMenu !== null
+            ? { top: contextMenu.mouseY, left: contextMenu.mouseX }
+            : undefined
+        }
+      >
+        <MenuItem onClick={() => handleCloseContextMenu(() => {
+          setEditingTitleId(contextConvId);
+          setEditingTitleValue(conversations.find(c => c.id === contextConvId)?.title || '');
+        })}>Rename</MenuItem>
+        <MenuItem onClick={() => { archiveConversation(contextConvId); handleCloseContextMenu(); }}>Archive</MenuItem>
+        <MenuItem onClick={() => { deleteConversation(contextConvId); handleCloseContextMenu(); }} sx={{ color: 'error.main' }}>Delete</MenuItem>
+      </Menu>
     </Box>
   );
 }
