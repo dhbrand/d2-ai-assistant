@@ -183,6 +183,25 @@ function ChatPage() {
     }
   };
 
+  // --- Polling for Title Update ---
+  const pollForTitleUpdate = useCallback((conversationId, maxAttempts = 5, intervalMs = 2000) => {
+    let attempts = 0;
+    const poll = async () => {
+      attempts++;
+      const updatedConvs = await fetchConversations();
+      setConversations(updatedConvs || []);
+      const conv = (updatedConvs || []).find(c => c.id === conversationId);
+      if (conv && conv.title && conv.title !== 'New Conversation') {
+        // Title updated, stop polling
+        return;
+      }
+      if (attempts < maxAttempts) {
+        setTimeout(poll, intervalMs);
+      }
+    };
+    poll();
+  }, [fetchConversations]);
+
   const handleSendMessage = async () => {
     if (!newMessage.trim() || isLoading) return;
 
@@ -227,6 +246,8 @@ function ChatPage() {
       if (isNewConversation && data.conversation_id) {
         setCurrentConversationId(data.conversation_id);
         fetchConversations();
+        // Start polling for title update
+        pollForTitleUpdate(data.conversation_id);
       } 
       
       setPreviousResponseId(data.response_id);
