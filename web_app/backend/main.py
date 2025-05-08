@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query, Header
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +21,7 @@ from collections import defaultdict
 import uuid
 import asyncio # <-- Import asyncio
 from openai import AsyncOpenAI # <-- Import OpenAI client
+from jose.exceptions import ExpiredSignatureError
 
 # Use absolute imports
 from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError, TokenData # Import TokenData here
@@ -76,7 +77,7 @@ BUNGIE_CLIENT_SECRET = os.getenv("BUNGIE_CLIENT_SECRET")
 BUNGIE_API_KEY = os.getenv("BUNGIE_API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY", "a_very_secret_key_for_dev_only") # Use env var for production
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30 # Should match Bungie's expiry if possible, but our JWT has its own life
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440 # 24 hours
 DATABASE_URL = "sqlite:///./catalysts.db"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # Uncomment
 OPENAI_ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID")
@@ -422,35 +423,21 @@ async def get_all_catalysts_endpoint(current_user: User = Depends(get_current_us
 
     logger.info(f"Fetching fresh catalyst data for user {bungie_id}")
     try:
-        # Get current access token from the authenticated user object
-        # The get_current_user dependency ensures this token is valid/refreshed
-        access_token = current_user.access_token
+        # Ensure access token is valid (refresh if needed)
+        oauth_manager.refresh_if_needed()
+        access_token = oauth_manager.token_data['access_token']
         if not access_token:
-            # This should ideally not happen if get_current_user worked, but check defensively
             logger.error(f"No access token available for user {bungie_id} in get_all_catalysts")
-
-        # Fetch data from Bungie API via CatalystAPI
-        logger.info("Fetching catalysts from Bungie API...")
-        # Use injected manifest_manager
         catalyst_api_instance = CatalystAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
         catalysts_data = catalyst_api_instance.get_catalysts(access_token=access_token)
         logger.info(f"Retrieved {len(catalysts_data)} catalysts from API")
-        
-        # Convert raw dicts to Pydantic models (FastAPI does this automatically if returning raw list)
-        # We need to do it here if we want to cache the Pydantic models
         processed_catalysts = [CatalystData.model_validate(c) for c in catalysts_data]
-
         logger.info(f"Successfully processed {len(processed_catalysts)} catalysts")
-
-        # Update cache
         _catalyst_cache[bungie_id] = (now, processed_catalysts)
         logger.info(f"Updated cache for user {bungie_id}")
-
         return processed_catalysts
-        
     except Exception as e:
         logger.error(f"Error fetching catalysts for user {bungie_id}: {e}", exc_info=True)
-        # Consider more specific error handling based on exception type
         raise HTTPException(status_code=500, detail=f"Failed to fetch catalyst data: {str(e)}")
 
 @app.get("/weapons/all", response_model=List[Weapon]) # Use Weapon Pydantic model
@@ -517,20 +504,19 @@ async def get_all_weapons_endpoint(current_user: User = Depends(get_current_user
 @app.get("/api/conversations", response_model=List[ConversationSchema])
 async def list_conversations(
     current_user: User = Depends(get_current_user_from_token),
-    db: Session = Depends(get_chat_db) # Use chat history DB session
+    db: Session = Depends(get_chat_db),
+    archived: int = Query(0, description="Set to 1 to show archived conversations")
 ):
-    """Lists all conversations for the currently authenticated user."""
+    """Lists all (optionally archived) conversations for the currently authenticated user."""
     user_bungie_id = current_user.bungie_id
     if not user_bungie_id:
-        # Should not happen if get_current_user_from_token worked
         raise HTTPException(status_code=401, detail="User Bungie ID not found in token")
-
-    conversations = (
-        db.query(Conversation)
-        .filter(Conversation.user_bungie_id == str(user_bungie_id))
-        .order_by(Conversation.updated_at.desc()) # Show most recent first
-        .all()
-    )
+    query = db.query(Conversation).filter(Conversation.user_bungie_id == str(user_bungie_id))
+    if archived:
+        query = query.filter(Conversation.archived == True)
+    else:
+        query = query.filter(Conversation.archived == False)
+    conversations = query.order_by(Conversation.updated_at.desc()).all()
     return conversations
 
 @app.get("/api/conversations/{conversation_id}/messages", response_model=List[ChatMessageSchema])
@@ -875,6 +861,139 @@ app.include_router(voice_router)
 @app.get("/")
 def read_root():
     return {"message": "Destiny 2 Assistant Backend is running."}
+
+# --- NEW: Delete Conversation Endpoint ---
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: uuid.UUID,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_chat_db)
+):
+    """Deletes a conversation and all its messages."""
+    conv = db.query(Conversation).filter(
+        Conversation.id == conversation_id,
+        Conversation.user_bungie_id == str(current_user.bungie_id)
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found or access denied")
+    db.query(Message).filter(Message.conversation_id == conversation_id).delete()
+    db.delete(conv)
+    db.commit()
+    return {"status": "deleted"}
+
+# --- NEW: Archive Conversation Endpoint ---
+@app.patch("/api/conversations/{conversation_id}/archive")
+async def archive_conversation(
+    conversation_id: uuid.UUID,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_chat_db)
+):
+    """Archives a conversation (hides from default list)."""
+    conv = db.query(Conversation).filter(
+        Conversation.id == conversation_id,
+        Conversation.user_bungie_id == str(current_user.bungie_id)
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found or access denied")
+    conv.archived = True
+    db.commit()
+    return {"status": "archived"}
+
+# --- NEW: Rename Conversation Endpoint ---
+from pydantic import BaseModel as PydanticBaseModel
+class RenameConversationRequest(PydanticBaseModel):
+    title: str
+
+@app.patch("/api/conversations/{conversation_id}/rename")
+async def rename_conversation(
+    conversation_id: uuid.UUID,
+    req: RenameConversationRequest,
+    current_user: User = Depends(get_current_user_from_token),
+    db: Session = Depends(get_chat_db)
+):
+    """Renames a conversation (changes its title)."""
+    conv = db.query(Conversation).filter(
+        Conversation.id == conversation_id,
+        Conversation.user_bungie_id == str(current_user.bungie_id)
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found or access denied")
+    conv.title = req.title
+    db.commit()
+    return {"status": "renamed", "title": req.title}
+
+@app.post("/auth/refresh")
+def refresh_jwt_token(Authorization: str = Header(None), db: Session = Depends(get_db)):
+    """
+    Issue a new JWT if the backend has a valid Bungie refresh token for the user.
+    The frontend should call this if it gets a 401 due to JWT expiry.
+    """
+    logger.info("/auth/refresh called. Attempting to refresh JWT using backend refresh token.")
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not refresh credentials. Please log in again.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    if not Authorization or not Authorization.startswith("Bearer "):
+        logger.error("No Authorization header or wrong format.")
+        raise credentials_exception
+    jwt_token = Authorization.split(" ", 1)[1]
+    try:
+        # Decode JWT ignoring expiry to get user info
+        payload = jwt.decode(jwt_token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": False})
+        user_id: str = payload.get("sub")
+        bungie_id: str = payload.get("bng")
+        if user_id is None or bungie_id is None:
+            logger.error("JWT missing 'sub' or 'bng' claim.")
+            raise credentials_exception
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        if not user:
+            logger.error(f"User with DB ID {user_id} not found in DB.")
+            raise credentials_exception
+        if str(user.bungie_id) != bungie_id:
+            logger.error(f"JWT Bungie ID ({bungie_id}) mismatch with DB Bungie ID ({user.bungie_id}) for user DB ID {user_id}")
+            raise credentials_exception
+        # Check for refresh token
+        if not user.refresh_token:
+            logger.error("No refresh token stored for user. Cannot refresh.")
+            raise credentials_exception
+        # Refresh Bungie access token if needed
+        try:
+            new_token_data = oauth_manager.refresh_token(user.refresh_token)
+            user.access_token = new_token_data["access_token"]
+            user.refresh_token = new_token_data["refresh_token"]
+            expires_in = new_token_data["expires_in"]
+            now_utc = datetime.now(timezone.utc)
+            user.access_token_expires = now_utc + timedelta(seconds=expires_in)
+            db.commit()
+            logger.info(f"Refreshed Bungie access token for user {user_id}.")
+        except Exception as e:
+            logger.error(f"Failed to refresh Bungie token: {e}")
+            raise credentials_exception
+        # Issue new JWT
+        jwt_expires = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        jwt_payload = {
+            "sub": str(user.id),
+            "bng": str(user.bungie_id),
+            "exp": jwt_expires
+        }
+        encoded_jwt = jwt.encode(jwt_payload, SECRET_KEY, algorithm=ALGORITHM)
+        logger.info(f"Issued new JWT for user {user_id} (Bungie ID {bungie_id}) via /auth/refresh.")
+        return {
+            "status": "success",
+            "access_token": encoded_jwt,
+            "token_type": "bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        }
+    except ExpiredSignatureError:
+        logger.info("JWT expired, but ignoring for refresh.")
+        raise credentials_exception
+    except JWTError as e:
+        logger.error(f"JWTError decoding token in /auth/refresh: {e}")
+        raise credentials_exception
+    except Exception as e:
+        logger.error(f"Unexpected error in /auth/refresh: {e}")
+        raise credentials_exception
 
 if __name__ == "__main__":
     import uvicorn

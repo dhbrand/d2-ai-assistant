@@ -132,4 +132,8 @@ dev-certs/
 
 # macOS
 .AppleDouble
-.LSOverride 
+.LSOverride
+
+# New lines from the code block
+web_app/backend/credentials.json
+web_app/backend/service_account.json 

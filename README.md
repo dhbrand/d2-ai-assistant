@@ -1,6 +1,6 @@
 # Destiny 2 Catalyst Tracker
 
-A tool to track your Destiny 2 catalyst collection and progress.
+A tool to track your Destiny 2 catalyst collection and progress, featuring an AI assistant for natural language queries.
 
 ## Repository Structure
 
@@ -22,6 +22,15 @@ The web application offers a modern, user-friendly interface for tracking your D
    ```
 
 2. Follow the instructions in the [web-app README](web-app/README.md).
+
+### Backend Architecture
+
+The web application's backend is built using FastAPI and utilizes several key components:
+
+*   **Bungie API Interaction:** Handles OAuth 2.0 authentication and direct calls to the Bungie.net API for user data (weapons, catalysts, profile info).
+*   **Manifest Management:** Downloads and queries the official Destiny 2 SQLite manifest database locally for definitions (item names, stats, perks, etc.).
+*   **Database:** Uses a local SQLite database (`catalysts.db`) to store user authentication tokens.
+*   **Agent-Based Chat:** The chat functionality (`/api/assistants/chat`) employs an AI agent built with the `openai-agents` library (`DestinyAgentService`). This agent uses tools (`get_user_info`, `get_weapons`, `get_catalysts`) to dynamically fetch relevant data from the Bungie API based on the user's natural language prompts, rather than pre-loading all data.
 
 ## Desktop Application (Legacy)
 
@@ -91,8 +100,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Features
 
 - Track completion progress for all Destiny 2 exotic catalysts
-- Automatic data synchronization with Bungie.net API
-- Dark/Light theme support
+- AI assistant for querying weapon and catalyst information using natural language
+- Data synchronization with Bungie.net API (fetched on demand by the agent for chat, or via specific endpoints)
+- Dark/Light theme support (Frontend)
 - Cross-platform desktop application (Windows, macOS, Linux)
 - Web interface for mobile access
 

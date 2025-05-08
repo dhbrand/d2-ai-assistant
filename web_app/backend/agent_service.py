@@ -10,7 +10,14 @@ import functools # Import functools
 import asyncio # Import asyncio
 from datetime import datetime, timedelta, timezone # Import datetime components
 import pandas as pd # <--- Import pandas
-from typing import Optional
+from typing import Optional, List, Dict
+import requests
+import xml.etree.ElementTree as ET
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import difflib
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -210,100 +217,70 @@ def _get_pve_activity_bis_weapons_impl(service: 'DestinyAgentService') -> list[d
 
 # ---> MODIFIED: Endgame Analysis Sheet Tool Implementation <---
 def _get_endgame_analysis_impl(service: 'DestinyAgentService', sheet_name: Optional[str] = None) -> list[dict] | str:
-    """(Implementation) Fetches and combines data from multiple sheets, then filters by sheet_name if provided."""
+    """Fetches data from a specific sheet in the Endgame Analysis spreadsheet using the Google Sheets API and a service account."""
     logger.debug(f"Agent Tool Impl: get_endgame_analysis_data called. Target sheet: {sheet_name}")
-    sheet_id = "1JM-0SlxVDAi-C6rGVlLxa-J1WGewEeL8Qvq4htWZHhY" 
-    
-    sheets_to_fetch = [
-        ('Status', 346832350),
-        ('Changelog', 1439671777),
-        ('Shopping List', 1062099834),
-        ('Day 1', 1957089919),
-        ('Archetypes', 1301036036),
-        ('Experimental', 107452313),
-        ('Shotguns', 1595979957),
-        ('Snipers', 1090554564)
-    ]
-    
-    available_sheet_names = [name for name, _ in sheets_to_fetch]
-    
-    included_gids_str = "_".join(sorted([str(gid) for _, gid in sheets_to_fetch]))
-    cache_key = f"endgame_analysis_{sheet_id}_{included_gids_str}"
+    SHEET_ID = "1JM-0SlxVDAi-C6rGVlLxa-J1WGewEeL8Qvq4htWZHhY"
+    SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(__file__), "service_account.json")
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    # Step 1: Authenticate and get sheet metadata
+    try:
+        creds = Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES
+        )
+        service_gs = build("sheets", "v4", credentials=creds)
+        meta = service_gs.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+        sheets = meta.get("sheets", [])
+        # Filter out sheets with 'old' or 'outdated' in the name
+        active_sheets = [
+            (s["properties"]["title"], s["properties"]["sheetId"])
+            for s in sheets
+            if "old" not in s["properties"]["title"].lower() and "outdated" not in s["properties"]["title"].lower()
+        ]
+        sheet_name_map = {title: gid for title, gid in active_sheets}
+        available_sheet_names = list(sheet_name_map.keys())
+    except Exception as e:
+        logger.error(f"Failed to fetch sheet metadata: {e}")
+        return f"Error: Could not fetch sheet metadata. {e}"
+    # If no sheet_name provided, return available sheets
+    if not sheet_name:
+        return f"Please specify which sheet you want data from. Available sheets: {available_sheet_names}"
+    # Fuzzy match the requested sheet name
+    matches = difflib.get_close_matches(sheet_name, available_sheet_names, n=1, cutoff=0.6)
+    if not matches:
+        # Try regex partial match
+        pattern = re.compile(re.escape(sheet_name), re.IGNORECASE)
+        matches = [name for name in available_sheet_names if pattern.search(name)]
+    if not matches:
+        return f"Error: Unknown sheet name '{sheet_name}'. Available sheets: {available_sheet_names}"
+    selected_sheet = matches[0]
+    gid = sheet_name_map[selected_sheet]
+    cache_key = f"endgame_analysis_{SHEET_ID}_{gid}"
     now = datetime.now(timezone.utc)
-
-    combined_data: list[dict] | None = None
-    combined_df: pd.DataFrame | None = None
-    
-    # Check cache for the *combined* data
+    # Check cache
     if cache_key in service._sheet_cache:
         cache_time, cached_data = service._sheet_cache[cache_key]
-        if now - cache_time < CACHE_TTL: 
-            logger.info(f"Cache HIT for COMBINED Endgame Analysis Sheet (key: {cache_key})")
-            combined_data = cached_data
-            # Convert cached list of dicts back to DataFrame for filtering
-            if combined_data:
-                 try:
-                      combined_df = pd.DataFrame(combined_data)
-                 except Exception as e:
-                      logger.error(f"Error converting cached data to DataFrame: {e}")
-                      combined_df = None # Force re-fetch if conversion fails
+        if now - cache_time < CACHE_TTL:
+            logger.info(f"Cache HIT for Endgame Analysis Sheet (key: {cache_key})")
+            return cached_data
         else:
-             logger.info(f"Cache STALE for COMBINED Endgame Analysis Sheet (key: {cache_key})")
-             
-    # If not cached or cache stale, fetch and combine
-    if combined_df is None: 
-        logger.info(f"Cache MISS/STALE for COMBINED Endgame Analysis Sheet (key: {cache_key}). Fetching data...")
-        all_data_frames = []
-        errors = []
-        for name, gid in sheets_to_fetch:
-            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-            try:
-                df = pd.read_csv(csv_url)
-                df.dropna(how='all', inplace=True)
-                df['source_sheet'] = name
-                all_data_frames.append(df)
-            except Exception as e:
-                error_msg = f"Failed to fetch/parse sheet '{name}' (gid={gid}): {e}"
-                logger.error(f"Agent Tool Impl Error: {error_msg}", exc_info=False)
-                errors.append(error_msg)
-
-        if not all_data_frames:
-            combined_error = " ; ".join(errors)
-            raise Exception(f"Could not load any data from the Endgame Analysis sheet. Errors: {combined_error}")
-
-        try:
-            combined_df = pd.concat(all_data_frames, ignore_index=True)
-            combined_data = combined_df.to_dict(orient='records')
-            service._sheet_cache[cache_key] = (now, combined_data) # Cache the combined list of dicts
-            logger.info(f"Cache SET for COMBINED Endgame Analysis Sheet (key: {cache_key}). Combined {len(combined_data)} rows.")
-        except Exception as e:
-            logger.error(f"Agent Tool Impl Error: Failed to concatenate or convert dataframes: {e}", exc_info=True)
-            raise Exception(f"Failed to combine data from sheets: {e}")
-
-    # --- FILTERING --- 
-    if sheet_name:
-        if sheet_name not in available_sheet_names:
-             return f"Error: Unknown sheet name '{sheet_name}'. Available sheets: {available_sheet_names}"
-        
-        if combined_df is not None:
-            logger.info(f"Filtering combined data for source_sheet: '{sheet_name}'")
-            filtered_df = combined_df[combined_df['source_sheet'] == sheet_name]
-            filtered_data = filtered_df.to_dict(orient='records')
-            logger.info(f"Returning {len(filtered_data)} rows from sheet '{sheet_name}'.")
-            # Add a limit check?
-            if len(filtered_data) > 200: # Example limit
-                 logger.warning(f"Filtered data for sheet '{sheet_name}' still large ({len(filtered_data)} rows). Returning summary instead.")
-                 return f"Sheet '{sheet_name}' contains {len(filtered_data)} rows, which is too large to return directly. Please ask a more specific query about this sheet."
-            return filtered_data
-        else:
-            # This shouldn't happen if caching/fetching worked
-            logger.error("Filtering error: Combined DataFrame is unexpectedly None.")
-            return "Error: Could not process the combined data for filtering."
-    else:
-        # No sheet_name specified - return list of available sheets instead of overwhelming data
-        logger.info("No specific sheet requested. Returning list of available sheets.")
-        return f"Please specify which sheet you want data from. Available sheets: {available_sheet_names}"
-        # Alternatively, return first N rows of combined_data if that's preferred?
+            logger.info(f"Cache STALE for Endgame Analysis Sheet (key: {cache_key})")
+    # Fetch the sheet data as CSV
+    try:
+        csv_url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={gid}"
+        df = pd.read_csv(csv_url)
+        df.dropna(how='all', inplace=True)
+        # --- Preserve and distinguish perk columns ---
+        # If the sheet has columns like 'Perk 1', 'Perk 2', etc., keep them as-is in the returned dicts
+        # This allows downstream logic to reason about rolls that match only one column versus both
+        data = df.to_dict(orient='records')
+        service._sheet_cache[cache_key] = (now, data)
+        logger.info(f"Cache SET for Endgame Analysis Sheet (key: {cache_key}). Read {len(data)} rows.")
+        if len(data) > 200:
+            return f"Sheet '{selected_sheet}' contains {len(data)} rows, which is too large to return directly. Please ask a more specific query about this sheet."
+        return data
+    except Exception as e:
+        logger.error(f"Failed to fetch/parse sheet '{selected_sheet}' (gid={gid}): {e}")
+        return f"Error: Failed to fetch or parse the sheet '{selected_sheet}'. {e}"
 
 # --- Agent Service Class ---
 
@@ -342,6 +319,18 @@ class DestinyAgentService:
             # For now, we log and continue, but run_chat will fail later.
             self.agent = None
 
+        self.persona_map = {
+            "Saint-14": "You are Saint-14, the legendary Titan. Speak with honor, warmth, and a touch of old-world chivalry. Use phrases like 'my friend' and reference the Lighthouse or Trials. Use plenty of shield 🛡️, helmet 🪖, and sun ☀️ emojis.",
+            "Cayde-6": "You are Cayde-6, the witty Hunter. Be playful, crack jokes, and use lots of chicken 🐔, ace of spades 🂡, and dice 🎲 emojis. Don't be afraid to be cheeky!",
+            "Ikora": "You are Ikora Rey, the wise Warlock. Speak with calm authority, offer insight, and use book 📚, eye 👁️, and star ✨ emojis.",
+            "Saladin": "You are Lord Saladin, the Iron Banner champion. Be stoic, proud, and use wolf 🐺, fire 🔥, and shield 🛡️ emojis.",
+            "Zavala": "You are Commander Zavala, the steadfast Titan. Be direct, inspiring, and use shield 🛡️, fist ✊, and tower 🏰 emojis.",
+            "Eris Morn": "You are Eris Morn, the mysterious Guardian. Speak cryptically, reference the Hive, and use eye 👁️, darkness 🌑, and worm 🪱 emojis.",
+            "Shaxx": "You are Lord Shaxx, the Crucible announcer. Be loud, encouraging, and use sword ⚔️, explosion 💥, and helmet 🪖 emojis.",
+            "Drifter": "You are the Drifter, the rogue Gambit handler. Speak with sly humor, streetwise slang, and a morally gray perspective. Reference Gambit and 'motes'.",
+            "Mara Sov": "You are Mara Sov, the enigmatic Queen of the Awoken. Speak with regal poise, subtlety, and a sense of cosmic perspective.",
+        }
+
     def _create_agent(self) -> Agent:
         """Creates the Agent instance with instructions and tools."""
         
@@ -373,20 +362,30 @@ class DestinyAgentService:
 
         @function_tool
         def get_pve_bis_weapons_from_sheet() -> list[dict]:
-            """Fetches the list of community-recommended PvE Best-in-Slot (BiS) LEGENDARY weapons for The Final Shape from a public Google Sheet. Use this for general weapon recommendations by type or slot."""
+            """
+            Fetches the list of community-recommended PvE Best-in-Slot (BiS) LEGENDARY weapons for The Final Shape from a general PvE spreadsheet.
+            Use this ONLY for general weapon recommendations by type or slot. Do NOT use this tool if the user mentions 'endgame analysis' or requests a specific sheet from the Endgame Analysis spreadsheet.
+            """
             return partial_get_pve_weapons()
             
         # ---> ADDED: Wrapper for the second sheet tool <---
         @function_tool
         def get_pve_activity_bis_weapons_from_sheet() -> list[dict]:
-            """Fetches community weapon recommendations SPECIFICALLY FOR DIFFERENT PVE ACTIVITIES (e.g., raids, dungeons, nightfalls) from a public Google Sheet. Use this to find what weapons are good for a particular activity."""
+            """
+            Fetches community weapon recommendations SPECIFICALLY FOR DIFFERENT PVE ACTIVITIES (e.g., raids, dungeons, nightfalls) from a public Google Sheet. Use this to find what weapons are good for a particular activity.
+            """
             return partial_get_activity_weapons()
 
         # ---> MODIFIED: Wrapper for the Endgame Analysis tool <---
         @function_tool
         def get_endgame_analysis_data(sheet_name: Optional[str] = None) -> list[dict] | str:
-            """Fetches data from the 'Destiny 2: Endgame Analysis' community spreadsheet. To avoid returning too much data, you MUST specify which sheet you want using the 'sheet_name' parameter (e.g., 'Archetypes', 'Perks', 'Shotguns', 'Shopping List'). If you don't specify a sheet_name, you will get a list of available sheets."""
-            # Add type hint for sheet_name
+            """
+            Fetches data from the 'Destiny 2: Endgame Analysis' community spreadsheet.
+            Use this tool ONLY if the user mentions 'endgame analysis' or requests a detailed breakdown from that specific spreadsheet.
+            You MUST specify a 'sheet_name' (e.g., 'Archetypes', 'Perks', 'Shotguns', 'Shopping List', 'Auto Rifles').
+            The sheet_name does NOT need to be exact; fuzzy and partial matches are supported (e.g., 'auto rifles', 'autorifle', 'autorifles', etc. will all match the 'Auto Rifles' sheet).
+            If the user does not specify a sheet_name, return a list of available sheets.
+            """
             return partial_get_endgame_analysis(sheet_name=sheet_name)
 
         # The agent needs the decorated wrapper functions
@@ -420,30 +419,40 @@ class DestinyAgentService:
 
     # --- Run Method (now async) ---
     
-    async def run_chat(self, prompt: str, access_token: str, bungie_id: str):
-        """Runs the agent for a single chat turn asynchronously."""
+    async def run_chat(self, prompt: str, access_token: str, bungie_id: str, history: Optional[List[Dict[str, str]]] = None, persona: Optional[str] = None):
+        """Runs the agent for a single chat turn asynchronously, using conversation history and persona."""
         if not self.agent:
              logger.error("Agent is not initialized. Cannot run chat.")
-             # Consider returning a specific error response or raising exception
              return {"error": "Agent service not available"}
-
-        logger.info(f"Running agent async for prompt: '{prompt[:30]}...' Access token set. Bungie ID: {bungie_id}")
+        messages_for_agent = history if history is not None else []
+        if not messages_for_agent or messages_for_agent[-1]["content"] != prompt or messages_for_agent[-1]["role"] != "user":
+             logger.warning("History format mismatch or latest prompt missing from history. Appending prompt.")
+             messages_for_agent.append({"role": "user", "content": prompt})
+        log_prompt_info = f"with history ({len(messages_for_agent)} messages)" if messages_for_agent else f"with prompt: '{prompt[:30]}...'"
+        logger.info(f"Running agent async {log_prompt_info}. Access token set. Bungie ID: {bungie_id}")
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
+        # --- Persona logic ---
+        persona_instructions = ""
+        if persona and persona in self.persona_map:
+            persona_instructions = f"\n\n[Persona Mode: {persona}] {self.get_persona_prompt(persona)}\n"
         try:
-            # Run the agent asynchronously
-            result = await Runner.run(self.agent, prompt)
+            # Prepend persona instructions to the agent's system prompt for this run
+            orig_instructions = self.agent.instructions
+            self.agent.instructions = orig_instructions + persona_instructions
+            logger.info(f"Agent persona set to: {persona if persona else 'Default'}")
+            result = await Runner.run(self.agent, messages_for_agent)
+            self.agent.instructions = orig_instructions  # Reset after run
             logger.info("Agent run completed.")
-            # ---> CHANGE: Return the full RunResult object <--- 
             return result 
         except Exception as e:
             logger.error(f"Error during agent run: {e}", exc_info=True)
-            # Return or raise an error - returning a simple error message for now
-            # ---> CHANGE: Return error structure if needed, or raise <--- 
-            # For now, let's return a dict to be handled by the caller
             return {"error": f"An error occurred while processing your request: {e}"} 
         finally:
-            # Clear the context variables after the run
             self._current_access_token = None
             self._current_bungie_id = None
             logger.debug("Agent context (token, user_id) cleared.") 
+
+    def get_persona_prompt(self, persona_name: str) -> str:
+        base = self.persona_map.get(persona_name, "You are a helpful Destiny 2 assistant.")
+        return f"{base}\n\nAlways use relevant Destiny-themed emojis liberally in your responses to add flavor and personality!" # Encourage emoji use 

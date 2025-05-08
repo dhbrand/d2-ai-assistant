@@ -204,25 +204,33 @@ class OAuthManager:
     
     def _load_token_data(self):
         """Load token data from the file if it exists."""
+        logger.info("[DEBUG] Attempting to load token data from file...")
         try:
             if TOKEN_FILE.exists():
                 with open(TOKEN_FILE, 'r') as f:
-                    self.token_data = json.load(f)
+                    loaded_data = json.load(f)
+                logger.info(f"[DEBUG] Raw data loaded from token.json: {loaded_data}")
+                self.token_data = loaded_data
                 
                 # Calculate expiry time if token data is loaded
                 if 'expires_in' in self.token_data and 'received_at' in self.token_data:
-                    received_at = datetime.fromisoformat(self.token_data['received_at'])
-                    expires_in = timedelta(seconds=self.token_data['expires_in'])
-                    self.token_expiry_time = received_at + expires_in
-                    logger.info(f"Loaded token data from {TOKEN_FILE}. Token expires at {self.token_expiry_time}")
+                    if isinstance(self.token_data['received_at'], str):
+                         received_at = datetime.fromisoformat(self.token_data['received_at'])
+                         expires_in = timedelta(seconds=self.token_data['expires_in'])
+                         self.token_expiry_time = received_at + expires_in
+                         logger.info(f"Loaded token data from {TOKEN_FILE}. Token expires at {self.token_expiry_time}")
+                    else:
+                         logger.warning(f"Loaded token data, but 'received_at' is not a string: {self.token_data['received_at']}. Cannot calculate expiry.")
+                         self.token_data = None # Invalidate if format is wrong
                 else:
-                    logger.warning(f"Loaded token data from {TOKEN_FILE}, but expiry information is incomplete.")
+                    logger.warning(f"Loaded token data from {TOKEN_FILE}, but expiry information (expires_in or received_at) is incomplete.")
                     self.token_data = None # Invalidate incomplete data
             else:
                  logger.info(f"Token file {TOKEN_FILE} not found. Need authentication.")
+                 self.token_data = None # Explicitly set to None
 
-        except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
-            logger.error(f"Error loading token data from {TOKEN_FILE}: {e}. Deleting corrupted file.")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Error loading or parsing token data from {TOKEN_FILE}: {e}. Deleting corrupted file.")
             # If file is corrupted or invalid, delete it to force re-auth
             if TOKEN_FILE.exists():
                 TOKEN_FILE.unlink()
@@ -232,8 +240,9 @@ class OAuthManager:
         """Save the current token data to the file."""
         if self.token_data:
             try:
-                 # Add the time the token was received before saving
+                 # Ensure the timestamp is in ISO format and uses the key "received_at"
                 self.token_data['received_at'] = datetime.now().isoformat()
+                logger.info(f"[DEBUG] Saving token data dictionary: {self.token_data}") 
                 with open(TOKEN_FILE, 'w') as f:
                     json.dump(self.token_data, f, indent=4)
                 logger.info(f"Saved token data to {TOKEN_FILE}")

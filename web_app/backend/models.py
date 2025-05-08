@@ -4,6 +4,10 @@ from sqlalchemy.orm import relationship, sessionmaker
 from typing import List, Optional
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict
+import uuid
+from sqlalchemy.sql import func
+from sqlalchemy.dialects.postgresql import UUID as UUIDType
+from sqlalchemy import Text, Index
 
 Base = declarative_base()
 
@@ -32,7 +36,43 @@ class Catalyst(Base):
     user_id = Column(Integer, ForeignKey('users.id'))
     user = relationship('User', back_populates='catalysts')
 
-# --- Pydantic Models for API Responses ---
+class Conversation(Base):
+    """Represents a single conversation thread."""
+    __tablename__ = 'conversations'
+
+    # Using UUID for primary key
+    id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_bungie_id = Column(String, nullable=False, index=True) # Index for faster lookup
+    title = Column(String, nullable=True) # Initially null, populated by summarization
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    archived = Column(Boolean, default=False, nullable=False)  # New column for archiving
+
+    # Relationship to messages
+    messages = relationship("Message", back_populates="conversation", cascade="all, delete-orphan", order_by="Message.order_index")
+
+    def __repr__(self):
+        return f"<Conversation(id={self.id}, user='{self.user_bungie_id}', title='{self.title}')>"
+
+class Message(Base):
+    """Represents a single message within a conversation."""
+    __tablename__ = 'messages'
+
+    id = Column(UUIDType(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id = Column(UUIDType(as_uuid=True), ForeignKey('conversations.id'), nullable=False, index=True)
+    order_index = Column(Integer, nullable=False)
+    role = Column(String, nullable=False)  # 'user' or 'assistant'
+    content = Column(Text, nullable=False)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Relationship back to the conversation
+    conversation = relationship("Conversation", back_populates="messages")
+
+    # Optional: Add an index for conversation_id and order_index together if performance requires
+    # __table_args__ = (Index('ix_message_conv_order', 'conversation_id', 'order_index'), )
+
+    def __repr__(self):
+        return f"<Message(id={self.id}, conv_id={self.conversation_id}, role='{self.role}', order={self.order_index})>"
 
 class Weapon(BaseModel):
     item_hash: str  # Changed from int to str to match API response
@@ -48,8 +88,7 @@ class Weapon(BaseModel):
     damage_type: Optional[str] = "None"
     perks: List[str] = []
     
-    class Config:
-        orm_mode = False
+    model_config = ConfigDict(orm_mode=False)
         
     @classmethod
     def from_dict(cls, raw_data: dict):
@@ -98,4 +137,48 @@ def init_db(database_url='sqlite:///./catalysts.db'):
     engine = create_engine(database_url, connect_args={"check_same_thread": False})
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
-    return engine, SessionLocal 
+    print(f"Initialized tables for {database_url} (if they didn't exist).")
+    return engine, SessionLocal
+
+CHAT_HISTORY_DATABASE_URL = "sqlite:///./web_app/backend/chat_history.db" # Point inside backend
+
+chat_history_engine = create_engine(
+    CHAT_HISTORY_DATABASE_URL,
+    connect_args={"check_same_thread": False}
+)
+
+# Session factory specifically for chat history
+ChatHistorySessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=chat_history_engine)
+
+def init_chat_history_db():
+    """Initializes the chat history database and creates tables if they don't exist."""
+    # Create tables related ONLY to chat history using the new engine
+    # We pass the specific tables to create_all to avoid touching other tables
+    Base.metadata.create_all(
+        bind=chat_history_engine,
+        tables=[Conversation.__table__, Message.__table__] # Explicitly list tables
+    )
+    print(f"Initialized chat history tables for {CHAT_HISTORY_DATABASE_URL} (if they didn't exist).")
+
+class ChatMessageBase(BaseModel):
+    role: str
+    content: str
+
+class ChatMessageSchema(ChatMessageBase):
+    id: uuid.UUID
+    timestamp: datetime
+    order_index: int
+    model_config = ConfigDict(from_attributes=True)
+
+class ConversationBase(BaseModel):
+    title: Optional[str] = None
+
+class ConversationCreate(ConversationBase):
+    user_bungie_id: str # Needed when creating
+
+class ConversationSchema(ConversationBase):
+    id: uuid.UUID
+    user_bungie_id: str
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True) 

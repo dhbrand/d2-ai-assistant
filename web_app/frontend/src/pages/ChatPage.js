@@ -26,6 +26,7 @@ import IconButton from '@mui/material/IconButton';
 import Menu from '@mui/material/Menu';
 import MenuItem from '@mui/material/MenuItem';
 import Tooltip from '@mui/material/Tooltip';
+import Select from '@mui/material/Select';
 
 // --- NEW Type Definitions for Chat History (using JSDoc for .js file) ---
 /**
@@ -65,6 +66,7 @@ function ChatPage() {
   const [showArchived, setShowArchived] = useState(false);
   const [contextMenu, setContextMenu] = useState(null); // { mouseX, mouseY, convId }
   const [contextConvId, setContextConvId] = useState(null);
+  const [selectedPersona, setSelectedPersona] = useState('Saint-14');
 
   // --- NEW Functions for Chat History API Calls ---
 
@@ -226,6 +228,7 @@ function ChatPage() {
       const requestBody = {
         messages: [...messages, userMessage].slice(-20), // Send recent history + new message
         conversation_id: currentConversationId, // Will be null for new chats
+        persona: selectedPersona, // <-- Include persona in request
       };
 
       const response = await fetch('https://localhost:8000/api/assistants/chat', {
@@ -499,29 +502,50 @@ function ChatPage() {
             display: 'flex',
             alignItems: 'center',
             boxSizing: 'border-box',
+            flexDirection: 'column', // Stack persona dropdown above input
           }}
         >
-          <TextField
-            fullWidth
-            placeholder="Ask about your gear, quests, or Destiny..."
-            variant="outlined"
-            value={newMessage}
-            onChange={handleInputChange}
-            onKeyPress={handleKeyPress}
-            multiline
-            maxRows={4}
-            disabled={isLoading}
-          />
-          <Button
-            variant="contained"
-            color="primary"
-            onClick={handleSendMessage}
-            disabled={isLoading || !newMessage.trim()}
-            sx={{ ml: 1 }}
-          >
-            Send
-          </Button>
-          <VoiceInputButton onTranscription={setNewMessage} />
+          <Box sx={{ width: '100%', mb: 1, display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
+            <Select
+              value={selectedPersona}
+              onChange={e => setSelectedPersona(e.target.value)}
+              size="small"
+              sx={{ minWidth: 180 }}
+            >
+              <MenuItem value="Saint-14">Saint-14</MenuItem>
+              <MenuItem value="Cayde-6">Cayde-6</MenuItem>
+              <MenuItem value="Ikora">Ikora</MenuItem>
+              <MenuItem value="Saladin">Saladin</MenuItem>
+              <MenuItem value="Zavala">Zavala</MenuItem>
+              <MenuItem value="Eris Morn">Eris Morn</MenuItem>
+              <MenuItem value="Shaxx">Shaxx</MenuItem>
+              <MenuItem value="Drifter">Drifter</MenuItem>
+              <MenuItem value="Mara Sov">Mara Sov</MenuItem>
+            </Select>
+          </Box>
+          <Box sx={{ width: '100%', display: 'flex', alignItems: 'center' }}>
+            <TextField
+              fullWidth
+              placeholder="Ask about your gear, quests, or Destiny..."
+              variant="outlined"
+              value={newMessage}
+              onChange={handleInputChange}
+              onKeyPress={handleKeyPress}
+              multiline
+              maxRows={4}
+              disabled={isLoading}
+            />
+            <Button
+              variant="contained"
+              color="primary"
+              onClick={handleSendMessage}
+              disabled={isLoading || !newMessage.trim()}
+              sx={{ ml: 1 }}
+            >
+              Send
+            </Button>
+            <VoiceInputButton onTranscription={setNewMessage} />
+          </Box>
         </Box>
       </Box>
 
