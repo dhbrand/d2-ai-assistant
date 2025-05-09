@@ -540,99 +540,117 @@ else:
     openai_client = None
 
 async def generate_and_save_title(conversation_id: uuid.UUID):
-    """Fetches first messages, calls OpenAI to generate a title, and saves it."""
-    logger.info(f"Starting title generation task for conversation {conversation_id}")
+    """Fetches first messages from Supabase, calls OpenAI to generate a title, and saves it to Supabase."""
+    logger.info(f"Starting title generation task for conversation {conversation_id} using Supabase.")
+    
+    # Access the global Supabase client and OpenAI client
+    global supabase_client, openai_client # Ensure we are referencing the global instances
+
     if not openai_client:
         logger.error(f"Cannot generate title for {conversation_id}: OpenAI client not available.")
         return
+    if not supabase_client:
+        logger.error(f"Cannot generate title for {conversation_id}: Supabase client not available.")
+        return
 
-    db = None # Initialize db to None
     try:
-        # Get a new DB session for this task
-        db = ChatHistorySessionLocal()
-        
-        # Fetch first user message (index 0) and first assistant message (index 1)
-        user_msg = db.query(Message).filter(
-            Message.conversation_id == conversation_id, 
-            Message.order_index == 0,
-            Message.role == 'user' 
-        ).first()
-        
-        assistant_msg = db.query(Message).filter(
-            Message.conversation_id == conversation_id, 
-            Message.order_index == 1, 
-            Message.role == 'assistant'
-        ).first()
-        
-        conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        # Fetch conversation details to check if title already exists
+        conv_details_response = (supabase_client.table("conversations")
+            .select("id, title, user_id")
+            .eq("id", str(conversation_id))
+            .maybe_single()
+            .execute())
 
-        if not conversation:
-            logger.error(f"Title gen failed: Conversation {conversation_id} not found.")
+        if not conv_details_response.data:
+            logger.error(f"Title gen failed: Conversation {conversation_id} not found in Supabase.")
             return
-        if conversation.title:
-            logger.info(f"Title already exists for conversation {conversation_id}. Skipping generation.")
+        if conv_details_response.data.get("title"):
+            logger.info(f"Title already exists for conversation {conversation_id} in Supabase. Skipping generation.")
             return
-        if not user_msg or not assistant_msg:
-            logger.warning(f"Could not find first user/assistant message for conv {conversation_id}. Cannot generate title.")
+        
+        user_bungie_id = conv_details_response.data.get("user_id") # Get user_id for logging/context
+
+        # Fetch first user message (order_index 0, sender 'user') from Supabase
+        user_msg_response = (supabase_client.table("messages")
+            .select("content")
+            .eq("conversation_id", str(conversation_id))
+            .eq("order_index", 0)
+            .eq("sender", "user")
+            .maybe_single()
+            .execute())
+
+        # Fetch first assistant message (order_index 1, sender 'assistant') from Supabase
+        assistant_msg_response = (supabase_client.table("messages")
+            .select("content")
+            .eq("conversation_id", str(conversation_id))
+            .eq("order_index", 1)
+            .eq("sender", "assistant")
+            .maybe_single()
+            .execute())
+
+        if not user_msg_response.data or not assistant_msg_response.data:
+            logger.warning(f"Could not find first user/assistant message for conv {conversation_id} in Supabase (User: {bool(user_msg_response.data)}, Asst: {bool(assistant_msg_response.data)}). Cannot generate title.")
             return
+
+        user_msg_content = user_msg_response.data["content"]
+        assistant_msg_content = assistant_msg_response.data["content"]
 
         # Construct prompt
         prompt = (
             f"Generate a concise title (5 words maximum, plain text only) for the following conversation start:\n\n"
-            f"User: {user_msg.content}\n"
-            f"Assistant: {assistant_msg.content}\n\n"
+            f"User: {user_msg_content}\n"
+            f"Assistant: {assistant_msg_content}\n\n"
             f"Title:"
         )
         
         logger.info(f"Calling OpenAI for title generation (model: gpt-4o) for conv {conversation_id}")
         try:
             completion = await openai_client.chat.completions.create(
-                model="gpt-4o", # <-- Switch to gpt-4o
+                model="gpt-4o",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=20, # Limit tokens for title
-                temperature=0.5, # Slightly creative but not too random
+                max_tokens=20,
+                temperature=0.5,
                 n=1,
                 stop=None
             )
-            generated_title = completion.choices[0].message.content.strip().strip('"') # Clean up quotes/whitespace
+            generated_title = completion.choices[0].message.content.strip().strip('\"')
             logger.info(f"Generated title for {conversation_id}: '{generated_title}'")
             
-            # Save the title
-            conversation.title = generated_title
-            db.commit()
-            logger.info(f"Successfully saved title for conversation {conversation_id}")
+            # Save the title to Supabase
+            update_title_response = (supabase_client.table("conversations")
+                .update({"title": generated_title, "updated_at": datetime.now(timezone.utc).isoformat()})
+                .eq("id", str(conversation_id))
+                .execute())
+            
+            if update_title_response.data:
+                logger.info(f"Successfully saved title for conversation {conversation_id} to Supabase.")
+            else:
+                logger.error(f"Failed to save title for conversation {conversation_id} to Supabase. Response: {update_title_response.error}")
             
         except Exception as api_err:
-            # Log API error - could be invalid model, rate limit, etc.
             logger.error(f"OpenAI API error during title generation for conv {conversation_id}: {api_err}", exc_info=True)
-            # Optionally try a fallback model here?
-            # For now, just log and exit.
-            pass # Don't save title if API failed
+            # Do not update Supabase conversation if API failed
             
     except Exception as e:
-        logger.error(f"Error in title generation task for conversation {conversation_id}: {e}", exc_info=True)
-        if db: # Rollback if any other error occurred
-             db.rollback()
-    finally:
-        if db: # Ensure session is closed
-            db.close()
+        logger.error(f"Error in Supabase title generation task for conversation {conversation_id}: {e}", exc_info=True)
+        # No explicit rollback needed for Supabase as operations are typically atomic per call
 
 # --- End Title Generation Function ---
 
 # --- REWRITTEN: Chat Endpoint <--- 
 @app.post("/api/assistants/chat", response_model=ChatResponse)
 async def assistants_chat_endpoint(
-    request: ChatRequest, 
+    request: ChatRequest,
     current_user: User = Depends(get_current_user_from_token),
-    chat_db: Session = Depends(get_chat_db) # Inject chat history DB session
+    sb_client: Client = Depends(get_supabase_db) # <--- Changed to Supabase client
 ):
     """
-    Chat endpoint using the agent service, handling conversation history.
+    Chat endpoint using the agent service, handling conversation history with Supabase.
     """
     if not agent_service_instance:
         logger.error("Chat request failed: DestinyAgentService not available.")
         raise HTTPException(status_code=503, detail="Chat service is currently unavailable.")
-        
+
     if not OPENAI_API_KEY:
         logger.error("OpenAI API key missing.")
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
@@ -642,136 +660,157 @@ async def assistants_chat_endpoint(
         raise HTTPException(status_code=400, detail="No message content provided")
 
     access_token = current_user.access_token
-    bungie_id = current_user.bungie_id # Get bungie_id from the user object
-    conversation_id = request.conversation_id # Get from request, could be None
-    
+    bungie_id = str(current_user.bungie_id) # Ensure string
+    requested_conversation_id_str = str(request.conversation_id) if request.conversation_id else None
+
     if not access_token or not bungie_id:
-        logger.error(f"Auth info missing for user {current_user.id} (Token: {'Present' if access_token else 'Missing'}, BungieID: {'Present' if bungie_id else 'Missing'})")
+        logger.error(f"Auth info missing for user {current_user.id}")
         raise HTTPException(status_code=401, detail="Authentication token or user ID missing")
 
     conversation_history = []
-    current_conversation: Conversation | None = None
+    current_conversation_id_str: Optional[str] = None # Store as string for Supabase
     next_order_index = 0
 
-    # --- Handle Existing vs New Conversation ---
-    if conversation_id:
-        # Load existing conversation and history
-        logger.info(f"Continuing existing conversation: {conversation_id}")
-        current_conversation = (
-            chat_db.query(Conversation)
-            .filter(
-                Conversation.id == conversation_id,
-                Conversation.user_bungie_id == str(bungie_id)
-            )
-            .first()
-        )
-        if not current_conversation:
-            logger.warning(f"Attempt to access non-existent or unauthorized conversation {conversation_id} by user {bungie_id}")
-            raise HTTPException(status_code=404, detail="Conversation not found or access denied")
-        
-        # Load history (already ordered by relationship/query)
-        db_messages = current_conversation.messages 
-        conversation_history = [
-            {"role": msg.role, "content": msg.content} 
-            for msg in db_messages
-        ]
-        next_order_index = len(db_messages) # Next index is current length
-
-    else:
-        # Start new conversation
-        logger.info(f"Starting new conversation for user {bungie_id}")
-        current_conversation = Conversation(user_bungie_id=str(bungie_id))
-        chat_db.add(current_conversation)
-        # We need the ID, so flush to get it assigned by the DB/UUID default
-        try:
-            chat_db.flush()
-            conversation_id = current_conversation.id # Get the newly assigned ID
-            logger.info(f"Created new conversation with ID: {conversation_id}")
-        except Exception as e:
-            logger.error(f"Error flushing new conversation for user {bungie_id}: {e}", exc_info=True)
-            chat_db.rollback()
-            raise HTTPException(status_code=500, detail="Failed to create new conversation record")
-        next_order_index = 0 # First message
-        
-    # --- Save User Message ---
-    user_db_message = Message(
-        conversation_id=conversation_id,
-        role="user",
-        content=user_message_content,
-        order_index=next_order_index
-    )
-    chat_db.add(user_db_message)
-    next_order_index += 1
-
-    # --- Prepare for Agent Call ---
-    # Add current user message to history *before* calling agent
-    conversation_history.append({"role": "user", "content": user_message_content})
-    
-    logger.info(f"Passing chat request to agent service for user {bungie_id}, conversation {conversation_id}")
-    
-    run_result = await agent_service_instance.run_chat(
-        prompt=user_message_content,
-        access_token=access_token, 
-        bungie_id=str(bungie_id),
-        history=conversation_history # Pass the constructed history
-    )
-    
-    agent_response_content = ""
-    # Check the type of the result from run_chat
-    if isinstance(run_result, str):
-        # Successfully received a string response
-        agent_response_content = run_result
-    elif isinstance(run_result, dict) and 'error' in run_result:
-        # Handle potential error dict returned (though run_chat should raise exceptions now)
-        logger.error(f"Agent service returned error dict for conv {conversation_id}: {run_result['error']}")
-        try:
-            sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
-                .eq("id", str(conversation_id)).execute()
-        except Exception as ts_update_err:
-            logger.error(f"Error updating conversation timestamp after agent error dict for conv {conversation_id}: {ts_update_err}")
-        raise HTTPException(status_code=500, detail=run_result['error'])
-    else:
-        # Log unexpected types, but raise a generic error
-        logger.warning(f"Unexpected result type from agent service for conv {conversation_id}: {type(run_result)}. Result: {run_result}")
-        try:
-            sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
-                .eq("id", str(conversation_id)).execute()
-        except Exception as ts_update_err:
-            logger.error(f"Error updating conversation timestamp after unexpected agent result for conv {conversation_id}: {ts_update_err}")
-        # Use a more specific error message for the frontend
-        raise HTTPException(status_code=500, detail="Agent service generated a response, but its format was unexpected.")
-
-    # --- Save Assistant Message ---
-    assistant_db_message = Message(
-        conversation_id=conversation_id,
-        role="assistant",
-        content=agent_response_content,
-        order_index=next_order_index # Use the incremented index
-    )
-    chat_db.add(assistant_db_message)
-
-    # --- Update Conversation Timestamp and Commit ---
-    current_conversation.updated_at = datetime.now(timezone.utc)
-    next_order_index += 1 # <-- Increment index AFTER adding assistant message
     try:
-        chat_db.commit() # Commit user msg, assistant msg, and timestamp update
-        logger.info(f"Successfully saved user and assistant messages for conversation {conversation_id}")
+        # --- Handle Existing vs New Conversation ---
+        if requested_conversation_id_str:
+            logger.info(f"Attempting to continue existing conversation: {requested_conversation_id_str} for user {bungie_id}")
+            # Load existing conversation from Supabase
+            conv_response = sb_client.table("conversations") \
+                .select("id, user_id, title, created_at, updated_at, archived") \
+                .eq("id", requested_conversation_id_str) \
+                .eq("user_id", bungie_id) \
+                .maybe_single() \
+                .execute()
+
+            if not conv_response.data:
+                logger.warning(f"Conversation {requested_conversation_id_str} not found for user {bungie_id} or access denied.")
+                raise HTTPException(status_code=404, detail="Conversation not found or access denied")
+            
+            current_conversation_id_str = str(conv_response.data["id"]) # Ensure we use the UUID as string
+
+            # Load history from Supabase
+            messages_response = sb_client.table("messages") \
+                .select("sender, content, order_index") \
+                .eq("conversation_id", current_conversation_id_str) \
+                .order("order_index", desc=False) \
+                .execute()
+            
+            if messages_response.data:
+                for msg_data in messages_response.data:
+                    # Map 'sender' to 'role' for agent history
+                    conversation_history.append({"role": msg_data["sender"], "content": msg_data["content"]})
+                next_order_index = len(messages_response.data)
+            logger.info(f"Loaded {len(conversation_history)} messages for conversation {current_conversation_id_str}. Next order_index: {next_order_index}")
+
+        else:
+            # Start new conversation in Supabase
+            logger.info(f"Starting new conversation for user {bungie_id}")
+            new_conv_data = {"user_id": bungie_id, "title": None} # title can be generated later
+            insert_response = sb_client.table("conversations").insert(new_conv_data).execute()
+            
+            if not insert_response.data:
+                logger.error(f"Failed to insert new conversation for user {bungie_id} into Supabase.")
+                raise HTTPException(status_code=500, detail="Failed to create new conversation record in Supabase.")
+            
+            current_conversation_id_str = str(insert_response.data[0]["id"]) # Get new ID
+            logger.info(f"Created new conversation with ID: {current_conversation_id_str} in Supabase.")
+            next_order_index = 0
+
+        # --- Save User Message to Supabase ---
+        user_message_to_save = {
+            "conversation_id": current_conversation_id_str,
+            "sender": "user", # Use 'sender' as per Supabase schema
+            "content": user_message_content,
+            "order_index": next_order_index
+            # Supabase handles 'created_at' (timestamp) and 'id' (message UUID)
+        }
+        insert_user_msg_response = sb_client.table("messages").insert(user_message_to_save).execute()
+        if not insert_user_msg_response.data:
+            logger.error(f"Failed to save user message for conv {current_conversation_id_str} to Supabase.")
+            # Not raising HTTPException here to allow agent to still respond if possible, but log it.
+        else:
+            logger.info(f"Saved user message (order: {next_order_index}) for conv {current_conversation_id_str} to Supabase.")
+            next_order_index += 1
+
+        # --- Prepare for Agent Call ---
+        conversation_history.append({"role": "user", "content": user_message_content})
+        
+        logger.info(f"Passing chat request to agent service for user {bungie_id}, conversation {current_conversation_id_str}")
+        
+        run_result = await agent_service_instance.run_chat(
+            prompt=user_message_content,
+            access_token=access_token,
+            bungie_id=bungie_id,
+            history=conversation_history
+        )
+        
+        agent_response_content = ""
+        if isinstance(run_result, str):
+            agent_response_content = run_result
+        elif isinstance(run_result, dict) and 'error' in run_result:
+            logger.error(f"Agent service returned error dict for conv {current_conversation_id_str}: {run_result['error']}")
+            # Update timestamp even if agent errored, as an interaction occurred
+            sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
+                .eq("id", current_conversation_id_str).execute()
+            raise HTTPException(status_code=500, detail=run_result['error'])
+        else:
+            logger.warning(f"Unexpected result type from agent service for conv {current_conversation_id_str}: {type(run_result)}. Result: {run_result}")
+            sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
+                .eq("id", current_conversation_id_str).execute()
+            raise HTTPException(status_code=500, detail="Agent service generated a response, but its format was unexpected.")
+
+        # --- Save Assistant Message to Supabase ---
+        assistant_message_to_save = {
+            "conversation_id": current_conversation_id_str,
+            "sender": "assistant", # Use 'sender'
+            "content": agent_response_content,
+            "order_index": next_order_index
+        }
+        insert_asst_msg_response = sb_client.table("messages").insert(assistant_message_to_save).execute()
+        if not insert_asst_msg_response.data:
+            logger.error(f"Failed to save assistant message for conv {current_conversation_id_str} to Supabase.")
+        else:
+            logger.info(f"Saved assistant message (order: {next_order_index}) for conv {current_conversation_id_str} to Supabase.")
+        
+        # --- Update Conversation Timestamp in Supabase ---
+        # This happens regardless of assistant message save success, as user message was processed.
+        update_conv_ts_response = sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
+            .eq("id", current_conversation_id_str).execute()
+        if not update_conv_ts_response.data:
+             logger.error(f"Failed to update timestamp for conversation {current_conversation_id_str} in Supabase.")
+        else:
+            logger.info(f"Updated timestamp for conversation {current_conversation_id_str} in Supabase.")
+
+        # --- Prepare and Return Response ---
+        response_message = ChatMessage(role="assistant", content=agent_response_content)
+        
+        # Convert string UUID back to UUID type for the response model
+        final_conversation_id_uuid = uuid.UUID(current_conversation_id_str)
+
+        # Trigger title generation if it was a new chat and first exchange (next_order_index would be 1 after saving user msg)
+        if not request.conversation_id and next_order_index == 1: # User message saved, assistant response is about to be generated
+            # The generate_and_save_title function still uses local DB. This needs to be addressed separately.
+            # For now, it might fail or operate on a different data source if not updated.
+            logger.info(f"Condition met for title generation for new conversation {final_conversation_id_uuid}. Note: title gen uses local DB.")
+            asyncio.create_task(generate_and_save_title(final_conversation_id_uuid))
+            logger.info(f"Background task for title generation for {final_conversation_id_uuid} scheduled (uses local DB).")
+
+        return ChatResponse(message=response_message, conversation_id=final_conversation_id_uuid)
+
+    except HTTPException as http_exc:
+        logger.error(f"HTTPException in assistants_chat_endpoint for user {bungie_id}, conv {requested_conversation_id_str}: {http_exc.status_code} - {http_exc.detail}", exc_info=False)
+        raise http_exc
     except Exception as e:
-        logger.error(f"Failed to commit conversation {conversation_id} updates: {e}", exc_info=True)
-        chat_db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to save conversation history")
-
-    # --- Prepare and Return Response ---
-    response_message = ChatMessage(role="assistant", content=agent_response_content)
-    
-    # Trigger title generation if it was a new chat and first exchange (next_order_index would be 2 after saving assistant msg)
-    if not request.conversation_id and next_order_index == 2: # If it was a new chat AND we just saved the first assistant message
-        logger.info(f"Condition met for title generation for new conversation {conversation_id}.") # Add specific log
-        # Call the async background task
-        asyncio.create_task(generate_and_save_title(conversation_id))
-        logger.info(f"Background task for title generation for {conversation_id} scheduled.")
-
-    return ChatResponse(message=response_message, conversation_id=conversation_id)
+        logger.error(f"Unexpected error in assistants_chat_endpoint for user {bungie_id}, conv {requested_conversation_id_str}: {e}", exc_info=True)
+        # Attempt to update timestamp on generic error if we have a conversation ID
+        if current_conversation_id_str:
+            try:
+                sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
+                    .eq("id", current_conversation_id_str).execute()
+            except Exception as ts_err:
+                logger.error(f"Failed to update timestamp during general error handling for conv {current_conversation_id_str}: {ts_err}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 @app.get("/api/models", response_model=ModelListResponse)
 async def get_available_models():
