@@ -50,16 +50,12 @@ class CatalystAPI:
         session.mount('https://', adapter)
         return session
         
-    def _get_authenticated_headers(self, access_token: str) -> Dict[str, str]:
+    def _get_authenticated_headers(self) -> Dict[str, str]:
         """Gets the necessary headers for authenticated Bungie API requests."""
-        if not access_token:
-            raise ValueError("Access token is required for authenticated headers")
-        return {
-            "Authorization": f"Bearer {access_token}",
-            "X-API-Key": self.oauth_manager.api_key
-        }
+        # Get headers from OAuthManager, which handles refresh
+        return self.oauth_manager.get_headers()
         
-    async def get_membership_info(self, access_token: str) -> Optional[Dict[str, str]]:
+    async def get_membership_info(self) -> Optional[Dict[str, str]]:
         """Get the current user's membership info"""
         if self.cancel_event.is_set():
             return None
@@ -67,7 +63,7 @@ class CatalystAPI:
         try:
             url = f"{self.base_url}/User/GetMembershipsForCurrentUser/"
             logger.info(f"Fetching membership from: {url}")
-            headers = self._get_authenticated_headers(access_token)
+            headers = self._get_authenticated_headers()
             response = self.session.get(url, headers=headers, timeout=8)
             if response.status_code != 200:
                 logger.error(f"Failed to get membership info: {response.status_code} - {response.text}")
@@ -88,7 +84,7 @@ class CatalystAPI:
             logger.error(f"Error getting membership info: {e}")
             return None
             
-    async def get_profile(self, access_token: str, membership_type: int, membership_id: str) -> Optional[Dict]:
+    async def get_profile(self, membership_type: int, membership_id: str) -> Optional[Dict]:
         """Get the user's profile with records"""
         if self.cancel_event.is_set():
             return None
@@ -107,7 +103,7 @@ class CatalystAPI:
             }
             logger.info("Fetching profile data with components: %s", params["components"])
             
-            headers = self._get_authenticated_headers(access_token)
+            headers = self._get_authenticated_headers()
             response = self.session.get(url, headers=headers, params=params, timeout=15)
             logger.info("API URL: %s", response.url)
             
@@ -308,75 +304,68 @@ class CatalystAPI:
         # e.g., lore hash, specific objective types, etc.
         return False
             
-    async def get_catalyst_status_for_db(self, access_token: str) -> Dict[int, Dict]:
-        """
-        Fetches catalyst status directly from profile records suitable for DB storage.
-        Returns a dictionary mapping catalyst recordHash to its status.
-        { recordHash: { "is_complete": bool, "objectives": { objectiveHash: progress, ... } } }
-        """
-        logger.info("Fetching catalyst status for database storage...")
-        status_map = {}
-
-        membership_info = await self.get_membership_info(access_token)
+    async def get_catalyst_status_for_db(self) -> Dict[int, Dict]:
+        """Fetch catalyst status suitable for database storage (record_hash -> status_dict)."""
+        logger.info("Fetching catalyst status for DB...")
+        membership_info = await self.get_membership_info()
         if not membership_info:
-            logger.error("Failed to get membership info for DB catalyst sync.")
-            return status_map
+            logger.error("Failed to get membership info for DB status fetch.")
+            return {}
 
-        profile_data = await self.get_profile(access_token, membership_info['type'], membership_info['id'])
+        profile_data = await self.get_profile(
+            membership_type=membership_info['type'],
+            membership_id=membership_info['id']
+        )
         if not profile_data or 'profileRecords' not in profile_data.get('Response', {}):
-            logger.error("Failed to get profile records for DB catalyst sync.")
-            return status_map
+            logger.error("Failed to get profile records for DB status fetch.")
+            return {}
 
-        profile_records_data = profile_data['Response']['profileRecords']['data']['records']
-        
-        for record_hash_str, record_data in profile_records_data.items():
-            if self.cancel_event.is_set(): break
+        profile_records = profile_data['Response']['profileRecords']['data']['records']
+        catalyst_statuses = {}
+
+        for record_hash_str, record_data in profile_records.items():
             try:
                 record_hash = int(record_hash_str)
-                is_known_catalyst = record_hash in CATALYST_RECORD_HASHES
-                
-                record_def_for_check = await self.get_definition('destinyrecorddefinition', record_hash)
-                if not record_def_for_check:
-                    continue
-
-                is_catalyst_by_name = 'catalyst' in record_def_for_check.get('displayProperties', {}).get('name', '').lower()
-
-                if not (is_known_catalyst or is_catalyst_by_name):
-                    continue
-
-                state_info = self._get_record_state(record_data)
-                objectives_for_db = {}
-                for obj_data in record_data.get('objectives', []):
-                    obj_hash = obj_data.get('objectiveHash')
-                    if obj_hash:
-                        objectives_for_db[obj_hash] = obj_data.get('progress', 0)
-                
-                status_map[record_hash] = {
-                    "is_complete": state_info['complete'],
-                    "objectives": objectives_for_db
-                }
+                if self.discovery_mode or record_hash in CATALYST_RECORD_HASHES:
+                    # Basic info for DB, focusing on completion state and objectives
+                    state_info = self._get_record_state(record_data)
+                    objectives_for_db = []
+                    for obj_data in record_data.get('objectives', []):
+                        objectives_for_db.append({
+                            'objectiveHash': obj_data.get('objectiveHash'),
+                            'progress': obj_data.get('progress', 0),
+                            'completionValue': obj_data.get('completionValue', 0),
+                            'complete': obj_data.get('complete', False)
+                        })
+                    
+                    catalyst_statuses[record_hash] = {
+                        'is_complete': state_info['complete'],
+                        'objectives': objectives_for_db,
+                        'record_hash': record_hash # Include for direct use by caller
+                        # 'last_updated' will be set by the caller (agent_service)
+                    }
             except ValueError:
-                logger.debug(f"Skipping non-integer record key {record_hash_str} in get_catalyst_status_for_db")
+                logger.debug(f"Skipping non-integer record key: {record_hash_str} for DB status.")
                 continue
-            except Exception as e:
-                logger.error(f"Error processing record {record_hash_str} for DB status: {e}", exc_info=True)
-
-        logger.info(f"Prepared catalyst status for DB: {len(status_map)} items.")
-        return status_map
-
-    async def get_catalysts(self, access_token: str) -> List[Dict]:
-        """Get all catalyst information for the user."""
-        if self.cancel_event.is_set():
-            return []
-            
+        
+        logger.info(f"Prepared {len(catalyst_statuses)} catalyst statuses for DB.")
+        return catalyst_statuses
+        
+    async def get_catalysts(self) -> List[Dict]:
+        """Fetch all catalysts for the current user."""
         logger.info("Starting catalyst retrieval process...")
         start_time = time.time()
-        
-        membership_info = await self.get_membership_info(access_token)
+
+        # Get membership info - no longer needs access_token passed in
+        membership_info = await self.get_membership_info()
         if not membership_info:
             return []
-            
-        profile_data = await self.get_profile(access_token, membership_info['type'], membership_info['id'])
+
+        # Get profile data - no longer needs access_token passed in
+        profile_data = await self.get_profile(
+            membership_info['type'],
+            membership_info['id']
+        )
         if not profile_data or 'profileRecords' not in profile_data.get('Response', {}):
             logger.error("Profile records not found in API response.")
             return []

@@ -36,16 +36,12 @@ class WeaponAPI:
         # ... (retry logic unchanged) ...
         return session
 
-    def _get_authenticated_headers(self, access_token: str) -> Dict[str, str]: # Stays synchronous
-        if not access_token:
-            raise ValueError("Access token is required for authenticated headers")
-        return {
-            "Authorization": f"Bearer {access_token}",
-            "X-API-Key": self.oauth_manager.api_key # Get API key from OAuthManager
-        }
+    def _get_authenticated_headers(self) -> Dict[str, str]: # Remove access_token param
+        # Get headers from OAuthManager, which handles refresh
+        return self.oauth_manager.get_headers()
 
-    def get_membership_info(self, access_token: str) -> Optional[Dict[str, Any]]: # Stays synchronous
-        headers = self._get_authenticated_headers(access_token)
+    def get_membership_info(self) -> Optional[Dict[str, Any]]: # Remove access_token param, stays synchronous
+        headers = self._get_authenticated_headers() # Call updated method
         url = f"{self.base_url}/User/GetMembershipsForCurrentUser/"
         try:
             response = self.session.get(url, headers=headers)
@@ -74,12 +70,13 @@ class WeaponAPI:
             logger.error(f"Error processing membership info: {e}", exc_info=True)
             return None
 
-    async def get_all_weapons(self, access_token: str, membership_type: int, destiny_membership_id: str) -> List[Weapon]: # BECOMES ASYNC
+    async def get_all_weapons(self, membership_type: int, destiny_membership_id: str) -> List[Weapon]: # Remove access_token param
         logger.info(f"Fetching all weapons for user {destiny_membership_id}")
         start_time = time.time()
         try:
+            # Call updated _get_profile_components without access_token
             profile_components_data = self._get_profile_components(
-                access_token, membership_type, destiny_membership_id, [102, 201, 205, 305]
+                membership_type, destiny_membership_id, [102, 201, 205, 305]
             )
             if not profile_components_data:
                 logger.error("Failed to get profile components data")
@@ -165,8 +162,8 @@ class WeaponAPI:
             logger.error(f"Error in get_all_weapons: {e}", exc_info=True)
             return []
 
-    def _get_profile_components(self, access_token: str, membership_type: int, destiny_membership_id: str, components: List[int]) -> Optional[dict]: # Stays synchronous
-        headers = self._get_authenticated_headers(access_token)
+    def _get_profile_components(self, membership_type: int, destiny_membership_id: str, components: List[int]) -> Optional[dict]: # Remove access_token param
+        headers = self._get_authenticated_headers() # Call updated method
         components_str = ",".join(map(str, components))
         url = f"{self.base_url}/Destiny2/{membership_type}/Profile/{destiny_membership_id}/?components={components_str}"
         try:

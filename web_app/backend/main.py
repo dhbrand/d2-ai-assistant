@@ -23,9 +23,10 @@ import asyncio # <-- Import asyncio
 from openai import AsyncOpenAI # <-- Import OpenAI client
 from jose.exceptions import ExpiredSignatureError
 from supabase import create_client, Client, ClientOptions # <-- Add Supabase imports
+from supabase import create_async_client, AsyncClient # <-- Add async Supabase imports
 
 # Use absolute imports
-from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError, TokenData # Import TokenData here
+from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError, TokenData, AuthenticationRequiredError # Import TokenData here
 from web_app.backend.models import init_db, User, CatalystData, Weapon, CallbackData, UserResponse, ConversationSchema, ChatMessageSchema, ChatHistorySessionLocal, Conversation, Message # <--- Added missing imports
 from sqlalchemy.orm import sessionmaker, Session
 from web_app.backend.catalyst import CatalystAPI
@@ -85,28 +86,20 @@ if not all([BUNGIE_CLIENT_ID, BUNGIE_CLIENT_SECRET, BUNGIE_API_KEY]):
 SUPABASE_URL = os.getenv("SUPABASE_URL") # <-- Use name from .env
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") # <-- Use name from .env
 
-supabase_client: Client = None
-if SUPABASE_URL and SUPABASE_KEY:
-    try:
-        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("Supabase client initialized.")
-
-        # Initialize SupabaseManifestService (depends on supabase_client)
-        supabase_manifest_service = SupabaseManifestService(sb_client=supabase_client)
-        logger.info("SupabaseManifestService initialized.")
-
-    except Exception as e:
-        logger.exception(f"Error initializing Supabase client or SupabaseManifestService: {e}")
-        # supabase_client and supabase_manifest_service will remain None
-else:
-    print("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not found in environment variables.") # Updated log message
+supabase_client: Optional[AsyncClient] = None # <-- Initialize to None
+supabase_manifest_service: Optional[SupabaseManifestService] = None # <-- Initialize to None
 
 # --- Database Setup ---
 # engine, SessionLocal = init_db(DATABASE_URL) # Commented out if only Supabase is used now
 engine = None # Placeholder if engine is needed elsewhere, otherwise remove.
 
 # --- FastAPI App Instance ---
-app = FastAPI()
+app = FastAPI(
+    title="Destiny 2 Catalyst Tracker & AI Assistant",
+    description="An application to track Destiny 2 weapon catalysts and interact with an AI assistant for Destiny 2 information.",
+    version="0.2.0",
+    # lifespan=lifespan # Use lifespan if on FastAPI 0.90.0+
+)
 
 # --- Timing Middleware ---
 @app.middleware("http")
@@ -146,7 +139,24 @@ async def startup_event():
     """Run initialization tasks when the application starts."""
     logger.info("Running application startup tasks...")
     # Declare all globals that are referenced or assigned to within this function
-    global oauth_manager, engine, db_session_local, supabase_manifest_service, openai_client, catalyst_api_instance, weapon_api_instance, agent_service_instance
+    global oauth_manager, engine, db_session_local, supabase_client, supabase_manifest_service, openai_client, catalyst_api_instance, weapon_api_instance, agent_service_instance
+
+    # Initialize Supabase Client and Manifest Service FIRST
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            # Use create_async_client for an asynchronous client
+            supabase_client = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
+            logger.info("Supabase ASYNC client initialized in startup.")
+
+            # Initialize SupabaseManifestService (depends on supabase_client)
+            supabase_manifest_service = SupabaseManifestService(sb_client=supabase_client)
+            logger.info("SupabaseManifestService initialized with ASYNC client in startup.")
+
+        except Exception as e:
+            logger.exception(f"Error initializing Supabase client or SupabaseManifestService in startup: {e}")
+            # supabase_client and supabase_manifest_service will remain None
+    else:
+        logger.error("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not found in environment variables. Supabase services will not be available.")
 
     # Initialize the old SQLite DB for User/Token storage
     try:
@@ -168,18 +178,8 @@ async def startup_event():
         logger.exception(f"Error initializing OAuthManager: {e}")
         oauth_manager = None
 
-    # Initialize Supabase Client (if not already done - it is done globally but good to have here if it were conditional)
-    # For this structure, the global supabase_client is initialized outside startup.
-    # We just need to ensure supabase_manifest_service is initialized using the global supabase_client.
-    # And that supabase_manifest_service itself is treated as a global being set/confirmed here.
-
-    # The global supabase_client and supabase_manifest_service are initialized above the startup event.
-    # We just need to make sure they are usable here if they were potentially modified.
-    # However, the main issue is catalyst_api_instance and weapon_api_instance not being global.
-
-    # Initialize CatalystAPI and WeaponAPI instances (assign to global vars)
-    # catalyst_api_instance = None # These are now global, initialized to None
-    # weapon_api_instance = None
+    # Supabase client and manifest service are initialized above.
+    # We now proceed to initialize services that depend on them.
 
     # ADD DETAILED LOGGING HERE
     logger.info(f"[STARTUP_CHECK] oauth_manager type: {type(oauth_manager)}, bool: {bool(oauth_manager)}")
@@ -202,13 +202,14 @@ async def startup_event():
 
     # Initialize AgentService with the API instances
     # agent_service_instance is already declared global at the module level and its assignment is handled by the global keyword below
-    if openai_client and catalyst_api_instance and weapon_api_instance:
+    if openai_client and catalyst_api_instance and weapon_api_instance and supabase_client:
         try:
             logger.info("Attempting to initialize DestinyAgentService...")
             agent_service_instance = DestinyAgentService(
                 openai_client=openai_client,
                 catalyst_api=catalyst_api_instance,
-                weapon_api=weapon_api_instance
+                weapon_api=weapon_api_instance,
+                supabase_client=supabase_client
             )
             logger.info("DestinyAgentService initialized.")
         except Exception as e:
@@ -219,6 +220,7 @@ async def startup_event():
         if not openai_client: missing_deps.append("OpenAI Client (global)")
         if not catalyst_api_instance: missing_deps.append("CatalystAPI (global)")
         if not weapon_api_instance: missing_deps.append("WeaponAPI (global)")
+        if not supabase_client: missing_deps.append("Supabase Client (global)")
         logger.error(f"DestinyAgentService could not be initialized. Missing: {', '.join(missing_deps)}")
 
     logger.info("Application startup tasks finished.")
@@ -247,8 +249,8 @@ def get_db_session():
         db.close()
 
 # --- Dependency Function for Supabase Client ---
-def get_supabase_db() -> Client:
-    """Dependency to get the initialized Supabase client."""
+async def get_supabase_db() -> AsyncClient:
+    """Dependency to get the initialized Supabase async client."""
     global supabase_client # Ensure we are referring to the global instance
     if not supabase_client:
         logger.error("Supabase client not initialized. Check server logs and .env configuration.")
@@ -443,23 +445,23 @@ async def verify_token(current_user: User = Depends(get_current_user_from_token)
 @app.get("/api/conversations", response_model=List[ConversationSchema])
 async def list_conversations(
     current_user: User = Depends(get_current_user_from_token),
-    sb_client: Client = Depends(get_supabase_db), # <--- Changed to Supabase client
-    archived: bool = Query(False, description="Set to true to show archived conversations") # Changed to bool
+    db_client: AsyncClient = Depends(get_supabase_db), # <--- Reinstate Depends
+    archived: bool = Query(False, description="Set to true to show archived conversations")
 ):
     """Lists all (optionally archived) conversations for the currently authenticated user."""
-    user_bungie_id = str(current_user.bungie_id) # Ensure it's a string for comparison
+    user_bungie_id = str(current_user.bungie_id)
     if not user_bungie_id:
         raise HTTPException(status_code=401, detail="User Bungie ID not found in token")
     
     try:
         # Supabase style query
         # Ensure your ConversationSchema matches the selected fields, especially user_id
-        query_builder = sb_client.table("conversations").select("id, user_id, title, created_at, updated_at, archived") \
+        query_builder = db_client.table("conversations").select("id, user_id, title, created_at, updated_at, archived") \
             .eq("user_id", user_bungie_id) \
             .eq("archived", archived) \
             .order("updated_at", desc=True)
         
-        response = query_builder.execute() # Synchronous Supabase client execute
+        response = await query_builder.execute()
 
         validated_conversations = []
         if response.data:
@@ -478,7 +480,7 @@ async def list_conversations(
 async def get_conversation_messages(
     conversation_id: uuid.UUID,
     current_user: User = Depends(get_current_user_from_token),
-    sb_client: Client = Depends(get_supabase_db) # <--- Changed to Supabase client
+    sb_client: AsyncClient = Depends(get_supabase_db) # <--- Changed to Supabase client
 ):
     """Gets all messages for a specific conversation from Supabase, verifying ownership."""
     user_bungie_id = str(current_user.bungie_id) # Ensure it's a string for comparison
@@ -488,23 +490,23 @@ async def get_conversation_messages(
     try:
         # First, verify the conversation exists and belongs to the user by trying to fetch it.
         # This also implicitly checks ownership.
-        conv_response = sb_client.table("conversations") \
+        conv_response = await sb_client.table("conversations") \
             .select("id") \
             .eq("id", str(conversation_id)) \
             .eq("user_id", user_bungie_id) \
             .maybe_single() \
-            .execute()
+            .execute() # <--- Add await
 
         if not conv_response.data:
             logger.warning(f"Conversation {conversation_id} not found for user {user_bungie_id} in Supabase or user does not have access.")
             raise HTTPException(status_code=404, detail="Conversation not found or access denied")
 
         # Fetch messages ordered by their index (assuming 'order_index' column exists in Supabase 'messages' table)
-        messages_response = sb_client.table("messages") \
+        messages_response = await sb_client.table("messages") \
             .select("*") \
             .eq("conversation_id", str(conversation_id)) \
             .order("order_index", desc=False) \
-            .execute()
+            .execute() # <--- Add await
 
         validated_messages = []
         if messages_response.data:
@@ -555,7 +557,7 @@ async def generate_and_save_title(conversation_id: uuid.UUID):
 
     try:
         # Fetch conversation details to check if title already exists
-        conv_details_response = (supabase_client.table("conversations")
+        conv_details_response = (await supabase_client.table("conversations") # <--- Add await
             .select("id, title, user_id")
             .eq("id", str(conversation_id))
             .maybe_single()
@@ -571,7 +573,7 @@ async def generate_and_save_title(conversation_id: uuid.UUID):
         user_bungie_id = conv_details_response.data.get("user_id") # Get user_id for logging/context
 
         # Fetch first user message (order_index 0, sender 'user') from Supabase
-        user_msg_response = (supabase_client.table("messages")
+        user_msg_response = (await supabase_client.table("messages") # <--- Add await
             .select("content")
             .eq("conversation_id", str(conversation_id))
             .eq("order_index", 0)
@@ -580,7 +582,7 @@ async def generate_and_save_title(conversation_id: uuid.UUID):
             .execute())
 
         # Fetch first assistant message (order_index 1, sender 'assistant') from Supabase
-        assistant_msg_response = (supabase_client.table("messages")
+        assistant_msg_response = (await supabase_client.table("messages") # <--- Add await
             .select("content")
             .eq("conversation_id", str(conversation_id))
             .eq("order_index", 1)
@@ -617,7 +619,7 @@ async def generate_and_save_title(conversation_id: uuid.UUID):
             logger.info(f"Generated title for {conversation_id}: '{generated_title}'")
             
             # Save the title to Supabase
-            update_title_response = (supabase_client.table("conversations")
+            update_title_response = (await supabase_client.table("conversations") # <--- Add await
                 .update({"title": generated_title, "updated_at": datetime.now(timezone.utc).isoformat()})
                 .eq("id", str(conversation_id))
                 .execute())
@@ -642,7 +644,7 @@ async def generate_and_save_title(conversation_id: uuid.UUID):
 async def assistants_chat_endpoint(
     request: ChatRequest,
     current_user: User = Depends(get_current_user_from_token),
-    sb_client: Client = Depends(get_supabase_db) # <--- Changed to Supabase client
+    sb_client: AsyncClient = Depends(get_supabase_db) # <--- Changed to Supabase client
 ):
     """
     Chat endpoint using the agent service, handling conversation history with Supabase.
@@ -676,12 +678,12 @@ async def assistants_chat_endpoint(
         if requested_conversation_id_str:
             logger.info(f"Attempting to continue existing conversation: {requested_conversation_id_str} for user {bungie_id}")
             # Load existing conversation from Supabase
-            conv_response = sb_client.table("conversations") \
+            conv_response = await sb_client.table("conversations") \
                 .select("id, user_id, title, created_at, updated_at, archived") \
                 .eq("id", requested_conversation_id_str) \
                 .eq("user_id", bungie_id) \
                 .maybe_single() \
-                .execute()
+                .execute() # <--- Add await
 
             if not conv_response.data:
                 logger.warning(f"Conversation {requested_conversation_id_str} not found for user {bungie_id} or access denied.")
@@ -690,11 +692,11 @@ async def assistants_chat_endpoint(
             current_conversation_id_str = str(conv_response.data["id"]) # Ensure we use the UUID as string
 
             # Load history from Supabase
-            messages_response = sb_client.table("messages") \
+            messages_response = await sb_client.table("messages") \
                 .select("sender, content, order_index") \
                 .eq("conversation_id", current_conversation_id_str) \
                 .order("order_index", desc=False) \
-                .execute()
+                .execute() # <--- Add await
             
             if messages_response.data:
                 for msg_data in messages_response.data:
@@ -707,7 +709,7 @@ async def assistants_chat_endpoint(
             # Start new conversation in Supabase
             logger.info(f"Starting new conversation for user {bungie_id}")
             new_conv_data = {"user_id": bungie_id, "title": None} # title can be generated later
-            insert_response = sb_client.table("conversations").insert(new_conv_data).execute()
+            insert_response = await sb_client.table("conversations").insert(new_conv_data).execute() # <--- Add await
             
             if not insert_response.data:
                 logger.error(f"Failed to insert new conversation for user {bungie_id} into Supabase.")
@@ -725,7 +727,7 @@ async def assistants_chat_endpoint(
             "order_index": next_order_index
             # Supabase handles 'created_at' (timestamp) and 'id' (message UUID)
         }
-        insert_user_msg_response = sb_client.table("messages").insert(user_message_to_save).execute()
+        insert_user_msg_response = await sb_client.table("messages").insert(user_message_to_save).execute() # <--- Add await
         if not insert_user_msg_response.data:
             logger.error(f"Failed to save user message for conv {current_conversation_id_str} to Supabase.")
             # Not raising HTTPException here to allow agent to still respond if possible, but log it.
@@ -751,12 +753,12 @@ async def assistants_chat_endpoint(
         elif isinstance(run_result, dict) and 'error' in run_result:
             logger.error(f"Agent service returned error dict for conv {current_conversation_id_str}: {run_result['error']}")
             # Update timestamp even if agent errored, as an interaction occurred
-            sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
+            await sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
                 .eq("id", current_conversation_id_str).execute()
             raise HTTPException(status_code=500, detail=run_result['error'])
         else:
             logger.warning(f"Unexpected result type from agent service for conv {current_conversation_id_str}: {type(run_result)}. Result: {run_result}")
-            sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
+            await sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
                 .eq("id", current_conversation_id_str).execute()
             raise HTTPException(status_code=500, detail="Agent service generated a response, but its format was unexpected.")
 
@@ -767,7 +769,7 @@ async def assistants_chat_endpoint(
             "content": agent_response_content,
             "order_index": next_order_index
         }
-        insert_asst_msg_response = sb_client.table("messages").insert(assistant_message_to_save).execute()
+        insert_asst_msg_response = await sb_client.table("messages").insert(assistant_message_to_save).execute() # <--- Add await
         if not insert_asst_msg_response.data:
             logger.error(f"Failed to save assistant message for conv {current_conversation_id_str} to Supabase.")
         else:
@@ -775,8 +777,8 @@ async def assistants_chat_endpoint(
         
         # --- Update Conversation Timestamp in Supabase ---
         # This happens regardless of assistant message save success, as user message was processed.
-        update_conv_ts_response = sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
-            .eq("id", current_conversation_id_str).execute()
+        update_conv_ts_response = await sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
+            .eq("id", current_conversation_id_str).execute() # <--- Add await
         if not update_conv_ts_response.data:
              logger.error(f"Failed to update timestamp for conversation {current_conversation_id_str} in Supabase.")
         else:
@@ -801,12 +803,15 @@ async def assistants_chat_endpoint(
     except HTTPException as http_exc:
         logger.error(f"HTTPException in assistants_chat_endpoint for user {bungie_id}, conv {requested_conversation_id_str}: {http_exc.status_code} - {http_exc.detail}", exc_info=False)
         raise http_exc
+    except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err: # <-- CATCH AUTH ERRORS SPECIFICALLY
+        logger.warning(f"Authentication error in assistants_chat_endpoint for user {bungie_id}, conv {requested_conversation_id_str}: {auth_err}")
+        raise auth_err # Re-raise to be caught by the app-level exception handlers
     except Exception as e:
         logger.error(f"Unexpected error in assistants_chat_endpoint for user {bungie_id}, conv {requested_conversation_id_str}: {e}", exc_info=True)
         # Attempt to update timestamp on generic error if we have a conversation ID
         if current_conversation_id_str:
             try:
-                sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
+                await sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
                     .eq("id", current_conversation_id_str).execute()
             except Exception as ts_err:
                 logger.error(f"Failed to update timestamp during general error handling for conv {current_conversation_id_str}: {ts_err}")
@@ -994,7 +999,7 @@ def refresh_jwt_token(Authorization: str = Header(None), db: Session = Depends(g
         raise credentials_exception
 
 # --- NEW: Supabase Manifest Service ---
-def get_supabase_manifest_service() -> SupabaseManifestService:
+async def get_supabase_manifest_service() -> SupabaseManifestService:
     """Dependency to get the Supabase manifest service."""
     global supabase_manifest_service # Ensure we're accessing the global
     if supabase_manifest_service is None:
@@ -1024,6 +1029,23 @@ async def get_weapon_api_dependency() -> WeaponAPI:
         raise HTTPException(status_code=503, detail="Weapon API service not available.")
     return weapon_api_instance
 # END NEW DEPENDENCIES
+
+# --- Custom Exception Handlers ---
+@app.exception_handler(AuthenticationRequiredError)
+async def authentication_required_exception_handler(request: Request, exc: AuthenticationRequiredError):
+    logger.warning(f"AuthenticationRequiredError caught: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"error": "auth_required", "message": str(exc) or "Authentication required. Please log in via Bungie.net."}
+    )
+
+@app.exception_handler(InvalidRefreshTokenError)
+async def invalid_refresh_token_exception_handler(request: Request, exc: InvalidRefreshTokenError):
+    logger.warning(f"InvalidRefreshTokenError caught: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"error": "invalid_refresh_token", "message": str(exc) or "Invalid refresh token. Please log in again."}
+    )
 
 if __name__ == "__main__":
     import uvicorn

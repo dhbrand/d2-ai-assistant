@@ -5,14 +5,15 @@ import json
 import zipfile
 import logging
 from typing import Dict, Any, Optional, List
-from supabase import Client as SupabaseClient # Import Supabase client
+from supabase import Client as SupabaseClient # Keep for type hint if needed, but will use AsyncClient
+from supabase import AsyncClient # Import AsyncClient
 
 logger = logging.getLogger(__name__)
 
 # New service for fetching definitions from Supabase
 class SupabaseManifestService:
     """Provides access to Destiny 2 Manifest definitions stored in Supabase."""
-    def __init__(self, sb_client: SupabaseClient):
+    def __init__(self, sb_client: AsyncClient):
         self.sb_client = sb_client
 
     async def get_definition(self, table_name: str, definition_hash: int) -> Optional[Dict[str, Any]]:

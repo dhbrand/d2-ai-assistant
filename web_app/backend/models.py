@@ -8,6 +8,7 @@ import uuid
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import UUID as UUIDType
 from sqlalchemy import Text, Index
+import json
 
 Base = declarative_base()
 

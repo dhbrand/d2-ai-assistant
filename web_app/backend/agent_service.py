@@ -19,11 +19,15 @@ from googleapiclient.errors import HttpError
 import difflib
 import re
 from openai import OpenAI # Ensure OpenAI is imported for type hinting
+from supabase import Client, AsyncClient
+import json
+from .models import CatalystData, CatalystObjective # <--- ADD THIS IMPORT
+from .bungie_oauth import AuthenticationRequiredError, InvalidRefreshTokenError # <-- IMPORT THESE
 
 logger = logging.getLogger(__name__)
 
 # Define Cache Time-To-Live (TTL)
-CACHE_TTL = timedelta(minutes=30) # Cache data for 30 minutes
+CACHE_TTL = timedelta(hours=24) # Cache data for 24 hours
 
 # --- Tool Implementation Functions (outside class) ---
 
@@ -51,7 +55,7 @@ def _get_user_info_impl(service: 'DestinyAgentService') -> dict:
 
     # Cache miss or stale, call API
     try:
-        info = service.weapon_api.get_membership_info(access_token)
+        info = service.weapon_api.get_membership_info()
         if not info or 'id' not in info or 'type' not in info:
             logger.warning("Agent Tool Impl: get_membership_info returned incomplete data.")
             return {"error": "Could not retrieve valid membership info."}
@@ -60,9 +64,13 @@ def _get_user_info_impl(service: 'DestinyAgentService') -> dict:
         service._user_info_cache[bungie_id] = (now, info)
         logger.info(f"Cache SET for user_info for bungie_id {bungie_id}")
         return info
+    except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err: # <-- CATCH SPECIFIC AUTH ERRORS
+        logger.warning(f"Authentication error in get_user_info: {auth_err}")
+        raise # Re-raise auth-specific errors to be caught by FastAPI
     except Exception as e:
         logger.error(f"Agent Tool Impl Error in get_user_info: {e}", exc_info=True)
-        raise # Re-raise the exception for the agent runner to handle
+        # For other errors, return a dict error for the agent to formulate a response
+        return {"error": f"Failed to get user info due to an internal error: {str(e)}"}
 
 async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int, membership_id: str) -> list:
     """(Implementation) Fetch all weapons for a user, using cache."""
@@ -91,9 +99,8 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
 
     # Cache miss or stale, call API
     try:
-        # Use await for the async API call
+        # Use await for the async API call, without access_token
         weapons_data = await service.weapon_api.get_all_weapons(
-            access_token=access_token,
             membership_type=membership_type,
             destiny_membership_id=membership_id
         )
@@ -102,12 +109,15 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
         service._weapons_cache[bungie_id] = (now, weapons_data)
         logger.info(f"Cache SET for weapons for bungie_id {bungie_id}")
         return weapons_data
+    except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err: # <-- CATCH SPECIFIC AUTH ERRORS
+        logger.warning(f"Authentication error in get_weapons: {auth_err}")
+        raise # Re-raise auth-specific errors
     except Exception as e:
         logger.error(f"Agent Tool Impl Error in get_weapons: {e}", exc_info=True)
-        raise
+        return {"error": f"Failed to get weapons due to an internal error: {str(e)}"} # Return dict error
 
 async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
-    """(Implementation) Fetch all catalyst progress for a user, using cache."""
+    """(Implementation) Fetch all catalyst progress for a user, using Supabase as cache."""
     logger.debug("Agent Tool Impl: get_catalysts called")
     bungie_id = service._current_bungie_id
     access_token = service._current_access_token
@@ -116,29 +126,189 @@ async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
         logger.error("Agent Tool Impl Error: Bungie ID or Access token not set in context.")
         raise Exception("User context not available for get_catalysts.")
 
-    # Check cache
     now = datetime.now(timezone.utc)
-    if bungie_id in service._catalysts_cache:
-        timestamp, cached_data = service._catalysts_cache[bungie_id]
-        if now - timestamp < CACHE_TTL:
-            logger.info(f"Cache HIT for catalysts for bungie_id {bungie_id}")
-            return cached_data
-        else:
-            logger.info(f"Cache STALE for catalysts for bungie_id {bungie_id}")
-    else:
-        logger.info(f"Cache MISS for catalysts for bungie_id {bungie_id}")
+    processed_catalysts_from_cache = []
+    all_cache_fresh = True # Assume fresh until a stale or missing entry is found
 
-    # Cache miss or stale, call API
     try:
-        # Use await for the async API call
-        catalysts_data = await service.catalyst_api.get_catalysts(access_token)
-        # Store in cache (again, assuming Pydantic models or dicts)
-        service._catalysts_cache[bungie_id] = (now, catalysts_data)
-        logger.info(f"Cache SET for catalysts for bungie_id {bungie_id}")
-        return catalysts_data
+        logger.info(f"Attempting to fetch catalysts from Supabase cache for user {bungie_id}")
+        supabase_response = await service.sb_client.table("user_catalyst_status") \
+            .select("catalyst_record_hash, is_complete, objectives, last_updated") \
+            .eq("user_id", bungie_id) \
+            .execute()
+
+        if supabase_response.data:
+            logger.info(f"Found {len(supabase_response.data)} catalyst entries in Supabase for user {bungie_id}")
+            # Check if we have at least one entry and if it might be stale
+            # A more robust check might involve knowing all expected catalysts, but for now, check recency.
+            # If any entry is older than CACHE_TTL, we consider the whole cache stale for simplicity.
+            # Alternatively, one could try to refresh only stale individual entries.
+            for cached_item_dict in supabase_response.data:
+                last_updated_str = cached_item_dict.get("last_updated")
+                if last_updated_str:
+                    last_updated_dt = datetime.fromisoformat(last_updated_str)
+                    if now - last_updated_dt > CACHE_TTL:
+                        all_cache_fresh = False
+                        logger.info(f"Supabase cache for catalyst {cached_item_dict.get('catalyst_record_hash')} is STALE for user {bungie_id}.")
+                        break # One stale item makes the whole cache miss for now
+                else:
+                    all_cache_fresh = False # Missing last_updated means it's effectively stale
+                    logger.info(f"Supabase cache for catalyst {cached_item_dict.get('catalyst_record_hash')} has no last_updated timestamp for user {bungie_id}.")
+                    break
+            
+            if all_cache_fresh:
+                logger.info(f"Supabase catalyst cache is FRESH for user {bungie_id}. Reconstructing CatalystData.")
+                for cached_item_dict in supabase_response.data:
+                    record_hash = cached_item_dict["catalyst_record_hash"]
+                    # Fetch static details from manifest using CatalystAPI's helper (which uses SupabaseManifestService)
+                    # This assumes CatalystAPI provides a way to get these, or we directly use manifest service.
+                    # For CatalystData, we need: name, description, weapon_type.
+                    # The CatalystAPI._get_catalyst_info method does this assembly.
+                    # However, _get_catalyst_info itself takes a 'record' object from profile, not just a hash.
+                    # We need a way to get CatalystData-like structure from record_hash + cached progress.
+
+                    # Simplified: For now, let's assume CatalystAPI can construct full CatalystData from record_hash and objectives.
+                    # This might require a new helper in CatalystAPI or direct use of SupabaseManifestService here.
+                    # Let's fetch the raw definition first.
+                    record_def = await service.catalyst_api.get_definition("destinyrecorddefinition", record_hash)
+                    if not record_def:
+                        logger.warning(f"Could not find record definition for {record_hash} when reconstructing from cache.")
+                        continue
+                    
+                    display_props = record_def.get('displayProperties', {})
+                    name = display_props.get('name', f'Unknown Catalyst {record_hash}')
+                    description = display_props.get('description', '')
+                    # weapon_type and overall progress needs more sophisticated derivation similar to CatalystAPI
+                    # For now, we'll use placeholders or derive simply if possible.
+                    # TODO: Enhance weapon_type and overall progress derivation from manifest/objectives.
+                    weapon_type = "Unknown"
+                    
+                    objectives_json = cached_item_dict.get("objectives")
+                    objectives_list = []
+                    if objectives_json:
+                        if isinstance(objectives_json, str): # If objectives are stored as a JSON string
+                            try:
+                                objectives_list = [CatalystObjective(**obj) for obj in json.loads(objectives_json)]
+                            except json.JSONDecodeError:
+                                logger.error(f"Failed to parse objectives JSON for {record_hash}: {objectives_json}")
+                        elif isinstance(objectives_json, list): # If already a list of dicts (from direct JSONB handling)
+                             objectives_list = [CatalystObjective(**obj) for obj in objectives_json]
+
+                    overall_progress = 0.0
+                    if objectives_list:
+                        total_prog = sum(obj.progress for obj in objectives_list)
+                        total_comp = sum(obj.completion for obj in objectives_list)
+                        if total_comp > 0:
+                            overall_progress = (total_prog / total_comp) * 100
+                        elif cached_item_dict["is_complete"]:
+                            overall_progress = 100.0
+
+                    processed_catalysts_from_cache.append(
+                        CatalystData(
+                            name=name,
+                            description=description,
+                            weapon_type=weapon_type, # Placeholder
+                            objectives=objectives_list,
+                            complete=cached_item_dict["is_complete"],
+                            progress=overall_progress # Placeholder/Simple Derivation
+                            # record_hash is not part of CatalystData model, but we have it.
+                        )
+                    )
+                if processed_catalysts_from_cache: # If we successfully reconstructed some/all items
+                    logger.info(f"Cache HIT: Returning {len(processed_catalysts_from_cache)} catalysts from Supabase for user {bungie_id}")
+                    return processed_catalysts_from_cache
+                else:
+                    # This case means we found entries, they were fresh, but failed to process all of them.
+                    logger.warning(f"Found fresh cache entries for user {bungie_id} but failed to reconstruct CatalystData for all items. Proceeding to API call.")
+                    all_cache_fresh = False # Treat as a cache miss to force API refresh
+
+        else:
+            logger.info(f"Cache MISS: No catalyst data in Supabase for user {bungie_id}")
+            all_cache_fresh = False # Explicitly a cache miss
+
     except Exception as e:
-        logger.error(f"Agent Tool Impl Error in get_catalysts: {e}", exc_info=True)
-        raise
+        logger.error(f"Error during Supabase catalyst cache check for user {bungie_id}: {e}", exc_info=True)
+        all_cache_fresh = False # Treat as a cache miss on error
+
+    # If cache was not fresh, or empty, or error during cache check: Call API
+    if not all_cache_fresh:
+        logger.info(f"Calling Bungie API for catalysts for user {bungie_id} due to cache miss or staleness.")
+        try:
+            # This is expected to return List[CatalystData] or list of dicts that can be validated into it
+            # It should include record_hash if it's a list of dicts.
+            api_catalysts_result = await service.catalyst_api.get_catalysts()
+
+            # Prepare data for Supabase upsert
+            catalysts_to_upsert = []
+            # The result from get_catalysts should be List[CatalystData] or conform to it.
+            # We need to ensure record_hash is available for each item to use as primary key for upsert.
+            # Assuming service.catalyst_api.get_catalysts() result contains objects/dicts that have a 'record_hash' field/key.
+            # For now, this part requires that the objects returned by get_catalysts have a .record_hash attribute.
+            # And that CatalystData has .name, .description, .objectives, .complete, .progress fields.
+
+            # Re-validate/structure into CatalystData if not already
+            validated_api_catalysts = [] # Will store tuples of (CatalystData, record_hash_str)
+            for item_data in api_catalysts_result: # item_data is a dict from catalyst_api
+                if isinstance(item_data, dict):
+                    current_record_hash = item_data.get('record_hash')
+                    if not current_record_hash:
+                        logger.warning(f"API item_data missing 'record_hash': {item_data.get('name', 'Unknown Catalyst')}")
+                        continue
+                    try:
+                        # Validate the dict into CatalystData. record_hash is not part of the model,
+                        # so it won't be included in 'validated_item'.
+                        validated_item = CatalystData(**item_data)
+                        validated_api_catalysts.append((validated_item, current_record_hash)) # Store as tuple
+                    except Exception as val_err:
+                        logger.error(f"Failed to validate item_data from catalyst_api into CatalystData: {item_data.get('name', 'Unknown')}, error: {val_err}")
+                        continue
+                else:
+                    logger.warning(f"Unexpected item type from catalyst_api: {type(item_data)}")
+                    continue
+
+            for item, item_record_hash_str in validated_api_catalysts: # Unpack the tuple, item_record_hash_str is a string
+                objectives_for_json = [obj.model_dump() for obj in item.objectives]
+                try:
+                    # Convert record hash string to integer for Supabase int8 column
+                    catalyst_hash_int = int(item_record_hash_str)
+                except ValueError:
+                    logger.error(f"Could not convert catalyst_record_hash '{item_record_hash_str}' to int for item '{item.name}'. Skipping upsert for this item.")
+                    continue
+
+                catalysts_to_upsert.append({
+                    "user_id": bungie_id,
+                    "catalyst_record_hash": catalyst_hash_int, # Use the integer hash
+                    "is_complete": item.complete,
+                    "objectives": json.dumps(objectives_for_json),
+                    "last_updated": now.isoformat()
+                })
+            
+            if catalysts_to_upsert:
+                try:
+                    supabase_upsert_response = await service.sb_client.table("user_catalyst_status").upsert(catalysts_to_upsert).execute()
+                    if supabase_upsert_response.data:
+                        logger.info(f"Successfully upserted/updated {len(supabase_upsert_response.data)} catalysts to Supabase for user {bungie_id}")
+                    else:
+                        # Log error but don't fail the whole operation if some items were processed
+                        logger.error(f"Supabase upsert for catalysts failed or returned no data for user {bungie_id}. Error: {supabase_upsert_response.error}")
+                except Exception as db_e:
+                    logger.error(f"Exception during Supabase catalyst upsert for user {bungie_id}: {db_e}", exc_info=True)
+            
+            logger.info(f"Cache SET: Returning {[item for item, _ in validated_api_catalysts]} catalysts from API for user {bungie_id}") # Return only CatalystData objects
+            return [item for item, _ in validated_api_catalysts] # Return only CatalystData objects
+
+        except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err: # <-- CATCH SPECIFIC AUTH ERRORS
+            logger.warning(f"Authentication error in get_catalysts API call: {auth_err}")
+            raise # Re-raise auth-specific errors
+        except Exception as e:
+            logger.error(f"Error calling Bungie API for catalysts for user {bungie_id}: {e}", exc_info=True)
+            # Return an error structure or empty list for the agent if API fails for other reasons
+            return {"error": f"Failed to fetch catalysts from API due to an internal error: {str(e)}"}
+    
+    # This should ideally not be reached if all_cache_fresh was true and processing happened,
+    # but as a fallback if cache was fresh but processing failed to return.
+    logger.warning(f"Returning empty list or error for _get_catalysts_impl for user {bungie_id} as no data path was conclusive.")
+    return {"error": "Could not determine catalyst status."}
 
 # ---> ADDED: Google Sheet Tool Implementation <---
 def _get_pve_bis_weapons_impl(service: 'DestinyAgentService') -> list[dict]:
@@ -290,15 +460,16 @@ class DestinyAgentService:
                  openai_client: OpenAI, 
                  catalyst_api: CatalystAPI, 
                  weapon_api: WeaponAPI,
+                 supabase_client: AsyncClient,
                  # TODO: Add google_sheets_service or similar if used by endgame_analysis directly
                  # For now, endgame_analysis creates its own GSheets client.
                  ):
-        logger.info("Initializing DestinyAgentService with pre-configured API clients.")
+        logger.info("Initializing DestinyAgentService with pre-configured API clients and Supabase client.")
         self.openai_client = openai_client
         set_default_openai_client(self.openai_client)
         self.catalyst_api = catalyst_api
         self.weapon_api = weapon_api
-        # self.google_sheets_service = google_sheets_service # If you have a shared one
+        self.sb_client = supabase_client
 
         self.agent = self._create_agent()
         self._current_access_token: Optional[str] = None
@@ -384,9 +555,14 @@ class DestinyAgentService:
             # Extract the final text output
             response_text = response_obj.final_output if hasattr(response_obj, 'final_output') else "Error: Could not get final output from agent."
             return response_text
+        except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err: # <-- CATCH AUTH ERRORS FIRST
+            logger.warning(f"Authentication error during agent chat execution: {auth_err}")
+            raise # Re-raise to be caught by FastAPI
         except Exception as e:
             logger.error(f"Error during agent chat execution: {e}", exc_info=True)
-            return f"An error occurred: {str(e)}"
+            # For other errors, the agent runner likely already formulated a polite response if it was tool error.
+            # If it's an error in the agent execution itself, return a generic error message.
+            return f"An unexpected error occurred while processing your request: {str(e)}"
         finally:
             # Clear user context after run
             self._current_access_token = None

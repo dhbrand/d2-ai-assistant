@@ -467,11 +467,18 @@ class OAuthManager:
             return True # Token is still valid
 
     def get_headers(self):
-        """Get headers for API requests"""
-        self.refresh_if_needed()
+        """Get headers for API requests, handling token refresh."""
+        logger.debug("Attempting to get authenticated headers...")
+        self.refresh_if_needed() # Attempt to refresh if token is expired or near expiry
+        
+        if not self.token_data or "access_token" not in self.token_data:
+            logger.error("No valid token data available after refresh attempt. Authentication is required.")
+            raise AuthenticationRequiredError("Authentication required. Please log in via Bungie.net.")
+            
+        logger.debug("Successfully obtained token data for headers.")
         return {
-            'X-API-Key': BUNGIE_API_KEY,
-            'Authorization': f'Bearer {self.token_data["access_token"]}'
+            "Authorization": f"Bearer {self.token_data['access_token']}",
+            "X-API-Key": self.api_key
         }
 
     def get_auth_url(self):
@@ -625,4 +632,43 @@ class OAuthManager:
 
 # Custom Exception for invalid refresh token
 class InvalidRefreshTokenError(Exception):
-    pass 
+    pass
+
+# --- Custom Exceptions ---
+class AuthenticationRequiredError(Exception):
+    """Custom exception to indicate that Bungie.net authentication is required."""
+    pass
+# --- End Custom Exceptions ---
+
+# logging.basicConfig(level=logging.DEBUG) # Example: Enable debug logging for OAuthManager
+# manager = OAuthManager()
+# manager.start_auth() # This will open browser and start server
+
+# Example of how to use get_headers safely:
+# try:
+#     headers = manager.get_headers()
+#     # Proceed with API call using headers
+# except AuthenticationRequiredError as e:
+#     print(f"Needs login: {e}")
+#     # Here, you would typically redirect the user to manager.get_auth_url()
+# except Exception as e:
+#     print(f"Some other error: {e}")
+
+
+# Remove the old InvalidRefreshTokenError if it's defined elsewhere or ensure it's consistently defined.
+# For this edit, I'm assuming we are consolidating its definition here or it was missing.
+# If it was defined lower in the file, that part of the diff will show its removal from the old location.
+
+# logging.basicConfig(level=logging.DEBUG) # Example: Enable debug logging for OAuthManager
+# manager = OAuthManager()
+# manager.start_auth() # This will open browser and start server
+
+# Example of how to use get_headers safely:
+# try:
+#     headers = manager.get_headers()
+#     # Proceed with API call using headers
+# except AuthenticationRequiredError as e:
+#     print(f"Needs login: {e}")
+#     # Here, you would typically redirect the user to manager.get_auth_url()
+# except Exception as e:
+#     print(f"Some other error: {e}") 
