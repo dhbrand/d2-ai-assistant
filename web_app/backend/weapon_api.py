@@ -56,7 +56,12 @@ class WeaponAPI:
                     membership = data['Response']['destinyMemberships'][0]
                 if membership:
                      logger.info(f"Found membership: Type={membership['membershipType']}, ID={membership['membershipId']}")
-                     return {"type": membership['membershipType'], "id": membership['membershipId']}
+                     return {
+                         "type": membership['membershipType'], 
+                         "id": membership['membershipId'],
+                         "bungieGlobalDisplayName": membership.get('bungieGlobalDisplayName', ''),
+                         "bungieGlobalDisplayNameCode": membership.get('bungieGlobalDisplayNameCode', '')
+                     }
                 else:
                      logger.error("No destiny memberships found for user.")
                      return None
