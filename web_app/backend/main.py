@@ -22,10 +22,11 @@ import uuid
 import asyncio # <-- Import asyncio
 from openai import AsyncOpenAI # <-- Import OpenAI client
 from jose.exceptions import ExpiredSignatureError
+from supabase import create_client, Client, ClientOptions # <-- Add Supabase imports
 
 # Use absolute imports
 from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError, TokenData # Import TokenData here
-from web_app.backend.models import init_db, User, CatalystData, Weapon, CallbackData, UserResponse, ConversationSchema, ChatMessageSchema
+from web_app.backend.models import init_db, User, CatalystData, Weapon, CallbackData, UserResponse, ConversationSchema, ChatMessageSchema, ChatHistorySessionLocal, Conversation, Message # <--- Added missing imports
 from sqlalchemy.orm import sessionmaker, Session
 from web_app.backend.catalyst import CatalystAPI
 from web_app.backend.weapon_api import WeaponAPI
@@ -245,6 +246,18 @@ def get_db_session():
     finally:
         db.close()
 
+# --- Dependency Function for Supabase Client ---
+def get_supabase_db() -> Client:
+    """Dependency to get the initialized Supabase client."""
+    global supabase_client # Ensure we are referring to the global instance
+    if not supabase_client:
+        logger.error("Supabase client not initialized. Check server logs and .env configuration.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Supabase client not initialized. Check server configuration."
+        )
+    return supabase_client
+
 # --- NEW Dependency Function for Chat History DB ---
 def get_chat_db():
     """Dependency to get a session for the chat history database."""
@@ -430,53 +443,82 @@ async def verify_token(current_user: User = Depends(get_current_user_from_token)
 @app.get("/api/conversations", response_model=List[ConversationSchema])
 async def list_conversations(
     current_user: User = Depends(get_current_user_from_token),
-    db: Session = Depends(get_chat_db),
-    archived: int = Query(0, description="Set to 1 to show archived conversations")
+    sb_client: Client = Depends(get_supabase_db), # <--- Changed to Supabase client
+    archived: bool = Query(False, description="Set to true to show archived conversations") # Changed to bool
 ):
     """Lists all (optionally archived) conversations for the currently authenticated user."""
-    user_bungie_id = current_user.bungie_id
+    user_bungie_id = str(current_user.bungie_id) # Ensure it's a string for comparison
     if not user_bungie_id:
         raise HTTPException(status_code=401, detail="User Bungie ID not found in token")
-    query = db.query(Conversation).filter(Conversation.user_bungie_id == str(user_bungie_id))
-    if archived:
-        query = query.filter(Conversation.archived == True)
-    else:
-        query = query.filter(Conversation.archived == False)
-    conversations = query.order_by(Conversation.updated_at.desc()).all()
-    return conversations
+    
+    try:
+        # Supabase style query
+        # Ensure your ConversationSchema matches the selected fields, especially user_id
+        query_builder = sb_client.table("conversations").select("id, user_id, title, created_at, updated_at, archived") \
+            .eq("user_id", user_bungie_id) \
+            .eq("archived", archived) \
+            .order("updated_at", desc=True)
+        
+        response = query_builder.execute() # Synchronous Supabase client execute
+
+        validated_conversations = []
+        if response.data:
+            for conv_data in response.data:
+                # Ensure field names from Supabase match ConversationSchema or adapt here
+                # Example: if Supabase has 'user_bungie_id' but Pydantic needs 'user_id', map it.
+                # Assuming direct mapping for now or that 'user_id' is the correct field in Supabase.
+                validated_conversations.append(ConversationSchema.model_validate(conv_data))
+        return validated_conversations
+            
+    except Exception as e:
+        logger.error(f"Error listing conversations for user {user_bungie_id} from Supabase: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list conversations.")
 
 @app.get("/api/conversations/{conversation_id}/messages", response_model=List[ChatMessageSchema])
 async def get_conversation_messages(
     conversation_id: uuid.UUID,
     current_user: User = Depends(get_current_user_from_token),
-    db: Session = Depends(get_chat_db) # Use chat history DB session
+    sb_client: Client = Depends(get_supabase_db) # <--- Changed to Supabase client
 ):
-    """Gets all messages for a specific conversation, verifying ownership."""
-    user_bungie_id = current_user.bungie_id
+    """Gets all messages for a specific conversation from Supabase, verifying ownership."""
+    user_bungie_id = str(current_user.bungie_id) # Ensure it's a string for comparison
     if not user_bungie_id:
         raise HTTPException(status_code=401, detail="User Bungie ID not found in token")
 
-    # First, verify the conversation exists and belongs to the user
-    conversation = (
-        db.query(Conversation)
-        .filter(
-            Conversation.id == conversation_id,
-            Conversation.user_bungie_id == str(user_bungie_id)
-        )
-        .first()
-    )
+    try:
+        # First, verify the conversation exists and belongs to the user by trying to fetch it.
+        # This also implicitly checks ownership.
+        conv_response = sb_client.table("conversations") \
+            .select("id") \
+            .eq("id", str(conversation_id)) \
+            .eq("user_id", user_bungie_id) \
+            .maybe_single() \
+            .execute()
 
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found or access denied")
+        if not conv_response.data:
+            logger.warning(f"Conversation {conversation_id} not found for user {user_bungie_id} in Supabase or user does not have access.")
+            raise HTTPException(status_code=404, detail="Conversation not found or access denied")
 
-    # Fetch messages ordered by their index
-    messages = (
-        db.query(Message)
-        .filter(Message.conversation_id == conversation_id)
-        .order_by(Message.order_index.asc())
-        .all()
-    )
-    return messages
+        # Fetch messages ordered by their index (assuming 'order_index' column exists in Supabase 'messages' table)
+        messages_response = sb_client.table("messages") \
+            .select("*") \
+            .eq("conversation_id", str(conversation_id)) \
+            .order("order_index", desc=False) \
+            .execute()
+
+        validated_messages = []
+        if messages_response.data:
+            for msg_data in messages_response.data:
+                # Ensure field names from Supabase match ChatMessageSchema or adapt here
+                # Example: if Supabase has 'created_at' but Pydantic needs 'timestamp', map it.
+                # Assuming direct mapping or that ChatMessageSchema is already aligned.
+                validated_messages.append(ChatMessageSchema.model_validate(msg_data))
+        
+        return validated_messages
+            
+    except Exception as e:
+        logger.error(f"Error fetching messages for conversation {conversation_id} for user {user_bungie_id} from Supabase: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch messages for the conversation.")
 
 # --- End NEW Chat History Endpoints ---
 

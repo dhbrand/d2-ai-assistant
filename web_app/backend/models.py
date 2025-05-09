@@ -3,7 +3,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker, Session
 from typing import List, Optional
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import uuid
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import UUID as UUIDType
@@ -165,14 +165,14 @@ def init_chat_history_db():
     print(f"Initialized chat history tables for {CHAT_HISTORY_DATABASE_URL} (if they didn't exist).")
 
 class ChatMessageBase(BaseModel):
-    role: str
+    role: str = Field(validation_alias='sender') # Alias for 'sender' column from Supabase
     content: str
 
 class ChatMessageSchema(ChatMessageBase):
     id: uuid.UUID
-    timestamp: datetime
+    timestamp: datetime = Field(validation_alias='created_at') # Alias for 'created_at' column from Supabase
     order_index: int
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True) # Ensure populate_by_name is True
 
 class ConversationBase(BaseModel):
     title: Optional[str] = None
@@ -182,7 +182,8 @@ class ConversationCreate(ConversationBase):
 
 class ConversationSchema(ConversationBase):
     id: uuid.UUID
-    user_bungie_id: str
+    user_bungie_id: str = Field(validation_alias='user_id')
     created_at: datetime
     updated_at: datetime
-    model_config = ConfigDict(from_attributes=True) 
+    archived: Optional[bool] = None
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True) 
