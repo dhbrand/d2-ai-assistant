@@ -240,17 +240,43 @@ function ChatPage() {
         body: JSON.stringify(requestBody),
       });
 
-      const responseText = await response.text();
+      const responseText = await response.text(); // Get raw text first
 
       if (!response.ok) {
-        let errorDetail = responseText;
+        let errorDisplayMessage = "An API error occurred."; // Default error message
         try {
-          const json = JSON.parse(responseText);
-          errorDetail = json.detail || JSON.stringify(json);
-        } catch (_) {}
-        throw new Error(`HTTP error ${response.status}: ${errorDetail}`);
+          const jsonError = JSON.parse(responseText); // Try to parse as JSON
+          
+          if (response.status === 401) {
+            if (jsonError.error === "auth_required") {
+              console.error("Authentication required by API. Frontend should trigger login flow.", jsonError.message);
+              errorDisplayMessage = jsonError.message || "Authentication is required. Please log in.";
+              // TODO: Implement actual login trigger/redirect here.
+              // Example: authContext.requestLogin(); 
+            } else if (jsonError.error === "invalid_refresh_token") {
+              console.error("Invalid refresh token. Frontend should trigger full re-login.", jsonError.message);
+              errorDisplayMessage = jsonError.message || "Your session has expired. Please log in again.";
+              // TODO: Implement actual login trigger/redirect here, possibly clearing old token.
+              // Example: authContext.logoutAndRequestLogin();
+            } else {
+              // Other 401 errors
+              errorDisplayMessage = jsonError.detail || jsonError.message || responseText;
+            }
+          } else {
+            // Non-401 errors
+            errorDisplayMessage = jsonError.detail || jsonError.message || responseText;
+          }
+        } catch (_) {
+          // If responseText wasn't valid JSON, use responseText as the error detail
+          errorDisplayMessage = responseText;
+        }
+        console.error('API Error:', response.status, errorDisplayMessage);
+        setMessages((prev) => [...prev, { role: 'assistant', content: `Error: ${errorDisplayMessage}` }]);
+        setIsLoading(false); // Ensure loading is stopped
+        return; // Important: stop processing on error
       }
 
+      // If response.ok, then try to parse the successful JSON response
       const data = JSON.parse(responseText);
       const assistantMessage = { role: 'assistant', content: data.message.content };
       setMessages(prev => [...prev, assistantMessage]);
