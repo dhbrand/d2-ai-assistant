@@ -1,7 +1,7 @@
 # Placeholder for DestinyAgentService class
 
 import os
-from agents import Agent, Runner, function_tool, WebSearchTool
+from agents import Agent, Runner, function_tool, WebSearchTool, set_default_openai_client
 from .weapon_api import WeaponAPI # Use relative import
 from .catalyst import CatalystAPI # Use relative import
 from .manifest import ManifestManager # Use relative import
@@ -18,6 +18,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import difflib
 import re
+from openai import OpenAI # Ensure OpenAI is imported for type hinting
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +64,8 @@ def _get_user_info_impl(service: 'DestinyAgentService') -> dict:
         logger.error(f"Agent Tool Impl Error in get_user_info: {e}", exc_info=True)
         raise # Re-raise the exception for the agent runner to handle
 
-def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int, membership_id: str) -> list:
+async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int, membership_id: str) -> list:
     """(Implementation) Fetch all weapons for a user, using cache."""
-    # Note: membership_type/id are required by the API call itself,
-    # but we use bungie_id (primary account identifier) for caching consistency.
     logger.debug(f"Agent Tool Impl: get_weapons called for {membership_type}/{membership_id}")
     bungie_id = service._current_bungie_id
     access_token = service._current_access_token
@@ -92,7 +91,8 @@ def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int, memb
 
     # Cache miss or stale, call API
     try:
-        weapons_data = service.weapon_api.get_all_weapons(
+        # Use await for the async API call
+        weapons_data = await service.weapon_api.get_all_weapons(
             access_token=access_token,
             membership_type=membership_type,
             destiny_membership_id=membership_id
@@ -106,7 +106,7 @@ def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int, memb
         logger.error(f"Agent Tool Impl Error in get_weapons: {e}", exc_info=True)
         raise
 
-def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
+async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
     """(Implementation) Fetch all catalyst progress for a user, using cache."""
     logger.debug("Agent Tool Impl: get_catalysts called")
     bungie_id = service._current_bungie_id
@@ -130,7 +130,8 @@ def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
 
     # Cache miss or stale, call API
     try:
-        catalysts_data = service.catalyst_api.get_catalysts(access_token)
+        # Use await for the async API call
+        catalysts_data = await service.catalyst_api.get_catalysts(access_token)
         # Store in cache (again, assuming Pydantic models or dicts)
         service._catalysts_cache[bungie_id] = (now, catalysts_data)
         logger.info(f"Cache SET for catalysts for bungie_id {bungie_id}")
@@ -285,39 +286,29 @@ def _get_endgame_analysis_impl(service: 'DestinyAgentService', sheet_name: Optio
 # --- Agent Service Class ---
 
 class DestinyAgentService:
-    def __init__(self, bungie_api_key: str, openai_api_key: str, manifest_manager: ManifestManager):
-        if not openai_api_key:
-            raise ValueError("OpenAI API key is required for DestinyAgentService")
-        
-        logger.info("Initializing DestinyAgentService...")
-        self.bungie_api_key = bungie_api_key
-        self.openai_api_key = openai_api_key # Store OpenAI key if needed later for client
-        self.manifest_manager = manifest_manager
-        
-        # Initialize API clients within the service
-        self.weapon_api = WeaponAPI(api_key=self.bungie_api_key, manifest_manager=self.manifest_manager)
-        self.catalyst_api = CatalystAPI(api_key=self.bungie_api_key, manifest_manager=self.manifest_manager)
+    def __init__(self, 
+                 openai_client: OpenAI, 
+                 catalyst_api: CatalystAPI, 
+                 weapon_api: WeaponAPI,
+                 # TODO: Add google_sheets_service or similar if used by endgame_analysis directly
+                 # For now, endgame_analysis creates its own GSheets client.
+                 ):
+        logger.info("Initializing DestinyAgentService with pre-configured API clients.")
+        self.openai_client = openai_client
+        set_default_openai_client(self.openai_client)
+        self.catalyst_api = catalyst_api
+        self.weapon_api = weapon_api
+        # self.google_sheets_service = google_sheets_service # If you have a shared one
+
+        self.agent = self._create_agent()
+        self._current_access_token: Optional[str] = None
+        self._current_bungie_id: Optional[str] = None
         
         # Initialize caches
-        self._user_info_cache = {} # { bungie_id: (timestamp, data) }
-        self._weapons_cache = {}   # { bungie_id: (timestamp, data) }
-        self._catalysts_cache = {} # { bungie_id: (timestamp, data) }
-        self._sheet_cache = {}      # { cache_key: (timestamp, data) }
-
-        # Variables to hold context for the current run
-        self._current_access_token: str | None = None
-        self._current_bungie_id: str | None = None
-        
-        # Create the agent instance (moved agent creation logic here)
-        try:
-             self.agent = self._create_agent()
-             logger.info("DestinyAgentService agent created successfully.")
-        except Exception as e:
-            logger.error(f"Failed to create agent during DestinyAgentService initialization: {e}", exc_info=True)
-            # Depending on requirements, you might want to raise this error
-            # or allow the service to initialize without a functional agent.
-            # For now, we log and continue, but run_chat will fail later.
-            self.agent = None
+        self._user_info_cache: Dict[str, tuple[datetime, dict]] = {}
+        self._weapons_cache: Dict[str, tuple[datetime, list]] = {}
+        self._catalysts_cache: Dict[str, tuple[datetime, list]] = {}
+        self._sheet_cache: Dict[str, tuple[datetime, list[dict]]] = {} # For Google Sheets
 
         self.persona_map = {
             "Saint-14": "You are Saint-14, the legendary Titan. Speak with honor, warmth, and a touch of old-world chivalry. Use phrases like 'my friend' and reference the Lighthouse or Trials. Use plenty of shield 🛡️, helmet 🪖, and sun ☀️ emojis.",
@@ -332,127 +323,89 @@ class DestinyAgentService:
         }
 
     def _create_agent(self) -> Agent:
-        """Creates the Agent instance with instructions and tools."""
-        
-        # Create partials first (these hold the 'self' context)
-        partial_get_user_info = functools.partial(_get_user_info_impl, service=self)
-        partial_get_weapons = functools.partial(_get_weapons_impl, service=self)
-        partial_get_catalysts = functools.partial(_get_catalysts_impl, service=self)
-        partial_get_pve_weapons = functools.partial(_get_pve_bis_weapons_impl, service=self)
-        partial_get_activity_weapons = functools.partial(_get_pve_activity_bis_weapons_impl, service=self)
-        partial_get_endgame_analysis = functools.partial(_get_endgame_analysis_impl, service=self)
-
-        # Now, define wrapper functions that call the partials.
-        # Decorate these wrappers with @function_tool.
-        
-        @function_tool
-        def get_user_info() -> dict:
-            """Fetch the user's Destiny membership info (required before fetching weapons)."""
-            return partial_get_user_info()
-
-        @function_tool
-        def get_weapons(membership_type: int, membership_id: str) -> list:
-            """Fetch all weapons for a user given their membership_type and membership_id (obtained from get_user_info)."""
-            return partial_get_weapons(membership_type=membership_type, membership_id=membership_id)
-        
-        @function_tool
-        def get_catalysts() -> list:
-            """Fetch all catalyst progress for the user."""
-            return partial_get_catalysts()
-
-        @function_tool
-        def get_pve_bis_weapons_from_sheet() -> list[dict]:
-            """
-            Fetches the list of community-recommended PvE Best-in-Slot (BiS) LEGENDARY weapons for The Final Shape from a general PvE spreadsheet.
-            Use this ONLY for general weapon recommendations by type or slot. Do NOT use this tool if the user mentions 'endgame analysis' or requests a specific sheet from the Endgame Analysis spreadsheet.
-            """
-            return partial_get_pve_weapons()
-            
-        # ---> ADDED: Wrapper for the second sheet tool <---
-        @function_tool
-        def get_pve_activity_bis_weapons_from_sheet() -> list[dict]:
-            """
-            Fetches community weapon recommendations SPECIFICALLY FOR DIFFERENT PVE ACTIVITIES (e.g., raids, dungeons, nightfalls) from a public Google Sheet. Use this to find what weapons are good for a particular activity.
-            """
-            return partial_get_activity_weapons()
-
-        # ---> MODIFIED: Wrapper for the Endgame Analysis tool <---
-        @function_tool
-        def get_endgame_analysis_data(sheet_name: Optional[str] = None) -> list[dict] | str:
-            """
-            Fetches data from the 'Destiny 2: Endgame Analysis' community spreadsheet.
-            Use this tool ONLY if the user mentions 'endgame analysis' or requests a detailed breakdown from that specific spreadsheet.
-            You MUST specify a 'sheet_name' (e.g., 'Archetypes', 'Perks', 'Shotguns', 'Shopping List', 'Auto Rifles').
-            The sheet_name does NOT need to be exact; fuzzy and partial matches are supported (e.g., 'auto rifles', 'autorifle', 'autorifles', etc. will all match the 'Auto Rifles' sheet).
-            If the user does not specify a sheet_name, return a list of available sheets.
-            """
-            return partial_get_endgame_analysis(sheet_name=sheet_name)
-
-        # The agent needs the decorated wrapper functions
-        agent_tools = [
-            get_user_info, 
-            get_weapons, 
-            get_catalysts,
-            get_pve_bis_weapons_from_sheet, 
-            get_pve_activity_bis_weapons_from_sheet, 
-            get_endgame_analysis_data,
-            WebSearchTool()
+        """Creates the agent with all its tools and persona."""
+        logger.debug("Creating agent with tools...")
+        tools = [
+            function_tool(self.get_user_info),
+            function_tool(self.get_weapons),
+            function_tool(self.get_catalysts),
+            function_tool(self.get_pve_bis_weapons_from_sheet),
+            function_tool(self.get_pve_activity_bis_weapons_from_sheet),
+            function_tool(self.get_endgame_analysis_data)
+            # WebSearchTool(enabled=False) # Disabled for now
         ]
-        
-        agent = Agent(
-            name="Destiny2Agent",
-            instructions=(
-                "You are a Destiny 2 assistant. Use the tools to fetch the user's info, weapons, and catalysts as needed. "
-                "You can also consult community-curated spreadsheets for weapon recommendations and analysis: " 
-                "1. Use 'get_pve_bis_weapons_from_sheet' for general PvE LEGENDARY weapon recommendations by type/slot. "
-                "2. Use 'get_pve_activity_bis_weapons_from_sheet' for recommendations specific to PvE ACTIVITIES like raids or dungeons. " 
-                "3. Use 'get_endgame_analysis_data' for detailed information from the 'Endgame Analysis' sheet. **You MUST specify a 'sheet_name' when calling this tool (e.g., 'Archetypes', 'Perks', 'Shotguns', 'Shopping List').** " # Emphasized sheet_name requirement
-                "When using the get_weapons tool, you MUST first use the get_user_info tool to get the required membership_type and membership_id. "
-                "When presenting catalyst information, list completed catalysts separately from incomplete ones. "
-                "For incomplete catalysts, ALWAYS include the specific objective description(s) along with the progress (e.g., 'Targets defeated: 150/500'). Do not just show a percentage."
-                "\n\n**NEW CAPABILITY:** You also have a 'WebSearchTool' available. Use it to find information about current events, topics outside of Destiny 2, or details not covered by the specific Destiny tools or spreadsheets (e.g., recent TWID summaries, external community guides, general knowledge)."
-            ),
-            model="gpt-4.1",
-            tools=agent_tools,
-        )
-        return agent
+        # If a persona is provided, prepend its instructions to the system prompt
+        system_prompt = "You are a helpful Destiny 2 assistant, knowledgeable about game mechanics, weapons, catalysts, and lore. Your goal is to provide accurate and concise information to the player. If you need a user's specific Bungie ID or access token for a tool, and it's not provided in the context, you must call 'get_user_info' first."
+        # The Runner is not passed to Agent constructor. OpenAI client is set globally.
+        return Agent(name="Destiny2Assistant", instructions=system_prompt, tools=tools)
 
-    # --- Run Method (now async) ---
+    # Tool-bound methods - these will call the _impl functions
+    # Make them async if their _impl is async
+
+    # get_user_info can remain sync if _get_user_info_impl is sync
+    def get_user_info(self) -> dict:
+        """Agent Tool: Fetch the user's D2 membership type and ID."""
+        return _get_user_info_impl(self)
+
+    async def get_weapons(self, membership_type: int, membership_id: str) -> list: # BECOMES ASYNC
+        """Agent Tool: Fetch all weapons for a given D2 user."""
+        return await _get_weapons_impl(self, membership_type, membership_id) # Use await
+
+    async def get_catalysts(self) -> list: # BECOMES ASYNC
+        """Agent Tool: Fetch all catalyst progress for the current D2 user."""
+        return await _get_catalysts_impl(self) # Use await
+
+    # Google Sheet tools remain synchronous
+    def get_pve_bis_weapons_from_sheet(self) -> list[dict]:
+        """Agent Tool: Fetches PvE BiS weapons from the community Google Sheet."""
+        return _get_pve_bis_weapons_impl(self)
+
+    def get_pve_activity_bis_weapons_from_sheet(self) -> list[dict]:
+        """Agent Tool: Fetches PvE BiS weapons BY ACTIVITY from the community Google Sheet."""
+        return _get_pve_activity_bis_weapons_impl(self)
     
+    def get_endgame_analysis_data(self, sheet_name: Optional[str] = None) -> list[dict] | str:
+        """Agent Tool: Fetches data from a specified sheet in the Endgame Analysis spreadsheet."""
+        return _get_endgame_analysis_impl(self, sheet_name)
+
     async def run_chat(self, prompt: str, access_token: str, bungie_id: str, history: Optional[List[Dict[str, str]]] = None, persona: Optional[str] = None):
-        """Runs the agent for a single chat turn asynchronously, using conversation history and persona."""
-        if not self.agent:
-             logger.error("Agent is not initialized. Cannot run chat.")
-             return {"error": "Agent service not available"}
-        messages_for_agent = history if history is not None else []
-        if not messages_for_agent or messages_for_agent[-1]["content"] != prompt or messages_for_agent[-1]["role"] != "user":
-             logger.warning("History format mismatch or latest prompt missing from history. Appending prompt.")
-             messages_for_agent.append({"role": "user", "content": prompt})
-        log_prompt_info = f"with history ({len(messages_for_agent)} messages)" if messages_for_agent else f"with prompt: '{prompt[:30]}...'"
-        logger.info(f"Running agent async {log_prompt_info}. Access token set. Bungie ID: {bungie_id}")
+        logger.debug(f"DestinyAgentService run_chat called for bungie_id: {bungie_id}")
+        # Set user context for this run
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
-        # --- Persona logic ---
-        persona_instructions = ""
-        if persona and persona in self.persona_map:
-            persona_instructions = f"\n\n[Persona Mode: {persona}] {self.get_persona_prompt(persona)}\n"
+        
+        # Construct the input list including history and the current user prompt
+        agent_input = history or [] # Start with history or an empty list
+        agent_input.append({"role": "user", "content": prompt}) # Add current user message
+        
         try:
-            # Prepend persona instructions to the agent's system prompt for this run
-            orig_instructions = self.agent.instructions
-            self.agent.instructions = orig_instructions + persona_instructions
-            logger.info(f"Agent persona set to: {persona if persona else 'Default'}")
-            result = await Runner.run(self.agent, messages_for_agent)
-            self.agent.instructions = orig_instructions  # Reset after run
-            logger.info("Agent run completed.")
-            return result 
+            # Execute agent using Runner.run static method, passing the list as input
+            response_obj = await Runner.run(self.agent, agent_input)
+            # Extract the final text output
+            response_text = response_obj.final_output if hasattr(response_obj, 'final_output') else "Error: Could not get final output from agent."
+            return response_text
         except Exception as e:
-            logger.error(f"Error during agent run: {e}", exc_info=True)
-            return {"error": f"An error occurred while processing your request: {e}"} 
+            logger.error(f"Error during agent chat execution: {e}", exc_info=True)
+            return f"An error occurred: {str(e)}"
         finally:
+            # Clear user context after run
             self._current_access_token = None
             self._current_bungie_id = None
-            logger.debug("Agent context (token, user_id) cleared.") 
 
     def get_persona_prompt(self, persona_name: str) -> str:
         base = self.persona_map.get(persona_name, "You are a helpful Destiny 2 assistant.")
         return f"{base}\n\nAlways use relevant Destiny-themed emojis liberally in your responses to add flavor and personality!" # Encourage emoji use 
+
+# Function to get AgentService (dependency for FastAPI)
+# This needs to be updated if AgentService __init__ changes significantly,
+# but since __init__ now takes pre-configured services passed from main.py's startup,
+# this function might just return the global agent_service_instance initialized in main.py.
+# For now, we assume agent_service_instance is correctly populated in main.py's startup.
+
+def get_agent_service() -> DestinyAgentService:
+    from web_app.backend.main import agent_service_instance # Access the global instance from main
+    if agent_service_instance is None:
+        # This should not happen if main.py startup_event completed successfully.
+        logger.error("AgentService not initialized. Check main.py startup_event.")
+        raise Exception("AgentService not available. Initialization failed.")
+    return agent_service_instance 

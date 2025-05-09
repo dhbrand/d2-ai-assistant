@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, Boolean, Float, JSON, ForeignKey, create_engine, DateTime
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
+from sqlalchemy.orm import relationship, sessionmaker, Session
 from typing import List, Optional
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict
@@ -11,6 +11,7 @@ from sqlalchemy import Text, Index
 
 Base = declarative_base()
 
+# --- SQLAlchemy Models --- 
 class User(Base):
     __tablename__ = 'users'
 
@@ -19,7 +20,6 @@ class User(Base):
     access_token = Column(String)
     refresh_token = Column(String)
     access_token_expires = Column(DateTime)
-    token_expiry = Column(Integer)
     catalysts = relationship('Catalyst', back_populates='user')
 
 class Catalyst(Base):
@@ -88,7 +88,7 @@ class Weapon(BaseModel):
     damage_type: Optional[str] = "None"
     perks: List[str] = []
     
-    model_config = ConfigDict(orm_mode=False)
+    model_config = ConfigDict(from_attributes=True)
         
     @classmethod
     def from_dict(cls, raw_data: dict):
@@ -134,11 +134,15 @@ class CallbackData(BaseModel):
     code: str
 
 def init_db(database_url='sqlite:///./catalysts.db'):
+    # global SessionLocal # No longer modifying a global here
     engine = create_engine(database_url, connect_args={"check_same_thread": False})
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    # Create the sessionmaker locally
+    LocalSessionMaker = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    # Create tables defined by SQLAlchemy models (User, Catalyst, etc.)
     Base.metadata.create_all(bind=engine)
-    print(f"Initialized tables for {database_url} (if they didn't exist).")
-    return engine, SessionLocal
+    print(f"Initialized SQLite tables for {database_url} (if they didn't exist).")
+    # Return the engine AND the configured sessionmaker
+    return engine, LocalSessionMaker
 
 CHAT_HISTORY_DATABASE_URL = "sqlite:///./web_app/backend/chat_history.db" # Point inside backend
 

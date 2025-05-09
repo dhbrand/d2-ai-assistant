@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query, Header
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query, Header, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -25,21 +25,12 @@ from jose.exceptions import ExpiredSignatureError
 
 # Use absolute imports
 from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError, TokenData # Import TokenData here
-from web_app.backend.models import ( # Group imports
-    init_db, User, Catalyst, CatalystData, 
-    CatalystObjective, Weapon, UserResponse,
-    CallbackData, # Add CallbackData
-    init_chat_history_db, # <-- Import new init function
-    # Add imports for chat history models and session
-    Conversation, Message, 
-    ConversationSchema, ChatMessageSchema, ConversationCreate, ChatMessageBase,
-    ChatHistorySessionLocal 
-)
+from web_app.backend.models import init_db, User, CatalystData, Weapon, CallbackData, UserResponse, ConversationSchema, ChatMessageSchema
+from sqlalchemy.orm import sessionmaker, Session
 from web_app.backend.catalyst import CatalystAPI
 from web_app.backend.weapon_api import WeaponAPI
-from web_app.backend.manifest import ManifestManager
-from web_app.backend.voice import router as voice_router
 from web_app.backend.agent_service import DestinyAgentService
+from .manifest import SupabaseManifestService # Import the new service
 
 # --- Pydantic Models for Chat (Moved Up) ---
 class ChatMessage(BaseModel):
@@ -87,8 +78,31 @@ if not all([BUNGIE_CLIENT_ID, BUNGIE_CLIENT_SECRET, BUNGIE_API_KEY]):
     # Depending on setup, might want to exit or raise an exception here
     # raise ValueError("Missing Bungie environment variables")
 
+# --- Supabase Client Initialization ---
+# Use environment variables for Supabase credentials
+# These should be set in your .env file
+SUPABASE_URL = os.getenv("SUPABASE_URL") # <-- Use name from .env
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") # <-- Use name from .env
+
+supabase_client: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("Supabase client initialized.")
+
+        # Initialize SupabaseManifestService (depends on supabase_client)
+        supabase_manifest_service = SupabaseManifestService(sb_client=supabase_client)
+        logger.info("SupabaseManifestService initialized.")
+
+    except Exception as e:
+        logger.exception(f"Error initializing Supabase client or SupabaseManifestService: {e}")
+        # supabase_client and supabase_manifest_service will remain None
+else:
+    print("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not found in environment variables.") # Updated log message
+
 # --- Database Setup ---
-engine, SessionLocal = init_db(DATABASE_URL)
+# engine, SessionLocal = init_db(DATABASE_URL) # Commented out if only Supabase is used now
+engine = None # Placeholder if engine is needed elsewhere, otherwise remove.
 
 # --- FastAPI App Instance ---
 app = FastAPI()
@@ -113,62 +127,98 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Initialize Managers ---
-# Note: Creating global instances like this is simple but might not be ideal
-# for scaling or complex dependency management. FastAPI's lifespan events
-# or dependency injection patterns are often preferred.
-logger.info("Initializing ManifestManager...")
-manifest_manager = ManifestManager(api_key=BUNGIE_API_KEY, manifest_dir='./manifest_data')
-logger.info("ManifestManager initialized.")
+# --- Globals / Clients (Should only contain placeholders filled by startup) ---
+# supabase_client is initialized earlier
+# supabase_manifest_service is initialized earlier
+oauth_manager: Optional[OAuthManager] = None
+openai_client = None # Initialized globally earlier, but can be re-confirmed or modified in startup
+agent_service_instance: Optional[DestinyAgentService] = None
+catalyst_api_instance: Optional[CatalystAPI] = None
+weapon_api_instance: Optional[WeaponAPI] = None
+# scheduler = BackgroundScheduler() # Keep scheduler if used
+db_session_local: Optional[sessionmaker[Session]] = None 
+engine: Optional[any] = None # Add placeholder for engine as it's used in startup global
 
-oauth_manager = OAuthManager()
-
-catalyst_api = CatalystAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
-
-logger.info("Initializing WeaponAPI...")
-weapon_api = WeaponAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
-logger.info("WeaponAPI initialized.")
-
-# ---> ADDED: Initialize Agent Service <---
-logger.info("Initializing DestinyAgentService...")
-try:
-    agent_service = DestinyAgentService(
-        bungie_api_key=BUNGIE_API_KEY,
-        openai_api_key=OPENAI_API_KEY,
-        manifest_manager=manifest_manager
-    )
-    logger.info("DestinyAgentService initialized.")
-except ValueError as e:
-    logger.error(f"Failed to initialize DestinyAgentService: {e}")
-    agent_service = None # Set to None if initialization fails
-except Exception as e:
-    logger.error(f"Unexpected error initializing DestinyAgentService: {e}", exc_info=True)
-    agent_service = None
-
-# --- Globals & Setup ---
-
-# --- FastAPI Startup Event ---
+# --- FastAPI Startup Event --- 
 @app.on_event("startup")
 async def startup_event():
     """Run initialization tasks when the application starts."""
     logger.info("Running application startup tasks...")
+    # Declare all globals that are referenced or assigned to within this function
+    global oauth_manager, engine, db_session_local, supabase_manifest_service, openai_client, catalyst_api_instance, weapon_api_instance, agent_service_instance
 
-    # Initialize the Chat History Database
+    # Initialize the old SQLite DB for User/Token storage
     try:
-        logger.info("Initializing chat history database...")
-        init_chat_history_db() # Create chat history tables if they don't exist
-        logger.info("Chat history database initialization complete.")
+        logger.info(f"Initializing SQLite database at {DATABASE_URL}...")
+        # Call init_db, which now returns engine and the configured sessionmaker
+        local_engine, configured_session_local = init_db(DATABASE_URL) 
+        engine = local_engine # Store engine if needed globally
+        db_session_local = configured_session_local # Store the session factory globally
+        logger.info("SQLite database initialization complete (tables checked/created, session factory configured).")
     except Exception as e:
-        logger.error(f"Failed to initialize chat history database during startup: {e}", exc_info=True)
-        # Decide if the app should proceed without chat history db
+        logger.error(f"Failed to initialize SQLite database during startup: {e}", exc_info=True)
+        # App might not function correctly without user DB
 
-    # Optional: Initialize the old catalysts.db if still needed
-    # try:
-    #     logger.info("Initializing main database (catalysts.db)...")
-    #     init_db(DATABASE_URL) 
-    #     logger.info("Main database initialization complete.")
-    # except Exception as e:
-    #     logger.error(f"Failed to initialize main database during startup: {e}", exc_info=True)
+    # Initialize OAuthManager
+    try:
+        oauth_manager = OAuthManager()
+        logger.info("OAuthManager initialized.")
+    except Exception as e:
+        logger.exception(f"Error initializing OAuthManager: {e}")
+        oauth_manager = None
+
+    # Initialize Supabase Client (if not already done - it is done globally but good to have here if it were conditional)
+    # For this structure, the global supabase_client is initialized outside startup.
+    # We just need to ensure supabase_manifest_service is initialized using the global supabase_client.
+    # And that supabase_manifest_service itself is treated as a global being set/confirmed here.
+
+    # The global supabase_client and supabase_manifest_service are initialized above the startup event.
+    # We just need to make sure they are usable here if they were potentially modified.
+    # However, the main issue is catalyst_api_instance and weapon_api_instance not being global.
+
+    # Initialize CatalystAPI and WeaponAPI instances (assign to global vars)
+    # catalyst_api_instance = None # These are now global, initialized to None
+    # weapon_api_instance = None
+
+    # ADD DETAILED LOGGING HERE
+    logger.info(f"[STARTUP_CHECK] oauth_manager type: {type(oauth_manager)}, bool: {bool(oauth_manager)}")
+    logger.info(f"[STARTUP_CHECK] supabase_manifest_service type: {type(supabase_manifest_service)}, bool: {bool(supabase_manifest_service)}")
+
+    if oauth_manager and supabase_manifest_service:
+        try:
+            logger.info("Attempting to initialize CatalystAPI and WeaponAPI...")
+            catalyst_api_instance = CatalystAPI(oauth_manager=oauth_manager, manifest_service=supabase_manifest_service)
+            logger.info("CatalystAPI instance created.")
+            weapon_api_instance = WeaponAPI(oauth_manager=oauth_manager, manifest_service=supabase_manifest_service)
+            logger.info("WeaponAPI instance created.")
+        except Exception as e:
+            logger.exception(f"Error initializing CatalystAPI or WeaponAPI: {e}")
+            # Ensure they are None on failure if they were partially assigned
+            catalyst_api_instance = None
+            weapon_api_instance = None
+    else:
+        logger.error("OAuthManager or SupabaseManifestService not available. Cannot initialize CatalystAPI or WeaponAPI.")
+
+    # Initialize AgentService with the API instances
+    # agent_service_instance is already declared global at the module level and its assignment is handled by the global keyword below
+    if openai_client and catalyst_api_instance and weapon_api_instance:
+        try:
+            logger.info("Attempting to initialize DestinyAgentService...")
+            agent_service_instance = DestinyAgentService(
+                openai_client=openai_client,
+                catalyst_api=catalyst_api_instance,
+                weapon_api=weapon_api_instance
+            )
+            logger.info("DestinyAgentService initialized.")
+        except Exception as e:
+            logger.exception(f"Error initializing DestinyAgentService: {e}")
+            agent_service_instance = None
+    else:
+        missing_deps = []
+        if not openai_client: missing_deps.append("OpenAI Client (global)")
+        if not catalyst_api_instance: missing_deps.append("CatalystAPI (global)")
+        if not weapon_api_instance: missing_deps.append("WeaponAPI (global)")
+        logger.error(f"DestinyAgentService could not be initialized. Missing: {', '.join(missing_deps)}")
 
     logger.info("Application startup tasks finished.")
 
@@ -177,15 +227,19 @@ CACHE_DURATION = timedelta(minutes=5)
 _catalyst_cache: Dict[str, Tuple[datetime, List[CatalystData]]] = {}
 
 WEAPON_CACHE_DURATION = timedelta(minutes=10) # Add weapon cache duration
-_weapon_cache: Dict[str, Tuple[datetime, List[Weapon]]] = {} # Add weapon cache dict
+_weapon_cache: Dict[str, Tuple[datetime, List[Weapon]]] = {}
 
 # In-memory mapping: user_id -> thread_id (for demo; replace with DB for production)
 user_thread_map = defaultdict(str)
 user_thread_lock = threading.Lock()
 
 # --- Dependency Functions ---
-def get_db():
-    db = SessionLocal()
+def get_db_session():
+    global db_session_local # Access the global session factory
+    if db_session_local is None:
+        logger.error("Database session factory (db_session_local) is not configured.")
+        raise HTTPException(status_code=503, detail="Database session not available.")
+    db = db_session_local() # Call the factory to get a session
     try:
         yield db
     finally:
@@ -205,89 +259,43 @@ def get_chat_db():
 # Use the standard scheme but expect the JWT in the Authorization header
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/dummy_token_url") 
 
-
-# async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-# Update function signature to reflect it's getting the JWT
-async def get_current_user_from_token(jwt_token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    """Dependency to get the current user from a JWT, without calling Bungie for validation."""
-    # logger.info("[DEBUG] Entering get_current_user") - Old logging
-    logger.info("[DEBUG] Entering get_current_user_from_token")
-    
+# Dependency for getting the current user from JWT
+async def get_current_user_from_token(jwt_token: str = Depends(oauth2_scheme), db: Session = Depends(get_db_session)) -> User:
+    """Dependency to get the current user from a JWT, fetching user data from DB."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-
-    # 1. Decode and Validate JWT
     try:
-        logger.debug(f"[DEBUG] Decoding JWT: {jwt_token[:10]}...")
         payload = jwt.decode(jwt_token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub") # Get user ID (subject) from JWT payload
-        bungie_id: str = payload.get("bng") # Get Bungie ID from JWT payload
-        
+        user_id: str = payload.get("sub")
+        bungie_id: str = payload.get("bng")
         if user_id is None or bungie_id is None:
-            logger.error("[DEBUG] JWT missing 'sub' or 'bng' claim.", extra={"payload": payload})
+            logger.error("JWT missing 'sub' or 'bng' claim.")
             raise credentials_exception
         
-        logger.debug(f"[DEBUG] JWT decoded successfully. User DB ID: {user_id}, Bungie ID: {bungie_id}")
+        # Fetch user from DB using the injected session `db`
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        if not user:
+             logger.error(f"User with DB ID {user_id} (from JWT) not found in DB.")
+             raise credentials_exception
+        # Optional: Double-check Bungie ID matches
+        if str(user.bungie_id) != bungie_id:
+             logger.error(f"JWT Bungie ID ({bungie_id}) mismatch with DB Bungie ID ({user.bungie_id}) for user DB ID {user_id}")
+             raise credentials_exception
         
-    except JWTError as e:
-        logger.error(f"[DEBUG] JWTError decoding token: {e}", exc_info=True)
+        # TODO: Implement Bungie token refresh logic if needed here or elsewhere
+        # based on user.access_token_expires compared to now.
+        
+        return user
+    except JWTError:
+        logger.error("JWTError decoding token.", exc_info=True)
         raise credentials_exception
-    except Exception as e: # Catch any other decoding errors
-        logger.error(f"[DEBUG] Unexpected error decoding JWT: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Unexpected error in get_current_user_from_token: {e}", exc_info=True)
+        # Don't raise generic 500, stick to 401 for auth failures
         raise credentials_exception
-
-
-    # --- REMOVED BUNGIE VALIDATION CALL ---
-    # # 2. Get Bungie ID (REQUIRED to find user) - NO LONGER NEEDED FOR VALIDATION
-    # try:
-    #     bungie_id = oauth_manager.get_bungie_id(access_token)
-    #     if not bungie_id: # Should not happen if get_bungie_id raises correctly
-    #          logger.error(f"[DEBUG] get_bungie_id failed unexpectedly without exception for token {access_token[:10]}...")
-    #          raise HTTPException(status_code=401, detail="Token validation failed (unexpected)")
-    #     logger.debug(f"[DEBUG] Got bungie_id: {bungie_id}")
-    # 
-    # except requests.exceptions.HTTPError as http_err: # Catch specific HTTP errors from Bungie
-    #     status_code = http_err.response.status_code if http_err.response is not None else 500
-    #     logger.error(f"[DEBUG] HTTP error {status_code} calling get_bungie_id: {http_err}", exc_info=False)
-    #     if 500 <= status_code <= 599: # Check if it's a 5xx server error
-    #          raise HTTPException(status_code=503, detail=f"Bungie API unavailable ({status_code})")
-    #     else: # Assume other errors (4xx) mean the token is invalid
-    #          raise HTTPException(status_code=401, detail=f"Token rejected by Bungie ({status_code})")
-    # 
-    # except Exception as e: # Catch other errors from get_bungie_id
-    #     logger.error(f"[DEBUG] Non-HTTP exception calling get_bungie_id for token {access_token[:10]}... Error: {e}", exc_info=True)
-    #     raise HTTPException(status_code=401, detail=f"Token validation failed: {e}")
-    # --- END REMOVED BUNGIE VALIDATION CALL ---
-        
-        
-    # 2. Find User in Database using ID from JWT
-    user = db.query(User).filter(User.id == int(user_id)).first() # Find by DB primary key
-    if not user:
-        # This implies the user existed when the JWT was issued but is now gone, 
-        # or the JWT is somehow invalid/forged despite passing signature check.
-        logger.error(f"[DEBUG] User with DB ID {user_id} (from JWT) not found in DB.")
-        raise credentials_exception
-        
-    # Optional: Double-check Bungie ID matches just in case
-    if str(user.bungie_id) != bungie_id:
-         logger.error(f"[DEBUG] JWT Bungie ID ({bungie_id}) mismatch with DB Bungie ID ({user.bungie_id}) for user DB ID {user_id}")
-         raise credentials_exception
-
-    logger.debug(f"[DEBUG] Found user in DB with ID: {user.id} using JWT claims.")
-
-    # --- SIMPLIFIED/REMOVED REFRESH LOGIC FOR NOW ---
-    # The JWT validation handles expiry. Refreshing the *Bungie* token 
-    # should ideally happen via a separate refresh endpoint or when a 
-    # downstream Bungie API call fails due to an expired *Bungie* token.
-    # We still return the user object which contains the *currently stored* Bungie tokens.
-    # --- END SIMPLIFIED REFRESH LOGIC ---
-
-    # 3. Return the User object
-    logger.debug(f"[DEBUG] Returning user object for ID: {user.id}")
-    return user
 
 # --- API Endpoints ---
 
@@ -301,7 +309,7 @@ def get_auth_url():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/auth/callback")
-async def handle_auth_callback(callback_data: CallbackData, request: Request, db: Session = Depends(get_db)):
+async def handle_auth_callback(callback_data: CallbackData, request: Request, db: Session = Depends(get_db_session)):
     """Handle the OAuth callback, exchange code for tokens, and store tokens for the user."""
     code = callback_data.code
     logger.info(f"Handling callback for code (start): {code[:5]}...") # Log start
@@ -405,99 +413,17 @@ async def verify_token(current_user: User = Depends(get_current_user_from_token)
     # Keep current_user parameter name for consistency in endpoint signature if desired
     return {"status": "ok", "bungie_id": current_user.bungie_id}
 
-@app.get("/catalysts/all", response_model=List[CatalystData])
-# Update dependency to use the new function name
-async def get_all_catalysts_endpoint(current_user: User = Depends(get_current_user_from_token), db: Session = Depends(get_db), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
-    """Get all catalysts for the authenticated user, using a 5-minute cache."""
-    bungie_id = current_user.bungie_id
-    now = datetime.now(timezone.utc)
-
-    # Check cache
-    if bungie_id in _catalyst_cache:
-        cache_time, cached_data = _catalyst_cache[bungie_id]
-        if now - cache_time < CACHE_DURATION:
-            logger.info(f"Returning cached catalyst data for user {bungie_id}")
-            return cached_data
-        else:
-            logger.info(f"Cache expired for user {bungie_id}")
-
-    logger.info(f"Fetching fresh catalyst data for user {bungie_id}")
-    try:
-        # Ensure access token is valid (refresh if needed)
-        oauth_manager.refresh_if_needed()
-        access_token = oauth_manager.token_data['access_token']
-        if not access_token:
-            logger.error(f"No access token available for user {bungie_id} in get_all_catalysts")
-        catalyst_api_instance = CatalystAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
-        catalysts_data = catalyst_api_instance.get_catalysts(access_token=access_token)
-        logger.info(f"Retrieved {len(catalysts_data)} catalysts from API")
-        processed_catalysts = [CatalystData.model_validate(c) for c in catalysts_data]
-        logger.info(f"Successfully processed {len(processed_catalysts)} catalysts")
-        _catalyst_cache[bungie_id] = (now, processed_catalysts)
-        logger.info(f"Updated cache for user {bungie_id}")
-        return processed_catalysts
-    except Exception as e:
-        logger.error(f"Error fetching catalysts for user {bungie_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to fetch catalyst data: {str(e)}")
-
-@app.get("/weapons/all", response_model=List[Weapon]) # Use Weapon Pydantic model
-# Update dependency to use the new function name
-async def get_all_weapons_endpoint(current_user: User = Depends(get_current_user_from_token), manifest_manager: ManifestManager = Depends(lambda: manifest_manager)):
-    """Endpoint to fetch all weapons for the authenticated user, using a 10-minute cache."""
-    bungie_id = current_user.bungie_id
-    now = datetime.now(timezone.utc)
-
-    # Check cache
-    if bungie_id in _weapon_cache:
-        cache_time, cached_data = _weapon_cache[bungie_id]
-        if now - cache_time < WEAPON_CACHE_DURATION:
-            logger.info(f"Returning cached weapon data for user {bungie_id}")
-            return cached_data
-        else:
-            logger.info(f"Weapon cache expired for user {bungie_id}")
-
-    logger.info(f"Fetching fresh weapon data for user: {bungie_id}")
-    
-    # Ensure we have a valid access token (refreshed by get_current_user if needed)
-    access_token = current_user.access_token 
-    if not access_token:
-        logger.error(f"No valid access token found for user {current_user.bungie_id} after get_current_user")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token")
-
-    try:
-        # Use injected manifest_manager
-        weapon_api_instance = WeaponAPI(api_key=BUNGIE_API_KEY, manifest_manager=manifest_manager)
-        # 1. Get Membership Info
-        logger.info(f"Fetching membership info for user {current_user.bungie_id}")
-        membership_info = weapon_api_instance.get_membership_info(access_token)
-        if not membership_info:
-            logger.error(f"Could not retrieve membership info for user {current_user.bungie_id}")
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Could not find Destiny membership info")
-        
-        membership_type = membership_info['type']
-        membership_id = membership_info['id']
-        logger.info(f"Found membership Type: {membership_type}, ID: {membership_id}")
-
-        # 2. Fetch Weapons using WeaponAPI instance
-        logger.info(f"Calling weapon_api.get_all_weapons for {membership_type}/{membership_id}")
-        weapons = weapon_api_instance.get_all_weapons(
-            access_token=access_token,
-            membership_type=membership_type,
-            destiny_membership_id=membership_id # Correct keyword argument name
-        )
-        logger.info(f"Successfully fetched {len(weapons)} weapons for user {current_user.bungie_id}")
-        
-        # Update cache before returning
-        _weapon_cache[bungie_id] = (now, weapons)
-        logger.info(f"Updated weapon cache for user {bungie_id}")
-        
-        return weapons
-        
-    except HTTPException as http_exc: # Re-raise known HTTP exceptions
-        raise http_exc 
-    except Exception as e:
-        logger.error(f"Unexpected error fetching weapons for user {current_user.bungie_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to fetch weapons data")
+# --- Endpoint commented out - Use agent tools instead ---
+# @app.get("/catalysts/all", response_model=List[CatalystData])
+# async def get_all_catalysts_endpoint(current_user: User = Depends(get_current_user_from_token), db: Session = Depends(get_db_session)):
+#     """(DEPRECATED/NEEDS REFACTOR) Get all catalysts for the authenticated user, using a 5-minute cache."""
+#     # This endpoint needs refactoring to use get_catalyst_api_dependency 
+#     # and potentially remove its own caching logic if agent service handles it.
+#     bungie_id = current_user.bungie_id
+#     now = datetime.now(timezone.utc)
+#     # ... (old caching and API call logic) ...
+#     logger.warning("Accessing deprecated /catalysts/all endpoint.")
+#     raise HTTPException(status_code=501, detail="Endpoint /catalysts/all needs refactoring or removal.")
 
 # --- NEW Chat History Endpoints ---
 
@@ -661,7 +587,7 @@ async def assistants_chat_endpoint(
     """
     Chat endpoint using the agent service, handling conversation history.
     """
-    if not agent_service:
+    if not agent_service_instance:
         logger.error("Chat request failed: DestinyAgentService not available.")
         raise HTTPException(status_code=503, detail="Chat service is currently unavailable.")
         
@@ -741,39 +667,37 @@ async def assistants_chat_endpoint(
     
     logger.info(f"Passing chat request to agent service for user {bungie_id}, conversation {conversation_id}")
     
-    # --- Call Agent Service (Modify agent_service later to accept history) ---
-    # Call the updated run_chat method with history
-    run_result = await agent_service.run_chat(
-        prompt=user_message_content, # Pass the latest user message as prompt
+    run_result = await agent_service_instance.run_chat(
+        prompt=user_message_content,
         access_token=access_token, 
         bungie_id=str(bungie_id),
         history=conversation_history # Pass the constructed history
     )
     
-    # --- Process Agent Response ---
-    if isinstance(run_result, dict) and 'error' in run_result:
-        logger.error(f"Agent service returned error for conv {conversation_id}: {run_result['error']}")
-        # Don't commit the user message if agent failed? Or commit anyway?
-        # Let's commit the user message but not the failed assistant response.
+    agent_response_content = ""
+    # Check the type of the result from run_chat
+    if isinstance(run_result, str):
+        # Successfully received a string response
+        agent_response_content = run_result
+    elif isinstance(run_result, dict) and 'error' in run_result:
+        # Handle potential error dict returned (though run_chat should raise exceptions now)
+        logger.error(f"Agent service returned error dict for conv {conversation_id}: {run_result['error']}")
         try:
-             current_conversation.updated_at = datetime.now(timezone.utc) # Update timestamp even on error
-             chat_db.commit()
-        except Exception as commit_err:
-             logger.error(f"Error committing user message after agent error for conv {conversation_id}: {commit_err}", exc_info=True)
-             chat_db.rollback()
+            sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
+                .eq("id", str(conversation_id)).execute()
+        except Exception as ts_update_err:
+            logger.error(f"Error updating conversation timestamp after agent error dict for conv {conversation_id}: {ts_update_err}")
         raise HTTPException(status_code=500, detail=run_result['error'])
-    
-    elif hasattr(run_result, 'final_output'): 
-        agent_response_content = run_result.final_output
     else:
-        logger.warning(f"Unexpected result type from agent service for conv {conversation_id}: {type(run_result)}")
+        # Log unexpected types, but raise a generic error
+        logger.warning(f"Unexpected result type from agent service for conv {conversation_id}: {type(run_result)}. Result: {run_result}")
         try:
-             current_conversation.updated_at = datetime.now(timezone.utc)
-             chat_db.commit()
-        except Exception as commit_err:
-             logger.error(f"Error committing user message after unexpected agent result for conv {conversation_id}: {commit_err}", exc_info=True)
-             chat_db.rollback()
-        raise HTTPException(status_code=500, detail="Received unexpected response from agent service.")
+            sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
+                .eq("id", str(conversation_id)).execute()
+        except Exception as ts_update_err:
+            logger.error(f"Error updating conversation timestamp after unexpected agent result for conv {conversation_id}: {ts_update_err}")
+        # Use a more specific error message for the frontend
+        raise HTTPException(status_code=500, detail="Agent service generated a response, but its format was unexpected.")
 
     # --- Save Assistant Message ---
     assistant_db_message = Message(
@@ -852,15 +776,8 @@ else:
 def shutdown_event():
     logger.info("Application shutting down...")
     # Add any cleanup logic here if needed
-    # manifest_manager.close_db() # Example if manifest manager held a DB connection
+    # supabase_manifest_service.close_db() # Example if supabase_manifest_service held a DB connection
     logger.info("Shutdown complete.")
-
-app.include_router(voice_router)
-
-# Add a root endpoint for basic check
-@app.get("/")
-def read_root():
-    return {"message": "Destiny 2 Assistant Backend is running."}
 
 # --- NEW: Delete Conversation Endpoint ---
 @app.delete("/api/conversations/{conversation_id}")
@@ -923,7 +840,7 @@ async def rename_conversation(
     return {"status": "renamed", "title": req.title}
 
 @app.post("/auth/refresh")
-def refresh_jwt_token(Authorization: str = Header(None), db: Session = Depends(get_db)):
+def refresh_jwt_token(Authorization: str = Header(None), db: Session = Depends(get_db_session)):
     """
     Issue a new JWT if the backend has a valid Bungie refresh token for the user.
     The frontend should call this if it gets a 401 due to JWT expiry.
@@ -994,6 +911,38 @@ def refresh_jwt_token(Authorization: str = Header(None), db: Session = Depends(g
     except Exception as e:
         logger.error(f"Unexpected error in /auth/refresh: {e}")
         raise credentials_exception
+
+# --- NEW: Supabase Manifest Service ---
+def get_supabase_manifest_service() -> SupabaseManifestService:
+    """Dependency to get the Supabase manifest service."""
+    global supabase_manifest_service # Ensure we're accessing the global
+    if supabase_manifest_service is None:
+        logger.error("Supabase Manifest Service accessed before initialization or initialization failed.") # Added logger
+        raise HTTPException(status_code=500, detail="Supabase Manifest Service not initialized")
+    return supabase_manifest_service
+
+async def get_openai_client_dependency(): # Renamed to avoid conflict
+    # ... existing code ...
+    if openai_client is None: raise HTTPException(status_code=500, detail="OpenAI client not available")
+    return openai_client
+
+# START NEW DEPENDENCIES
+async def get_catalyst_api_dependency() -> CatalystAPI:
+    """Dependency to get an instance of CatalystAPI using global services."""
+    global catalyst_api_instance # Access the globally initialized instance
+    if catalyst_api_instance is None:
+        logger.error("CatalystAPI instance not initialized during startup.")
+        raise HTTPException(status_code=503, detail="Catalyst API service not available.")
+    return catalyst_api_instance
+
+async def get_weapon_api_dependency() -> WeaponAPI:
+    """Dependency to get an instance of WeaponAPI using global services."""
+    global weapon_api_instance # Access the globally initialized instance
+    if weapon_api_instance is None:
+        logger.error("WeaponAPI instance not initialized during startup.")
+        raise HTTPException(status_code=503, detail="Weapon API service not available.")
+    return weapon_api_instance
+# END NEW DEPENDENCIES
 
 if __name__ == "__main__":
     import uvicorn

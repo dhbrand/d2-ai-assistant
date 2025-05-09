@@ -10,6 +10,7 @@ from threading import Event
 from .catalyst_hashes import CATALYST_RECORD_HASHES
 import hashlib
 import pathlib
+from .manifest import SupabaseManifestService
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -27,14 +28,14 @@ class DestinyRecordState:
     CAN_EQUIP_TITLE = 64
 
 class CatalystAPI:
-    def __init__(self, api_key: str, manifest_manager):
-        """Initialize the Catalyst API"""
+    def __init__(self, oauth_manager, manifest_service: SupabaseManifestService):
+        """Initialize the Catalyst API with OAuthManager and SupabaseManifestService."""
         self.base_url = "https://www.bungie.net/Platform"
-        self.api_key = api_key
+        self.oauth_manager = oauth_manager
         self.session = self._create_session()
         self.cancel_event = Event()  # For cancelling operations
         self.discovery_mode = False  # Default to standard mode (known catalysts only)
-        self.manifest_manager = manifest_manager
+        self.manifest_service = manifest_service
         
     def _create_session(self) -> requests.Session:
         """Create a requests session with retry logic"""
@@ -55,10 +56,10 @@ class CatalystAPI:
             raise ValueError("Access token is required for authenticated headers")
         return {
             "Authorization": f"Bearer {access_token}",
-            "X-API-Key": self.api_key
+            "X-API-Key": self.oauth_manager.api_key
         }
         
-    def get_membership_info(self, access_token: str) -> Optional[Dict[str, str]]:
+    async def get_membership_info(self, access_token: str) -> Optional[Dict[str, str]]:
         """Get the current user's membership info"""
         if self.cancel_event.is_set():
             return None
@@ -87,7 +88,7 @@ class CatalystAPI:
             logger.error(f"Error getting membership info: {e}")
             return None
             
-    def get_profile(self, access_token: str, membership_type: int, membership_id: str) -> Optional[Dict]:
+    async def get_profile(self, access_token: str, membership_type: int, membership_id: str) -> Optional[Dict]:
         """Get the user's profile with records"""
         if self.cancel_event.is_set():
             return None
@@ -131,36 +132,31 @@ class CatalystAPI:
             logger.error(f"Error getting profile: {e}")
             return None
             
-    def get_definition(self, table: str, hash_id: int) -> Optional[Dict]:
-        """Get a definition from the Destiny 2 manifest (local only)"""
+    async def get_definition(self, table: str, hash_id: int) -> Optional[Dict]:
+        """Get a definition from Supabase Manifest Service."""
         if self.cancel_event.is_set():
             return None
-        return self.manifest_manager.get_definition(table, hash_id)
+        return await self.manifest_service.get_definition(table, hash_id)
         
-    def _prefetch_definitions(self, profile_records: Dict) -> None:
+    async def _prefetch_definitions(self, profile_records: Dict) -> None:
         """Pre-fetch all needed definitions"""
         logger.info("Pre-fetching definitions...")
         start_time = time.time()
-        
-        # First, get all record definitions
-        for record_hash in CATALYST_RECORD_HASHES:
-            if self.cancel_event.is_set():
-                return
-                
-            if str(record_hash) in profile_records:
-                self.get_definition('DestinyRecordDefinition', record_hash)
-                
-        # Then get objective definitions
-        for record_hash in CATALYST_RECORD_HASHES:
-            if self.cancel_event.is_set():
-                return
-                
-            record = profile_records.get(str(record_hash))
-            if record:
-                for obj in record.get('objectives', []):
-                    if obj_hash := obj.get('objectiveHash'):
-                        self.get_definition('DestinyObjectiveDefinition', obj_hash)
-                        
+        for record_hash_str in profile_records.keys():
+            if self.cancel_event.is_set(): return
+            try:
+                record_hash = int(record_hash_str)
+                if self.discovery_mode or record_hash in CATALYST_RECORD_HASHES:
+                    await self.get_definition('destinyrecorddefinition', record_hash)
+                    record_data = profile_records.get(str(record_hash))
+                    if record_data:
+                        for obj in record_data.get('objectives', []):
+                            if self.cancel_event.is_set(): return
+                            if obj_hash := obj.get('objectiveHash'):
+                                await self.get_definition('destinyobjectivedefinition', obj_hash)
+            except ValueError:
+                logger.debug(f"Skipping non-integer record key: {record_hash_str} during prefetch.")
+                continue
         elapsed = time.time() - start_time
         logger.info(f"Pre-fetched definitions in {elapsed:.1f} seconds")
         
@@ -183,13 +179,13 @@ class CatalystAPI:
             'visible': not is_invisible
         }
         
-    def _get_catalyst_info(self, record_hash, record):
+    async def _get_catalyst_info(self, record_hash, record):
         """Get detailed information about a catalyst record using DIM's approach."""
         if self.cancel_event.is_set():
             return None
         
         try:
-            record_def = self.get_definition('DestinyRecordDefinition', record_hash)
+            record_def = await self.get_definition('destinyrecorddefinition', record_hash)
             if not record_def:
                 logger.debug(f"No record definition found for hash {record_hash}")
                 return None
@@ -236,7 +232,7 @@ class CatalystAPI:
                     return None
                 
                 obj_hash = obj.get('objectiveHash')
-                obj_def = self.get_definition('DestinyObjectiveDefinition', obj_hash)
+                obj_def = await self.get_definition('destinyobjectivedefinition', obj_hash)
                 if obj_def:
                     progress = obj.get('progress', 0)
                     completion = obj.get('completionValue', 100)
@@ -300,93 +296,134 @@ class CatalystAPI:
                 'progress': overall_progress
             }
         except Exception as e:
-            logger.error(f"Error getting catalyst info for record {record_hash}: {e}")
+            logger.error(f"Error getting catalyst info for record {record_hash}: {e}", exc_info=True)
             return None
     
     def _is_catalyst_by_content(self, record_def):
         """Check if a record is a catalyst based on its content not just name"""
-        try:
-            # Skip category records (these often have "Exotic Weapons" in description)
-            if record_def.get('recordValueStyle', 0) == 1:  # This indicates a category/parent record
-                return False
-
-            # Skip parent records that contain many children
-            if 'parentNodeHashes' in record_def or 'children' in record_def:
-                children_count = len(record_def.get('children', {}).get('records', []))
-                if children_count > 3:  # If it has multiple children, it's likely a category
-                    return False
-
-            # Check for actual catalyst evidence in description
-            description = record_def.get('displayProperties', {}).get('description', '').lower()
+        if not record_def: return False
+        name = record_def.get('displayProperties', {}).get('name', '').lower()
+        if 'catalyst' in name: return True
+        # Add more checks based on record_def content if needed
+        # e.g., lore hash, specific objective types, etc.
+        return False
             
-            # Look for specific catalyst phrases (more precise than general terms)
-            catalyst_phrases = [
-                'weapon catalyst', 
-                'catalyst for', 
-                'masterwork the', 
-                'exotic catalyst', 
-                'catalyst objectives'
-            ]
-            
-            if any(phrase in description for phrase in catalyst_phrases):
-                return True
+    async def get_catalyst_status_for_db(self, access_token: str) -> Dict[int, Dict]:
+        """
+        Fetches catalyst status directly from profile records suitable for DB storage.
+        Returns a dictionary mapping catalyst recordHash to its status.
+        { recordHash: { "is_complete": bool, "objectives": { objectiveHash: progress, ... } } }
+        """
+        logger.info("Fetching catalyst status for database storage...")
+        status_map = {}
+
+        membership_info = await self.get_membership_info(access_token)
+        if not membership_info:
+            logger.error("Failed to get membership info for DB catalyst sync.")
+            return status_map
+
+        profile_data = await self.get_profile(access_token, membership_info['type'], membership_info['id'])
+        if not profile_data or 'profileRecords' not in profile_data.get('Response', {}):
+            logger.error("Failed to get profile records for DB catalyst sync.")
+            return status_map
+
+        profile_records_data = profile_data['Response']['profileRecords']['data']['records']
+        
+        for record_hash_str, record_data in profile_records_data.items():
+            if self.cancel_event.is_set(): break
+            try:
+                record_hash = int(record_hash_str)
+                is_known_catalyst = record_hash in CATALYST_RECORD_HASHES
                 
-            # Check objectives descriptions for catalyst-specific language
-            if 'objectiveHashes' in record_def:
-                for obj_hash in record_def['objectiveHashes']:
-                    obj_def = self.get_definition('DestinyObjectiveDefinition', obj_hash)
-                    if obj_def:
-                        desc = obj_def.get('progressDescription', '').lower()
-                        if any(phrase in desc for phrase in ['catalyst', 'masterwork']):
-                            if 'defeat' in desc or 'kills' in desc or 'precision' in desc:
-                                return True  # Common catalyst objectives involve defeating enemies
-            
-            return False
-        except Exception as e:
-            logger.error(f"Error in _is_catalyst_by_content: {e}")
-            return False
-            
-    def get_catalysts(self, access_token: str) -> List[Dict]:
-        """Get all known catalyst records for the user."""
-        logger.info("Starting catalyst fetch process...")
-        start_total = time.time()
-        
+                record_def_for_check = await self.get_definition('destinyrecorddefinition', record_hash)
+                if not record_def_for_check:
+                    continue
+
+                is_catalyst_by_name = 'catalyst' in record_def_for_check.get('displayProperties', {}).get('name', '').lower()
+
+                if not (is_known_catalyst or is_catalyst_by_name):
+                    continue
+
+                state_info = self._get_record_state(record_data)
+                objectives_for_db = {}
+                for obj_data in record_data.get('objectives', []):
+                    obj_hash = obj_data.get('objectiveHash')
+                    if obj_hash:
+                        objectives_for_db[obj_hash] = obj_data.get('progress', 0)
+                
+                status_map[record_hash] = {
+                    "is_complete": state_info['complete'],
+                    "objectives": objectives_for_db
+                }
+            except ValueError:
+                logger.debug(f"Skipping non-integer record key {record_hash_str} in get_catalyst_status_for_db")
+                continue
+            except Exception as e:
+                logger.error(f"Error processing record {record_hash_str} for DB status: {e}", exc_info=True)
+
+        logger.info(f"Prepared catalyst status for DB: {len(status_map)} items.")
+        return status_map
+
+    async def get_catalysts(self, access_token: str) -> List[Dict]:
+        """Get all catalyst information for the user."""
         if self.cancel_event.is_set():
             return []
-
-        # 1. Get Membership Info
+            
+        logger.info("Starting catalyst retrieval process...")
         start_time = time.time()
-        membership = self.get_membership_info(access_token)
-        if not membership:
-            logger.error("Failed to get membership info.")
-            return []
-        elapsed = time.time() - start_time
-        logger.info(f"Got membership in {elapsed:.1f} seconds")
         
-        if self.cancel_event.is_set():
+        membership_info = await self.get_membership_info(access_token)
+        if not membership_info:
             return []
-
-        # 2. Get Profile Data
-        start_time = time.time()
-        profile_data = self.get_profile(access_token, membership['type'], membership['id'])
-        if not profile_data:
-            logger.error("Failed to get profile data.")
+            
+        profile_data = await self.get_profile(access_token, membership_info['type'], membership_info['id'])
+        if not profile_data or 'profileRecords' not in profile_data.get('Response', {}):
+            logger.error("Profile records not found in API response.")
             return []
-        elapsed = time.time() - start_time
-        logger.info(f"Got profile in {elapsed:.1f} seconds")
-
-        profile_records = profile_data.get('Response', {}).get('profileRecords', {}).get('data', {}).get('records', {})
-        self._prefetch_definitions(profile_records)
-
+            
+        records = profile_data['Response']['profileRecords']['data']['records']
+        logger.info(f"Retrieved {len(records)} records from profile.")
+        
+        await self._prefetch_definitions(records)
+        
         catalysts = []
-        for record_hash in CATALYST_RECORD_HASHES:
-            if self.cancel_event.is_set():
-                return []
+        processed_hashes = set()
+        
+        if not self.discovery_mode:
+            logger.info(f"Standard mode: Processing {len(CATALYST_RECORD_HASHES)} known catalyst hashes.")
+            for record_hash in CATALYST_RECORD_HASHES:
+                if self.cancel_event.is_set(): break
+                record = records.get(str(record_hash))
+                if record:
+                    info = await self._get_catalyst_info(record_hash, record)
+                    if info:
+                        catalysts.append(info)
+                    processed_hashes.add(record_hash)
+                else:
+                    logger.debug(f"Known catalyst hash {record_hash} not found in user's profile records.")
+        
+        logger.info(f"Processing all {len(records)} profile records (Discovery: {self.discovery_mode}).")
+        for record_hash_str, record in records.items():
+            if self.cancel_event.is_set(): break
+            try:
+                record_hash = int(record_hash_str)
+                if record_hash in processed_hashes:
+                    continue
+                
+                info = await self._get_catalyst_info(record_hash, record)
+                if info:
+                    catalysts.append(info)
+                    processed_hashes.add(record_hash)
+            except ValueError:
+                logger.debug(f"Skipping non-integer record key: {record_hash_str}")
+                continue
+            except Exception as e:
+                logger.error(f"Error processing record {record_hash_str} in get_catalysts: {e}", exc_info=True)
 
-            record = profile_records.get(str(record_hash))
-            if record:
-                catalyst_info = self._get_catalyst_info(record_hash, record)
-                if catalyst_info:
-                    catalysts.append(catalyst_info)
-
-        return catalysts 
+        elapsed = time.time() - start_time
+        logger.info(f"Retrieved {len(catalysts)} catalysts in {elapsed:.1f} seconds")
+        return catalysts
+        
+    def cancel_operations(self):
+        """Signal any ongoing operations to cancel."""
+        self.cancel_event.set() 

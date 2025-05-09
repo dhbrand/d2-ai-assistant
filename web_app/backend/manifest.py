@@ -4,19 +4,72 @@ import os
 import json
 import zipfile
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from supabase import Client as SupabaseClient # Import Supabase client
 
 logger = logging.getLogger(__name__)
 
+# New service for fetching definitions from Supabase
+class SupabaseManifestService:
+    """Provides access to Destiny 2 Manifest definitions stored in Supabase."""
+    def __init__(self, sb_client: SupabaseClient):
+        self.sb_client = sb_client
+
+    async def get_definition(self, table_name: str, definition_hash: int) -> Optional[Dict[str, Any]]:
+        """Fetches a specific definition from a Supabase manifest table by its hash.
+
+        Args:
+            table_name: The lowercase name of the Supabase table (e.g., 'destinyinventoryitemdefinition').
+            definition_hash: The integer hash identifier (unsigned).
+
+        Returns:
+            A dictionary representing the definition JSON from the 'json_data' column,
+            or None if not found or an error occurs.
+        """
+        if not self.sb_client:
+            logger.error(f"Supabase client not available for fetching definition {definition_hash} from {table_name}.")
+            return None
+        
+        try:
+            # Ensure table name is lowercase as per our Supabase schema
+            query_table_name = table_name.lower()
+            
+            logger.debug(f"Fetching definition for hash {definition_hash} from Supabase table {query_table_name}...")
+            response = await self.sb_client.table(query_table_name)\
+                .select("json_data")\
+                .eq("hash", definition_hash)\
+                .maybe_single()\
+                .execute()
+
+            if response.data:
+                # The json_data column should already be a dict/JSON object
+                return response.data.get('json_data')
+            else:
+                # logger.debug(f"Definition not found for hash {definition_hash} in Supabase table {query_table_name}.")
+                return None
+        except Exception as e:
+            logger.error(f"Error fetching definition {definition_hash} from Supabase table {table_name}: {e}", exc_info=True)
+            return None
+
 class ManifestManager:
-    """Manages downloading and accessing the Destiny 2 Manifest database."""
+    """Manages downloading, extracting, and accessing the Destiny 2 Manifest SQLite database.
+    This class is primarily intended for use by scripts that populate other data stores (e.g., Supabase)
+    with manifest data. For application runtime, use SupabaseManifestService to query definitions.
+    """
 
     def __init__(self, api_key: str, manifest_dir: str = './manifest_data'):
+        """Initializes ManifestManager for SQLite operations.
+        
+        Args:
+            api_key: Bungie API key for fetching manifest metadata.
+            manifest_dir: Directory to store manifest files (zip, SQLite DB, version.txt).
+        """
         self.api_key = api_key
         self.manifest_dir = manifest_dir
         self.db_path: Optional[str] = None
         self.conn: Optional[sqlite3.Connection] = None
-        self._ensure_manifest_updated()
+        # This initialization path is for scripts like populate_manifest_supabase.py
+        self._ensure_manifest_updated() 
 
     def _get_manifest_metadata(self) -> Optional[Dict[str, Any]]:
         """Fetches the manifest metadata from the Bungie API."""
@@ -207,6 +260,56 @@ class ManifestManager:
             return None
         finally:
             cursor.close()
+            
+    def get_all_definitions_for_table(self, table_name: str) -> List[Dict[str, Any]]:
+        """Fetches all definitions from a specific manifest table.
+
+        Args:
+            table_name: The name of the definition table (e.g., 'DestinyInventoryItemDefinition').
+
+        Returns:
+            A list of dictionaries, where each dictionary represents a definition JSON,
+            or an empty list if the table doesn't exist or an error occurs.
+        """
+        definitions = []
+        if not self.conn:
+            logger.error(f"Manifest database connection is not available for fetching all from {table_name}.")
+            return definitions
+
+        logger.info(f"Fetching all definitions from table: {table_name}...")
+        cursor = self.conn.cursor()
+        try:
+            # Ensure table name is safe if coming from external sources (it's internal here)
+            cursor.execute(f"SELECT id, json FROM {table_name}")
+            rows = cursor.fetchall()
+            logger.info(f"Retrieved {len(rows)} rows from {table_name}.")
+            
+            for row in rows:
+                try:
+                    json_str = row['json']
+                    if isinstance(json_str, bytes):
+                        json_str = json_str.decode('utf-8')
+                    # We need both the hash (original, unsigned) and the JSON data
+                    original_hash = row['id']
+                    if original_hash < 0: # Convert signed negative back to unsigned
+                        original_hash += 2**32
+                        
+                    definitions.append({
+                        "hash": original_hash, 
+                        "json_data": json.loads(json_str)
+                    })
+                except json.JSONDecodeError as json_e:
+                    logger.error(f"Error decoding JSON for row with id {row['id']} in {table_name}: {json_e}")
+                except Exception as inner_e:
+                     logger.error(f"Error processing row with id {row['id']} in {table_name}: {inner_e}")
+                     
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error fetching all definitions from {table_name}: {e}", exc_info=True)
+        finally:
+            cursor.close()
+            
+        logger.info(f"Finished fetching. Returning {len(definitions)} definitions from {table_name}.")
+        return definitions
             
     def close(self):
         """Closes the database connection."""
