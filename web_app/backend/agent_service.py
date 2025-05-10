@@ -10,7 +10,7 @@ import functools # Import functools
 import asyncio # Import asyncio
 from datetime import datetime, timedelta, timezone # Import datetime components
 import pandas as pd # <--- Import pandas
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 import requests
 import xml.etree.ElementTree as ET
 from google.oauth2.service_account import Credentials
@@ -158,21 +158,30 @@ async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
             
             if all_cache_fresh:
                 logger.info(f"Supabase catalyst cache is FRESH for user {bungie_id}. Reconstructing CatalystData.")
+                
+                # --- Step 1: Collect all record hashes ---
+                all_record_hashes = list(set(item['catalyst_record_hash'] for item in supabase_response.data if 'catalyst_record_hash' in item))
+                record_definitions_map: Dict[int, Dict[str, Any]] = {}
+
+                # --- Step 2: Batch fetch all record definitions ---
+                if all_record_hashes:
+                    logger.info(f"Batch fetching {len(all_record_hashes)} DestinyRecordDefinition for cached catalysts.")
+                    record_definitions_map = await service.manifest_service.get_definitions_batch(
+                        "DestinyRecordDefinition", 
+                        all_record_hashes
+                    )
+                    logger.info(f"Successfully fetched {len(record_definitions_map)} record definitions for cached catalysts.")
+                else:
+                    logger.info("No record hashes found in cached catalyst data to fetch definitions for.")
+
+                # --- Step 3: Process cached items using the fetched definitions ---
                 for cached_item_dict in supabase_response.data:
                     record_hash = cached_item_dict["catalyst_record_hash"]
-                    # Fetch static details from manifest using CatalystAPI's helper (which uses SupabaseManifestService)
-                    # This assumes CatalystAPI provides a way to get these, or we directly use manifest service.
-                    # For CatalystData, we need: name, description, weapon_type.
-                    # The CatalystAPI._get_catalyst_info method does this assembly.
-                    # However, _get_catalyst_info itself takes a 'record' object from profile, not just a hash.
-                    # We need a way to get CatalystData-like structure from record_hash + cached progress.
+                    
+                    record_def = record_definitions_map.get(record_hash) # Get from pre-fetched map
 
-                    # Simplified: For now, let's assume CatalystAPI can construct full CatalystData from record_hash and objectives.
-                    # This might require a new helper in CatalystAPI or direct use of SupabaseManifestService here.
-                    # Let's fetch the raw definition first.
-                    record_def = await service.catalyst_api.get_definition("destinyrecorddefinition", record_hash)
                     if not record_def:
-                        logger.warning(f"Could not find record definition for {record_hash} when reconstructing from cache.")
+                        logger.warning(f"Could not find pre-fetched record definition for {record_hash} when reconstructing from cache.")
                         continue
                     
                     display_props = record_def.get('displayProperties', {})

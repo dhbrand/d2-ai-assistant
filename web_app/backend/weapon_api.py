@@ -75,25 +75,71 @@ class WeaponAPI:
             logger.error(f"Error processing membership info: {e}", exc_info=True)
             return None
 
-    async def get_all_weapons(self, membership_type: int, destiny_membership_id: str) -> List[Weapon]: # Remove access_token param
+    async def get_all_weapons(self, membership_type: int, destiny_membership_id: str) -> List[Weapon]:
         logger.info(f"Fetching all weapons for user {destiny_membership_id}")
         start_time = time.time()
         try:
-            # Call updated _get_profile_components without access_token
             profile_components_data = self._get_profile_components(
-                membership_type, destiny_membership_id, [102, 201, 205, 305]
+                membership_type, destiny_membership_id, [102, 201, 205, 300, 305] # Added 300 for item plug states (sockets)
             )
-            if not profile_components_data:
-                logger.error("Failed to get profile components data")
+            if not profile_components_data or "Response" not in profile_components_data:
+                logger.error("Failed to get profile components data or Response key missing")
                 return []
-            item_sockets_data = profile_components_data.get("Response", {}).get("itemComponents", {}).get("sockets", {}).get("data", {})
+
+            response_data = profile_components_data["Response"]
+            item_sockets_data = response_data.get("itemComponents", {}).get("sockets", {}).get("data", {})
+            # For itemPlugObjectives component 300
+            plug_objectives_data = response_data.get("itemComponents", {}).get("plugObjectives", {}).get("data", {})
+
+            all_item_hashes = set()
+            all_plug_hashes = set()
+
+            # --- Step 1: Collect all item and plug hashes ---
+            inventories_to_scan = []
+            if response_data.get("characterInventories", {}).get("data"):
+                for char_inv in response_data["characterInventories"]["data"].values():
+                    inventories_to_scan.extend(char_inv.get("items", []))
+            if response_data.get("characterEquipment", {}).get("data"):
+                for char_equip in response_data["characterEquipment"]["data"].values():
+                    inventories_to_scan.extend(char_equip.get("items", []))
+            if response_data.get("profileInventory", {}).get("data"):
+                inventories_to_scan.extend(response_data["profileInventory"]["data"].get("items", []))
+
+            for item_data in inventories_to_scan:
+                if "itemHash" in item_data:
+                    all_item_hashes.add(item_data["itemHash"])
+                    item_instance_id = item_data.get("itemInstanceId")
+                    if item_instance_id and item_instance_id in item_sockets_data:
+                        sockets = item_sockets_data[item_instance_id].get("sockets", [])
+                        for socket in sockets:
+                            if socket.get("plugHash"):
+                                all_plug_hashes.add(socket["plugHash"])
+            
+            # Combine all hashes that need to be looked up in DestinyInventoryItemDefinition
+            all_definition_hashes = list(all_item_hashes.union(all_plug_hashes))
+
+            # --- Step 2: Batch fetch all definitions ---
+            all_definitions_map: Dict[int, Dict[str, Any]] = {}
+            if all_definition_hashes:
+                logger.info(f"Batch fetching {len(all_definition_hashes)} item/plug definitions.")
+                all_definitions_map = await self.manifest_service.get_definitions_batch(
+                    "destinyinventoryitemdefinition", 
+                    all_definition_hashes
+                )
+                logger.info(f"Successfully fetched {len(all_definitions_map)} definitions.")
+            else:
+                logger.info("No item or plug hashes found to fetch definitions for.")
+                return [] # Or handle as appropriate if no items means no weapons
+
             weapons = []
 
-            async def process_item(item: Dict[str, Any], location_prefix: str) -> Optional[Weapon]: # BECOMES ASYNC
-                if "itemHash" not in item: return None
-                item_hash = item["itemHash"]
-                item_instance_id = item.get("itemInstanceId")
-                item_def = await self.manifest_service.get_definition("destinyinventoryitemdefinition", item_hash) # Use await
+            # --- Step 3: Define synchronous process_item helper ---
+            def process_item_sync(item_data: Dict[str, Any], location_prefix: str, definitions_cache: Dict[int, Dict[str, Any]]) -> Optional[Weapon]:
+                if "itemHash" not in item_data: return None
+                item_hash = item_data["itemHash"]
+                item_instance_id = item_data.get("itemInstanceId")
+                
+                item_def = definitions_cache.get(item_hash)
                 if not item_def or item_def.get('itemType') != ITEM_TYPE_WEAPON: return None
                 
                 display_props = item_def.get('displayProperties', {})
@@ -101,7 +147,7 @@ class WeaponAPI:
                 description = display_props.get('description', '')
                 icon_url = "https://www.bungie.net" + display_props.get('icon', '') if display_props.get('icon') else ''
                 tier_type = item_def.get('inventory', {}).get('tierTypeName', 'Unknown')
-                item_type_display = item_def.get('itemTypeDisplayName', 'Unknown Weapon Type') # Renamed to avoid conflict with item_type model field
+                item_type_display = item_def.get('itemTypeDisplayName', 'Unknown Weapon Type')
                 item_sub_type = item_def.get('itemSubTypeDisplayName', '')
                 damage_type_int = item_def.get("defaultDamageType", 0)
                 damage_type_str = DAMAGE_TYPE_MAP.get(damage_type_int, "Unknown")
@@ -112,51 +158,53 @@ class WeaponAPI:
                     for socket in sockets:
                         plug_hash = socket.get("plugHash")
                         if plug_hash and socket.get("isEnabled", True):
-                            plug_def = await self.manifest_service.get_definition("destinyinventoryitemdefinition", plug_hash) # Use await
+                            plug_def = definitions_cache.get(plug_hash)
                             if plug_def:
                                 plug_category_id = plug_def.get("plug", {}).get("plugCategoryIdentifier", "")
                                 plug_display_name = plug_def.get("displayProperties", {}).get("name", "")
                                 wanted_categories = ["intrinsics", "barrels", "tubes", "magazines", "batteries", "magazines_gl", "arrows", "stocks", "grips", "guards", "blades", "origins", "frames"]
                                 excluded_substrings = ["shader", "masterworks", "tracker", "memento", "crafting", "empty", "default", "v400.weapon.mod"]
-                                is_wanted = plug_category_id in wanted_categories
+                                
+                                is_wanted = any(cat_part in plug_category_id for cat_part in wanted_categories)
                                 is_excluded = False
-                                if not plug_display_name: is_excluded = True
+                                if not plug_display_name: 
+                                    is_excluded = True
                                 else:
                                      for sub in excluded_substrings:
                                           if sub in plug_category_id or sub in plug_display_name.lower():
                                                is_excluded = True; break
                                 if is_wanted and not is_excluded:
                                      perk_names.append(plug_display_name)
-                                elif not is_excluded:
-                                     logger.debug(f"Skipping plug '{plug_display_name}' (Hash: {plug_hash}) with category '{plug_category_id}' for weapon {name}")
+                                # elif not is_excluded: # Optional: reduce noise by removing this debug log or making it more specific
+                                #      logger.debug(f"Skipping plug '{plug_display_name}' (Hash: {plug_hash}) with category '{plug_category_id}' for weapon {name}")
                 
                 return Weapon(
                     item_hash=str(item_hash),
                     instance_id=item_instance_id,
                     name=name, description=description, icon_url=icon_url,
-                    tier_type=tier_type, item_type=item_type_display, item_sub_type=item_sub_type, # Ensure correct field name
+                    tier_type=tier_type, item_type=item_type_display, item_sub_type=item_sub_type,
                     damage_type=damage_type_str,
                     perks=perk_names,
                     location=location_prefix
                 )
 
-            # Process items from various inventory locations
+            # --- Step 4: Process items using the synchronous helper and cached definitions ---
             # Character Inventories
-            if profile_components_data.get("Response", {}).get("characterInventories", {}).get("data"):
-                for char_id, char_inv in profile_components_data["Response"]["characterInventories"]["data"].items():
-                    for item in char_inv.get("items", []):
-                        weapon = await process_item(item, f"Character {char_id} Inventory") # Use await
+            if response_data.get("characterInventories", {}).get("data"):
+                for char_id, char_inv in response_data["characterInventories"]["data"].items():
+                    for item_data_loop in char_inv.get("items", []):
+                        weapon = process_item_sync(item_data_loop, f"Character {char_id} Inventory", all_definitions_map)
                         if weapon: weapons.append(weapon)
             # Character Equipment
-            if profile_components_data.get("Response", {}).get("characterEquipment", {}).get("data"):
-                for char_id, char_equip in profile_components_data["Response"]["characterEquipment"]["data"].items():
-                    for item in char_equip.get("items", []):
-                        weapon = await process_item(item, f"Character {char_id} Equipped") # Use await
+            if response_data.get("characterEquipment", {}).get("data"):
+                for char_id, char_equip in response_data["characterEquipment"]["data"].items():
+                    for item_data_loop in char_equip.get("items", []):
+                        weapon = process_item_sync(item_data_loop, f"Character {char_id} Equipped", all_definitions_map)
                         if weapon: weapons.append(weapon)
             # Profile Inventory (Vault)
-            if profile_components_data.get("Response", {}).get("profileInventory", {}).get("data"):
-                for item in profile_components_data["Response"]["profileInventory"]["data"].get("items", []):
-                    weapon = await process_item(item, "Vault") # Use await
+            if response_data.get("profileInventory", {}).get("data"):
+                for item_data_loop in response_data["profileInventory"]["data"].get("items", []):
+                    weapon = process_item_sync(item_data_loop, "Vault", all_definitions_map)
                     if weapon: weapons.append(weapon)
             
             elapsed_time = time.time() - start_time
