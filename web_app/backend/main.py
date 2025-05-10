@@ -209,7 +209,8 @@ async def startup_event():
                 openai_client=openai_client,
                 catalyst_api=catalyst_api_instance,
                 weapon_api=weapon_api_instance,
-                supabase_client=supabase_client
+                sb_client=supabase_client,
+                manifest_service=supabase_manifest_service
             )
             logger.info("DestinyAgentService initialized.")
         except Exception as e:

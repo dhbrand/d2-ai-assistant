@@ -21,7 +21,7 @@ import re
 from openai import OpenAI # Ensure OpenAI is imported for type hinting
 from supabase import Client, AsyncClient
 import json
-from .models import CatalystData, CatalystObjective # <--- ADD THIS IMPORT
+from .models import CatalystData, CatalystObjective, Weapon # <--- ensure Weapon is imported
 from .bungie_oauth import AuthenticationRequiredError, InvalidRefreshTokenError # <-- IMPORT THESE
 
 logger = logging.getLogger(__name__)
@@ -72,49 +72,219 @@ def _get_user_info_impl(service: 'DestinyAgentService') -> dict:
         # For other errors, return a dict error for the agent to formulate a response
         return {"error": f"Failed to get user info due to an internal error: {str(e)}"}
 
-async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int, membership_id: str) -> list:
-    """(Implementation) Fetch all weapons for a user, using cache."""
+async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int, membership_id: str) -> List[Weapon]:
+    """(Implementation) Fetch all weapons for a user, using Supabase as cache."""
     logger.debug(f"Agent Tool Impl: get_weapons called for {membership_type}/{membership_id}")
     bungie_id = service._current_bungie_id
-    access_token = service._current_access_token
 
-    if not bungie_id or not access_token:
-        logger.error("Agent Tool Impl Error: Bungie ID or Access token not set in context.")
-        raise Exception("User context not available for get_weapons.")
+    if not bungie_id:
+        logger.error("Agent Tool Impl Error: Bungie ID not set in context for get_weapons.")
+        raise Exception("User context (bungie_id) not available for get_weapons.")
 
-    # Check cache
     now = datetime.now(timezone.utc)
-    cache_key = f"{bungie_id}_{membership_type}_{membership_id}" # Use combined key for weapon cache if needed, or just bungie_id if sufficient
-    if bungie_id in service._weapons_cache: # Using bungie_id as primary cache key
-        timestamp, cached_data = service._weapons_cache[bungie_id]
-        if now - timestamp < CACHE_TTL:
-            logger.info(f"Cache HIT for weapons for bungie_id {bungie_id}")
-            # Convert cached Pydantic models back to dicts if necessary for agent?
-            # Assuming agent handles Pydantic models or they were stored as dicts
-            return cached_data
-        else:
-            logger.info(f"Cache STALE for weapons for bungie_id {bungie_id}")
-    else:
-        logger.info(f"Cache MISS for weapons for bungie_id {bungie_id}")
-
-    # Cache miss or stale, call API
+    
     try:
-        # Use await for the async API call, without access_token
-        weapons_data = await service.weapon_api.get_all_weapons(
+        logger.info(f"Attempting to fetch weapons from Supabase cache for user {bungie_id}")
+        # Select columns that exist in user_weapon_inventory
+        supabase_response = await (service.sb_client.table("user_weapon_inventory")
+            .select("item_instance_id, item_hash, perks, location, is_equipped, last_updated") # Adjusted columns
+            .eq("user_id", bungie_id)
+            .execute())
+
+        if supabase_response.data:
+            logger.info(f"Found {len(supabase_response.data)} weapon instance entries in Supabase for user {bungie_id}")
+            
+            cache_is_fresh = True
+            oldest_update_time = None 
+
+            for item_dict in supabase_response.data:
+                last_updated_str = item_dict.get("last_updated")
+                if last_updated_str:
+                    try:
+                        last_updated_dt = datetime.fromisoformat(last_updated_str)
+                        if oldest_update_time is None or last_updated_dt < oldest_update_time:
+                            oldest_update_time = last_updated_dt
+                    except ValueError:
+                        logger.warning(f"Invalid date format for last_updated for item_instance_id {item_dict.get('item_instance_id')}: {last_updated_str}. Considering cache stale.")
+                        cache_is_fresh = False; break
+                else:
+                    cache_is_fresh = False
+                    logger.info(f"Weapon instance {item_dict.get('item_instance_id')} missing last_updated, cache STALE for user {bungie_id}")
+                    break
+            
+            if cache_is_fresh and oldest_update_time is not None:
+                if (now - oldest_update_time > CACHE_TTL):
+                    cache_is_fresh = False
+                    logger.info(f"Supabase weapon cache is STALE for user {bungie_id} (oldest item updated at {oldest_update_time}).")
+            elif cache_is_fresh and oldest_update_time is None and supabase_response.data: 
+                cache_is_fresh = False
+                logger.info(f"Supabase weapon cache for user {bungie_id} has items but no valid last_updated timestamps, considering STALE.")
+
+            if cache_is_fresh:
+                logger.info(f"Supabase weapon cache is FRESH for user {bungie_id}. Reconstructing Weapon list with manifest data.")
+                reconstructed_weapons: List[Weapon] = []
+                
+                # Collect item_hashes to fetch definitions.
+                item_hashes_from_cache = [item_dict['item_hash'] for item_dict in supabase_response.data if item_dict.get('item_hash') is not None]
+                unique_item_hashes = list(set(item_hashes_from_cache))
+
+                manifest_definitions = {}
+                if unique_item_hashes: # Only call if there are hashes
+                    manifest_definitions = await service.manifest_service.get_definitions_batch(
+                        "DestinyInventoryItemDefinition", 
+                        unique_item_hashes
+                    )
+                    logger.info(f"Successfully fetched {len(manifest_definitions)} unique manifest definitions for weapon reconstruction.")
+                else:
+                    logger.info("No unique item hashes found in cache to fetch manifest definitions.")
+
+                for item_dict in supabase_response.data:
+                    original_item_hash = item_dict.get('item_hash')
+                    if original_item_hash is None:
+                        logger.warning(f"Skipping item due to missing 'item_hash': {item_dict}")
+                        continue
+
+                    manifest_def = manifest_definitions.get(original_item_hash) # item_hash is int here
+
+                    if not manifest_def:
+                        logger.warning(f"No manifest definition found for item_hash {original_item_hash}. Skipping weapon reconstruction for this item.")
+                        continue
+                    
+                    display_props = manifest_def.get("displayProperties", {})
+                    
+                    # Ensure perks is a list
+                    perks_data = item_dict.get("perks", "[]") # Default to string '[]'
+                    if isinstance(perks_data, str):
+                        try:
+                            perks_list = json.loads(perks_data)
+                            if not isinstance(perks_list, list): # Ensure it's a list after parsing
+                                logger.warning(f"Perks data for item {original_item_hash} did not parse to a list: {perks_data}. Defaulting to empty list.")
+                                perks_list = []
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse perks JSON for item {original_item_hash}: {perks_data}. Defaulting to empty list.")
+                            perks_list = []
+                    elif isinstance(perks_data, list):
+                        perks_list = perks_data
+                    else:
+                        logger.warning(f"Unexpected type for perks data for item {original_item_hash}: {type(perks_data)}. Defaulting to empty list.")
+                        perks_list = []
+
+                    weapon_data_for_model = {
+                        "item_hash": str(original_item_hash), 
+                        "instance_id": item_dict.get("item_instance_id"),
+                        "name": display_props.get("name", "Unknown Name"),
+                        "description": display_props.get("description", ""),
+                        "icon_url": display_props.get("icon", ""),
+                        "tier_type": manifest_def.get("inventory", {}).get("tierTypeName", "Unknown Tier"),
+                        "item_type": manifest_def.get("itemTypeDisplayName", "Unknown Item Type"),
+                        "item_sub_type": str(manifest_def.get("itemSubType", 0)), # Ensure string
+                        "location": item_dict.get("location"),
+                        "is_equipped": item_dict.get("is_equipped", False),
+                        # Convert damage_type (hash) to string for the model
+                        "damage_type": str(manifest_def.get("defaultDamageTypeHash", "None")), 
+                        "perks": perks_list
+                    }
+                    try:
+                        weapon = Weapon(**weapon_data_for_model)
+                        reconstructed_weapons.append(weapon)
+                    except Exception as e: # Catch Pydantic validation errors specifically if possible
+                        logger.error(f"Pydantic validation error reconstructing weapon {original_item_hash} from cache: {e}. Data: {weapon_data_for_model}")
+                
+                # <<< START ADDED LOGGING >>>
+                location_counts = {}
+                for weapon in reconstructed_weapons:
+                    loc = weapon.location if weapon.location is not None else "None"
+                    location_counts[loc] = location_counts.get(loc, 0) + 1
+                logger.info(f"Weapon location distribution from cache for user {bungie_id}: {location_counts}")
+                # <<< END ADDED LOGGING >>>
+
+                logger.info(f"Cache HIT: Returning {len(reconstructed_weapons)} weapons from Supabase for user {bungie_id}")
+                return reconstructed_weapons
+            else:
+                logger.warning(f"Failed to reconstruct all ({valid_reconstructions}/{len(supabase_response.data)}) weapons from cache for user {bungie_id}. Proceeding to API call.")
+                # Fall through to API call
+
+        else: 
+            logger.info(f"Cache MISS: No weapon data in Supabase for user {bungie_id}")
+
+    except Exception as e:
+        logger.error(f"Error during Supabase weapon cache read or reconstruction for user {bungie_id}: {e}", exc_info=True)
+        # Fall through to API call on any error
+
+    # Cache miss, stale, or error in cache read/reconstruction: Call API
+    logger.info(f"Calling Bungie API for weapons for user {bungie_id} (membership: {membership_type}/{membership_id})")
+    try:
+        # weapon_api.get_all_weapons is expected to return List[Weapon]
+        # where Weapon objects are fully populated with manifest data.
+        weapons_from_api: List[Weapon] = await service.weapon_api.get_all_weapons(
             membership_type=membership_type,
             destiny_membership_id=membership_id
         )
-        # Store in cache (converting Pydantic models to dicts might be safer for serialization/agent)
-        # For now, storing the list of Pydantic objects directly.
-        service._weapons_cache[bungie_id] = (now, weapons_data)
-        logger.info(f"Cache SET for weapons for bungie_id {bungie_id}")
-        return weapons_data
-    except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err: # <-- CATCH SPECIFIC AUTH ERRORS
+
+        if weapons_from_api:
+            logger.info(f"Fetched {len(weapons_from_api)} weapons from API. Storing instance data in Supabase for user {bungie_id}.")
+            
+            try:
+                await (service.sb_client.table("user_weapon_inventory")
+                    .delete()
+                    .eq("user_id", bungie_id)
+                    .execute())
+                logger.info(f"Successfully deleted old weapon inventory for user {bungie_id} from Supabase.")
+            except Exception as del_e:
+                logger.error(f"Failed to delete old weapon inventory for user {bungie_id} from Supabase: {del_e}", exc_info=True)
+
+            weapons_to_insert = []
+            current_timestamp_iso = now.isoformat()
+            for weapon_model in weapons_from_api: # weapon_model is a Weapon Pydantic instance
+                db_weapon_entry = {
+                    "user_id": bungie_id,
+                    # Weapon Pydantic model has 'instance_id', map it to 'item_instance_id' in DB
+                    "item_instance_id": weapon_model.instance_id, 
+                    "item_hash": weapon_model.item_hash, # item_hash is a string in Pydantic, bigint in DB. Ensure conversion if strict.
+                                                       # Supabase client might handle string to bigint conversion for item_hash.
+                    "location": weapon_model.location,
+                    "is_equipped": weapon_model.is_equipped,
+                    "perks": json.dumps(weapon_model.perks if weapon_model.perks else []), 
+                    "last_updated": current_timestamp_iso
+                    # Removed: name, image_url, item_type_display_name, power_level as they are not in user_weapon_inventory table
+                }
+                # Ensure item_hash is int for bigint column if Supabase doesn't auto-convert
+                try:
+                    if db_weapon_entry["item_hash"] is not None:
+                        db_weapon_entry["item_hash"] = int(db_weapon_entry["item_hash"])
+                except ValueError:
+                    logger.error(f"Could not convert item_hash '{db_weapon_entry['item_hash']}' to int for item_instance_id '{weapon_model.instance_id}'. Skipping this item for DB insert.")
+                    continue # Skip this weapon if item_hash is invalid for DB
+
+                weapons_to_insert.append(db_weapon_entry)
+            
+            if weapons_to_insert:
+                try:
+                    insert_response = await (service.sb_client.table("user_weapon_inventory")
+                        .insert(weapons_to_insert)
+                        .execute())
+                    
+                    if hasattr(insert_response, 'error') and insert_response.error:
+                         logger.error(f"Supabase insert error for weapons user {bungie_id}: {insert_response.error}")
+                    elif insert_response.data:
+                         logger.info(f"Successfully inserted {len(insert_response.data)} weapon instances in Supabase for user {bungie_id}.")
+                    else:
+                         logger.info(f"Weapon instance insert for user {bungie_id} completed; no data/error in response.")
+                except Exception as ins_e:
+                    logger.error(f"Failed to insert weapon instances in Supabase for user {bungie_id}: {ins_e}", exc_info=True)
+            else:
+                logger.info(f"No valid weapons from API to insert into Supabase for user {bungie_id}.")
+        else:
+            logger.info(f"No weapons returned from API for user {bungie_id}. Cache will not be updated.")
+        
+        return weapons_from_api
+
+    except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err:
         logger.warning(f"Authentication error in get_weapons: {auth_err}")
-        raise # Re-raise auth-specific errors
+        raise 
     except Exception as e:
-        logger.error(f"Agent Tool Impl Error in get_weapons: {e}", exc_info=True)
-        return {"error": f"Failed to get weapons due to an internal error: {str(e)}"} # Return dict error
+        logger.error(f"Agent Tool Impl Error in get_weapons during API call/Supabase write: {e}", exc_info=True)
+        raise Exception(f"Failed to get weapons due to an internal error: {str(e)}")
 
 async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
     """(Implementation) Fetch all catalyst progress for a user, using Supabase as cache."""
@@ -469,42 +639,53 @@ class DestinyAgentService:
                  openai_client: OpenAI, 
                  catalyst_api: CatalystAPI, 
                  weapon_api: WeaponAPI,
-                 supabase_client: AsyncClient,
-                 # TODO: Add google_sheets_service or similar if used by endgame_analysis directly
-                 # For now, endgame_analysis creates its own GSheets client.
+                 sb_client: AsyncClient, 
+                 manifest_service: Any, 
                  ):
         logger.info("Initializing DestinyAgentService with pre-configured API clients and Supabase client.")
         self.openai_client = openai_client
-        set_default_openai_client(self.openai_client)
+        set_default_openai_client(self.openai_client) # Set for the agents library
         self.catalyst_api = catalyst_api
         self.weapon_api = weapon_api
-        self.sb_client = supabase_client
+        self.sb_client = sb_client 
+        self.manifest_service = manifest_service
 
-        self.agent = self._create_agent()
+        # Define components of the system prompt for clarity and reusability
+        self.DEFAULT_AGENT_IDENTITY_PROMPT = "You are a helpful Destiny 2 assistant."
+        self.AGENT_CORE_ABILITIES_PROMPT = (
+            "You are knowledgeable about game mechanics, weapons, catalysts, and lore. "
+            "Your goal is to provide accurate and concise information to the player. "
+            "If you need a user's specific Bungie ID or access token for a tool, and it's not "
+            "provided in the context, you must call 'get_user_info' first."
+        )
+        self.EMOJI_ENCOURAGEMENT = "Always use relevant Destiny-themed emojis liberally in your responses to add flavor and personality!"
+
+        # Persona map (remains the same)
+        self.persona_map = {
+            "Saint-14": f"You are Saint-14, the legendary Titan. Speak with honor, warmth, and a touch of old-world chivalry. Use phrases like 'my friend' and reference the Lighthouse or Trials. Use plenty of shield 🛡️, helmet 🪖, and sun ☀️ emojis.",
+            "Cayde-6": f"You are Cayde-6, the witty Hunter. Be playful, crack jokes, and use lots of chicken 🐔, ace of spades 🂡, and dice 🎲 emojis. Don't be afraid to be cheeky!",
+            "Ikora": f"You are Ikora Rey, the wise Warlock. Speak with calm authority, offer insight, and use book 📚, eye 👁️, and star ✨ emojis.",
+            "Saladin": f"You are Lord Saladin, the Iron Banner champion. Be stoic, proud, and use wolf 🐺, fire 🔥, and shield 🛡️ emojis.",
+            "Zavala": f"You are Commander Zavala, the steadfast Titan. Be direct, inspiring, and use shield 🛡️, fist ✊, and tower 🏰 emojis.",
+            "Eris Morn": f"You are Eris Morn, the mysterious Guardian. Speak cryptically, reference the Hive, and use eye 👁️, darkness 🌑, and worm 🪱 emojis.",
+            "Shaxx": f"You are Lord Shaxx, the Crucible announcer. Be loud, encouraging, and use sword ⚔️, explosion 💥, and helmet 🪖 emojis.",
+            "Drifter": f"You are the Drifter, the rogue Gambit handler. Speak with sly humor, streetwise slang, and a morally gray perspective. Reference Gambit and 'motes'.",
+            "Mara Sov": f"You are Mara Sov, the enigmatic Queen of the Awoken. Speak with regal poise, subtlety, and a sense of cosmic perspective.",
+        }
+        
+        # Default agent created with a combined default system prompt
+        default_full_system_prompt = f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT}"
+        self.agent = self._create_agent_internal(instructions=default_full_system_prompt)
+        
         self._current_access_token: Optional[str] = None
         self._current_bungie_id: Optional[str] = None
         
-        # Initialize caches
         self._user_info_cache: Dict[str, tuple[datetime, dict]] = {}
-        self._weapons_cache: Dict[str, tuple[datetime, list]] = {}
-        self._catalysts_cache: Dict[str, tuple[datetime, list]] = {}
-        self._sheet_cache: Dict[str, tuple[datetime, list[dict]]] = {} # For Google Sheets
+        self._sheet_cache: Dict[str, tuple[datetime, list[dict]]] = {}
 
-        self.persona_map = {
-            "Saint-14": "You are Saint-14, the legendary Titan. Speak with honor, warmth, and a touch of old-world chivalry. Use phrases like 'my friend' and reference the Lighthouse or Trials. Use plenty of shield 🛡️, helmet 🪖, and sun ☀️ emojis.",
-            "Cayde-6": "You are Cayde-6, the witty Hunter. Be playful, crack jokes, and use lots of chicken 🐔, ace of spades 🂡, and dice 🎲 emojis. Don't be afraid to be cheeky!",
-            "Ikora": "You are Ikora Rey, the wise Warlock. Speak with calm authority, offer insight, and use book 📚, eye 👁️, and star ✨ emojis.",
-            "Saladin": "You are Lord Saladin, the Iron Banner champion. Be stoic, proud, and use wolf 🐺, fire 🔥, and shield 🛡️ emojis.",
-            "Zavala": "You are Commander Zavala, the steadfast Titan. Be direct, inspiring, and use shield 🛡️, fist ✊, and tower 🏰 emojis.",
-            "Eris Morn": "You are Eris Morn, the mysterious Guardian. Speak cryptically, reference the Hive, and use eye 👁️, darkness 🌑, and worm 🪱 emojis.",
-            "Shaxx": "You are Lord Shaxx, the Crucible announcer. Be loud, encouraging, and use sword ⚔️, explosion 💥, and helmet 🪖 emojis.",
-            "Drifter": "You are the Drifter, the rogue Gambit handler. Speak with sly humor, streetwise slang, and a morally gray perspective. Reference Gambit and 'motes'.",
-            "Mara Sov": "You are Mara Sov, the enigmatic Queen of the Awoken. Speak with regal poise, subtlety, and a sense of cosmic perspective.",
-        }
-
-    def _create_agent(self) -> Agent:
-        """Creates the agent with all its tools and persona."""
-        logger.debug("Creating agent with tools...")
+    def _create_agent_internal(self, instructions: str) -> Agent:
+        """Internal helper to create an agent instance with specific instructions."""
+        logger.debug(f"Creating agent with instructions: '{instructions[:100]}...'") # Log first 100 chars
         tools = [
             function_tool(self.get_user_info),
             function_tool(self.get_weapons),
@@ -512,12 +693,9 @@ class DestinyAgentService:
             function_tool(self.get_pve_bis_weapons_from_sheet),
             function_tool(self.get_pve_activity_bis_weapons_from_sheet),
             function_tool(self.get_endgame_analysis_data)
-            # WebSearchTool(enabled=False) # Disabled for now
         ]
-        # If a persona is provided, prepend its instructions to the system prompt
-        system_prompt = "You are a helpful Destiny 2 assistant, knowledgeable about game mechanics, weapons, catalysts, and lore. Your goal is to provide accurate and concise information to the player. If you need a user's specific Bungie ID or access token for a tool, and it's not provided in the context, you must call 'get_user_info' first."
-        # The Runner is not passed to Agent constructor. OpenAI client is set globally.
-        return Agent(name="Destiny2Assistant", instructions=system_prompt, tools=tools)
+        # OpenAI client is set globally via set_default_openai_client
+        return Agent(name="Destiny2Assistant", instructions=instructions, tools=tools)
 
     # Tool-bound methods - these will call the _impl functions
     # Make them async if their _impl is async
@@ -527,13 +705,24 @@ class DestinyAgentService:
         """Agent Tool: Fetch the user's D2 membership type and ID."""
         return _get_user_info_impl(self)
 
-    async def get_weapons(self, membership_type: int, membership_id: str) -> list: # BECOMES ASYNC
-        """Agent Tool: Fetch all weapons for a given D2 user."""
-        return await _get_weapons_impl(self, membership_type, membership_id) # Use await
+    async def get_weapons(self, membership_type: int, membership_id: str) -> List[Weapon]:
+        """Agent Tool: Fetches all weapons currently in the specified user's inventory and vault.
+        Returns a list of weapon objects. Each weapon object includes fields such as:
+        - 'item_hash' (string): The unique identifier for the weapon type.
+        - 'instance_id' (string, optional): The unique identifier for this specific instance of the weapon.
+        - 'name' (string): The name of the weapon.
+        - 'location' (string, optional): Where the weapon is located (e.g., 'Vault', 'Character Inventory', 'Character Equipped').
+        - 'is_equipped' (boolean, optional): Whether the weapon is currently equipped by a character.
+        - 'perks' (list of strings): A list of perk names or identifiers on the weapon.
+        - 'tier_type' (string): The rarity tier of the weapon (e.g., 'Exotic', 'Legendary').
+        - 'item_type' (string): The type of weapon (e.g., 'Auto Rifle', 'Hand Cannon').
+        - 'damage_type' (string, optional): The elemental damage type of the weapon (e.g., 'Kinetic', 'Void', 'Solar', 'Arc', 'Stasis', 'Strand').
+        """
+        return await _get_weapons_impl(self, membership_type, membership_id)
 
-    async def get_catalysts(self) -> list: # BECOMES ASYNC
+    async def get_catalysts(self) -> list:
         """Agent Tool: Fetch all catalyst progress for the current D2 user."""
-        return await _get_catalysts_impl(self) # Use await
+        return await _get_catalysts_impl(self)
 
     # Google Sheet tools remain synchronous
     def get_pve_bis_weapons_from_sheet(self) -> list[dict]:
@@ -549,37 +738,55 @@ class DestinyAgentService:
         return _get_endgame_analysis_impl(self, sheet_name)
 
     async def run_chat(self, prompt: str, access_token: str, bungie_id: str, history: Optional[List[Dict[str, str]]] = None, persona: Optional[str] = None):
-        logger.debug(f"DestinyAgentService run_chat called for bungie_id: {bungie_id}")
-        # Set user context for this run
+        logger.debug(f"DestinyAgentService run_chat called for bungie_id: {bungie_id}, persona: {persona}")
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
         
-        # Construct the input list including history and the current user prompt
-        agent_input = history or [] # Start with history or an empty list
-        agent_input.append({"role": "user", "content": prompt}) # Add current user message
+        agent_to_use = self.agent # Default to the standard agent
+
+        if persona:
+            persona_base_instructions = self.persona_map.get(persona)
+            if persona_base_instructions:
+                # Persona instructions already contain "You are [Persona]..." and specific style/emoji guidance.
+                # We combine this with the core abilities and general emoji encouragement.
+                effective_system_prompt = (
+                    f"{persona_base_instructions} " 
+                    f"{self.AGENT_CORE_ABILITIES_PROMPT} " # Add core abilities
+                    # self.EMOJI_ENCOURAGEMENT # Persona map entries now include specific emoji guidance. General one might be redundant or slightly conflict. Let's test without it first.
+                )
+                logger.info(f"Using effective system prompt for persona '{persona}': '{effective_system_prompt[:150]}...'")
+                # Create a new, temporary agent instance for this call with the persona-specific instructions.
+                # This assumes Agent constructor is lightweight and tools can be reused.
+                # Tools are taken from self.agent.tools which are already initialized.
+                agent_to_use = self._create_agent_internal(instructions=effective_system_prompt)
+            else:
+                logger.warning(f"Persona '{persona}' selected but no matching instructions found in persona_map. Using default agent.")
+        
+        messages_for_run: List[Dict[str, str]] = []
+        if history:
+            messages_for_run.extend(history)
+        messages_for_run.append({"role": "user", "content": prompt})
         
         try:
-            # Execute agent using Runner.run static method, passing the list as input
-            response_obj = await Runner.run(self.agent, agent_input)
-            # Extract the final text output
+            response_obj = await Runner.run(agent_to_use, messages_for_run)
             response_text = response_obj.final_output if hasattr(response_obj, 'final_output') else "Error: Could not get final output from agent."
             return response_text
-        except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err: # <-- CATCH AUTH ERRORS FIRST
+        except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err:
             logger.warning(f"Authentication error during agent chat execution: {auth_err}")
-            raise # Re-raise to be caught by FastAPI
+            raise 
         except Exception as e:
             logger.error(f"Error during agent chat execution: {e}", exc_info=True)
-            # For other errors, the agent runner likely already formulated a polite response if it was tool error.
-            # If it's an error in the agent execution itself, return a generic error message.
             return f"An unexpected error occurred while processing your request: {str(e)}"
         finally:
-            # Clear user context after run
             self._current_access_token = None
             self._current_bungie_id = None
 
     def get_persona_prompt(self, persona_name: str) -> str:
-        base = self.persona_map.get(persona_name, "You are a helpful Destiny 2 assistant.")
-        return f"{base}\n\nAlways use relevant Destiny-themed emojis liberally in your responses to add flavor and personality!" # Encourage emoji use 
+        # This method might become less necessary or simplified
+        # as persona instructions are now directly used from persona_map
+        # and combined with core abilities in run_chat.
+        # For now, let it return the base persona instruction from the map.
+        return self.persona_map.get(persona_name, f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT}")
 
 # Function to get AgentService (dependency for FastAPI)
 # This needs to be updated if AgentService __init__ changes significantly,
