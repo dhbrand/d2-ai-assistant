@@ -3,7 +3,7 @@ import logging
 from typing import List, Dict, Any, Optional
 import asyncio # Import asyncio for potential gather later
 
-from .models import Weapon # Use explicit relative import
+from .models import Weapon, WeaponPerkDetail # Use explicit relative import, ADD WeaponPerkDetail
 from .manifest import SupabaseManifestService # Import the new service
 from .bungie_oauth import OAuthManager # Import OAuthManager
 import time
@@ -140,52 +140,135 @@ class WeaponAPI:
                 item_instance_id = item_data.get("itemInstanceId")
                 
                 item_def = definitions_cache.get(item_hash)
-                if not item_def or item_def.get('itemType') != ITEM_TYPE_WEAPON: return None
+                if not item_def or item_def.get('itemType') != ITEM_TYPE_WEAPON:
+                    # logger.debug(f"Skipping item {item_hash} as it's not a weapon or has no definition.")
+                    return None
                 
                 display_props = item_def.get('displayProperties', {})
                 name = display_props.get('name', f"Unknown Weapon {item_hash}")
+                # logger.debug(f"Processing weapon: {name} ({item_hash}), Instance: {item_instance_id}")
+
                 description = display_props.get('description', '')
                 icon_url = "https://www.bungie.net" + display_props.get('icon', '') if display_props.get('icon') else ''
                 tier_type = item_def.get('inventory', {}).get('tierTypeName', 'Unknown')
                 item_type_display = item_def.get('itemTypeDisplayName', 'Unknown Weapon Type')
-                item_sub_type = item_def.get('itemSubTypeDisplayName', '')
+                item_sub_type_str = str(item_def.get('itemSubType', 0)) # Match Pydantic model if it expects string
                 damage_type_int = item_def.get("defaultDamageType", 0)
                 damage_type_str = DAMAGE_TYPE_MAP.get(damage_type_int, "Unknown")
+                power_level = item_data.get("primaryStat", {}).get("value") if item_instance_id else None # Get power level for instanced items
 
-                perk_names = []
+                # Initialize perk lists for the new model structure
+                barrel_perks_list: List[WeaponPerkDetail] = []
+                magazine_perks_list: List[WeaponPerkDetail] = []
+                trait_perk_col1_list: List[WeaponPerkDetail] = []
+                trait_perk_col2_list: List[WeaponPerkDetail] = []
+                origin_trait_detail: Optional[WeaponPerkDetail] = None
+
+                # Socket definitions from the weapon's manifest entry
+                weapon_socket_entries = item_def.get("sockets", {}).get("socketEntries", [])
+                weapon_socket_categories = item_def.get("sockets", {}).get("socketCategories", [])
+
+                # --- Known Socket Category Hashes (approximations, verify these with manifest inspection) ---
+                # These hashes can be found by inspecting DestinySocketCategoryDefinition in manifest
+                # Or by looking at weapon definitions (e.g. item_def['sockets']['socketCategories'])
+                BARREL_CATEGORY_HASHES = [4241085061] # Example: "Weapon Barrel"
+                MAGAZINE_CATEGORY_HASHES = [192609005] # Example: "Weapon Magazine"
+                # Trait perks often fall under a general category, might need index-based or plugCategoryIdentifier filtering
+                TRAIT_PERK_MAIN_CATEGORY_HASHES = [2685412097] # Example: "Weapon Perks"
+                ORIGIN_TRAIT_CATEGORY_HASHES = [270265983, 3379164202, 2237050098] # Example hashes for origin traits, REMOVED "reforming_frame_category_hash"
+
+                # Get the actual sockets and their plugged perks for this specific item instance
+                instance_sockets = []
                 if item_instance_id and item_instance_id in item_sockets_data:
-                    sockets = item_sockets_data[item_instance_id].get("sockets", [])
-                    for socket in sockets:
-                        plug_hash = socket.get("plugHash")
-                        if plug_hash and socket.get("isEnabled", True):
-                            plug_def = definitions_cache.get(plug_hash)
-                            if plug_def:
-                                plug_category_id = plug_def.get("plug", {}).get("plugCategoryIdentifier", "")
-                                plug_display_name = plug_def.get("displayProperties", {}).get("name", "")
-                                wanted_categories = ["intrinsics", "barrels", "tubes", "magazines", "batteries", "magazines_gl", "arrows", "stocks", "grips", "guards", "blades", "origins", "frames"]
-                                excluded_substrings = ["shader", "masterworks", "tracker", "memento", "crafting", "empty", "default", "v400.weapon.mod"]
-                                
-                                is_wanted = any(cat_part in plug_category_id for cat_part in wanted_categories)
-                                is_excluded = False
-                                if not plug_display_name: 
-                                    is_excluded = True
-                                else:
-                                     for sub in excluded_substrings:
-                                          if sub in plug_category_id or sub in plug_display_name.lower():
-                                               is_excluded = True; break
-                                if is_wanted and not is_excluded:
-                                     perk_names.append(plug_display_name)
-                                # elif not is_excluded: # Optional: reduce noise by removing this debug log or making it more specific
-                                #      logger.debug(f"Skipping plug '{plug_display_name}' (Hash: {plug_hash}) with category '{plug_category_id}' for weapon {name}")
-                
+                    instance_sockets = item_sockets_data[item_instance_id].get("sockets", [])
+
+                # Create a map of socketIndex to plugHash for easy lookup for this instance
+                # Only consider enabled plugs
+                socket_index_to_plug_hash_map: Dict[int, int] = {
+                    idx: s.get("plugHash") for idx, s in enumerate(instance_sockets) 
+                    if s.get("plugHash") and s.get("isEnabled", False) and s.get("isVisible", True)
+                }
+
+                processed_trait_socket_indexes = set()
+
+                for category in weapon_socket_categories:
+                    category_hash = category.get("socketCategoryHash")
+                    socket_indexes_in_category = category.get("socketIndexes", [])
+
+                    # logger.debug(f"Weapon: {name}, Category: {category_hash}, Sockets: {socket_indexes_in_category}")
+
+                    for socket_idx in socket_indexes_in_category:
+                        plug_hash = socket_index_to_plug_hash_map.get(socket_idx)
+                        if not plug_hash: continue
+
+                        plug_def = definitions_cache.get(plug_hash)
+                        if not plug_def: continue
+
+                        plug_display_props = plug_def.get("displayProperties", {})
+                        perk_name = plug_display_props.get("name")
+                        perk_description = plug_display_props.get("description", "")
+                        perk_icon_path = plug_display_props.get("icon", "")
+                        perk_icon_url = f"https://www.bungie.net{perk_icon_path}" if perk_icon_path else "https://www.bungie.net/common/destiny2_content/icons/broken_icon.png"
+                        
+                        # Ensure we have a name, skip if it's a hidden/default/empty plug
+                        if not perk_name or "shader" in plug_def.get("plug",{}).get("plugCategoryIdentifier","").lower() or "empty" in perk_name.lower() or "default" in perk_name.lower():
+                            continue
+
+                        perk_detail = WeaponPerkDetail(
+                            perk_hash=plug_hash,
+                            name=perk_name,
+                            description=perk_description,
+                            icon_url=perk_icon_url
+                        )
+
+                        # Categorize the perk
+                        if category_hash in BARREL_CATEGORY_HASHES:
+                            barrel_perks_list.append(perk_detail)
+                        elif category_hash in MAGAZINE_CATEGORY_HASHES:
+                            magazine_perks_list.append(perk_detail)
+                        elif category_hash in ORIGIN_TRAIT_CATEGORY_HASHES:
+                            if not origin_trait_detail: # Only take the first one if multiple are somehow present
+                                origin_trait_detail = perk_detail
+                        elif category_hash in TRAIT_PERK_MAIN_CATEGORY_HASHES:
+                            # This is where it gets tricky. We need to ensure we get the two main trait perks in order.
+                            # We also need to avoid intrinsic perks if they share this category.
+                            # The `socket_indexes_in_category` from weapon_def should represent the order.
+                            # Check if it's an intrinsic plug (sometimes plugCategoryIdentifier helps, e.g. "frames")
+                            plug_category_id = plug_def.get("plug", {}).get("plugCategoryIdentifier", "").lower()
+                            if "frames" in plug_category_id or "intrinsics" in plug_category_id or "enhancements.season" in plug_category_id:
+                                # logger.debug(f"Skipping intrinsic/frame perk {perk_name} in TRAIT_PERK_MAIN_CATEGORY for {name}")
+                                continue # Skip intrinsic frames that might be in the main perk category
+                            
+                            if socket_idx not in processed_trait_socket_indexes:
+                                if not trait_perk_col1_list:
+                                    trait_perk_col1_list.append(perk_detail)
+                                    processed_trait_socket_indexes.add(socket_idx)
+                                elif not trait_perk_col2_list:
+                                    trait_perk_col2_list.append(perk_detail)
+                                    processed_trait_socket_indexes.add(socket_idx)
+                                # else: logger.debug(f"Already filled trait perk slots for {name}, found extra: {perk_name}")
+
+                        # else:
+                            # logger.debug(f"Perk '{perk_name}' (cat hash {category_hash}) for {name} did not fit predefined categories.")
+
                 return Weapon(
                     item_hash=str(item_hash),
                     instance_id=item_instance_id,
-                    name=name, description=description, icon_url=icon_url,
-                    tier_type=tier_type, item_type=item_type_display, item_sub_type=item_sub_type,
+                    name=name, 
+                    description=description, 
+                    icon_url=icon_url if icon_url else None, # Ensure None if empty string
+                    tier_type=tier_type, 
+                    item_type=item_type_display, 
+                    item_sub_type=str(item_def.get("itemSubType", 0)), # Ensure string
                     damage_type=damage_type_str,
-                    perks=perk_names,
-                    location=location_prefix
+                    power_level=power_level,
+                    barrel_perks=barrel_perks_list,
+                    magazine_perks=magazine_perks_list,
+                    trait_perk_col1=trait_perk_col1_list,
+                    trait_perk_col2=trait_perk_col2_list,
+                    origin_trait=origin_trait_detail,
+                    location=location_prefix,
+                    is_equipped="Equipped" in location_prefix # Simple check for equipped status
                 )
 
             # --- Step 4: Process items using the synchronous helper and cached definitions ---

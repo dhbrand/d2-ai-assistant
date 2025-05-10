@@ -1,9 +1,9 @@
 from sqlalchemy import Column, Integer, String, Boolean, Float, JSON, ForeignKey, create_engine, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker, Session
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 import uuid
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import UUID as UUIDType
@@ -75,57 +75,61 @@ class Message(Base):
     def __repr__(self):
         return f"<Message(id={self.id}, conv_id={self.conversation_id}, role='{self.role}', order={self.order_index})>"
 
+class WeaponPerkDetail(BaseModel):
+    perk_hash: int # The Bungie manifest hash for the perk (DestinyInventoryItemDefinition)
+    name: str
+    description: Optional[str] = "" # Perk's description
+    icon_url: HttpUrl # Perk's icon
+
 class Weapon(BaseModel):
-    item_hash: str  # Changed from int to str to match API response
+    item_hash: str # Keep as string to match current usage, conversion happens at DB
     instance_id: Optional[str] = None
-    name: str 
-    description: str
-    icon_url: str
-    tier_type: str  # e.g., Exotic, Legendary
-    item_type: str  # e.g., Auto Rifle, Hand Cannon
-    item_sub_type: str
-    location: Optional[str] = None
-    is_equipped: Optional[bool] = False
-    damage_type: Optional[str] = "None"
-    perks: List[str] = []
+    name: str
+    description: Optional[str] = ""
+    icon_url: Optional[HttpUrl] = None # Changed to HttpUrl for validation
+    tier_type: Optional[str] = None
+    item_type: Optional[str] = None # e.g., "Auto Rifle"
+    item_sub_type: Optional[str] = None # e.g., "Aggressive Frame"
+    damage_type: Optional[str] = "None" # Kinetic, Arc, Solar, Void, Stasis, Strand
     
-    model_config = ConfigDict(from_attributes=True)
-        
-    @classmethod
-    def from_dict(cls, raw_data: dict):
-        """Convert raw weapon data to a Weapon model instance."""
-        # Default values for all required fields
-        weapon_data = {
-            "item_hash": str(raw_data.get("item_hash", "")),
-            "instance_id": raw_data.get("instance_id", ""),
-            "name": raw_data.get("name", "Unknown Weapon"),
-            "description": raw_data.get("description", "No description available"),
-            "icon_url": raw_data.get("icon_url", ""),
-            "tier_type": raw_data.get("tier_type", "Common"),
-            "item_type": raw_data.get("item_type", "Unknown"),
-            "item_sub_type": raw_data.get("item_sub_type", ""),
-            "location": raw_data.get("location", ""),
-            "is_equipped": raw_data.get("is_equipped", False),
-            "damage_type": raw_data.get("damage_type", "None"),
-            "perks": raw_data.get("perks", [])
-        }
-        return cls(**weapon_data)
+    # NEW STRUCTURED PERKS
+    barrel_perks: List[WeaponPerkDetail] = Field(default_factory=list)
+    magazine_perks: List[WeaponPerkDetail] = Field(default_factory=list)
+    trait_perk_col1: List[WeaponPerkDetail] = Field(default_factory=list) # Typically 3rd column
+    trait_perk_col2: List[WeaponPerkDetail] = Field(default_factory=list) # Typically 4th column
+    # Optional: For future expansion or more detailed categorization
+    origin_trait: Optional[WeaponPerkDetail] = None
+    # masterwork_applied: Optional[WeaponPerkDetail] = None # If we want to store the specific MW applied
+    # mod_applied: Optional[WeaponPerkDetail] = None
+
+    # Location and other metadata
+    location: Optional[str] = None  # e.g., "Vault", "Character X Inventory", "Character Y Equipped"
+    is_equipped: bool = False # Calculated if location indicates equipped
+    power_level: Optional[int] = None # Current power level of the item instance
+    # last_updated: datetime = Field(default_factory=datetime.utcnow) # For cache management in DB
+
+    class Config:
+        populate_by_name = True
+        # alias_generator = to_snake # If converting from camelCase API responses
 
 class CatalystObjective(BaseModel):
-    description: str
-    completion: int
-    progress: int
-    complete: bool
-    model_config = ConfigDict(from_attributes=True)
-
-class CatalystData(BaseModel):
+    objective_hash: int
     name: str
     description: str
-    weapon_type: str
+    completion_value: int
+    progress: int
+    is_complete: bool
+
+class CatalystData(BaseModel):
+    item_hash: int # Changed from record_hash as it's an item
+    name: str
+    description: str
+    icon_url: str # Added from previous discussions
+    # source: Optional[str] = None # Retaining for now, might be populated from manifest
+    is_complete: bool
     objectives: List[CatalystObjective]
-    complete: bool
-    progress: float
-    model_config = ConfigDict(from_attributes=True)
+    #bungie_provided_desc: Optional[str] = None # Field for Bungie's description
+    #user_notes: Optional[str] = None # Field for user notes
 
 class UserResponse(BaseModel):
     status: str
