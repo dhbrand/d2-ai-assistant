@@ -121,7 +121,7 @@ class SupabaseManifestService:
         """Helper coroutine to fetch a single chunk of definitions."""
         logger.debug(f"Fetching chunk {chunk_num}/{total_chunks} with {len(hash_chunk)} hashes from {table_name} concurrently.")
         try:
-            response = await self.sb_client.table(table_name)\
+            response = self.sb_client.table(table_name)\
                 .select("hash, json_data")\
                 .in_("hash", hash_chunk)\
                 .execute()
