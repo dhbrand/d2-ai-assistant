@@ -87,7 +87,7 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
         logger.info(f"Attempting to fetch weapons from Supabase cache for user {bungie_id}")
         # Select columns that exist in user_weapon_inventory
         supabase_response = await (service.sb_client.table("user_weapon_inventory")
-            .select("item_instance_id, item_hash, perks, location, is_equipped, last_updated") # Adjusted columns
+            .select("item_instance_id, item_hash, barrel_perks, magazine_perks, trait_perk_col1, trait_perk_col2, origin_trait, location, is_equipped, last_updated")
             .eq("user_id", bungie_id)
             .execute())
 
@@ -107,7 +107,7 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
                     except ValueError:
                         logger.warning(f"Invalid date format for last_updated for item_instance_id {item_dict.get('item_instance_id')}: {last_updated_str}. Considering cache stale.")
                         cache_is_fresh = False; break
-                else:
+        else:
                     cache_is_fresh = False
                     logger.info(f"Weapon instance {item_dict.get('item_instance_id')} missing last_updated, cache STALE for user {bungie_id}")
                     break
@@ -135,7 +135,7 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
                         unique_item_hashes
                     )
                     logger.info(f"Successfully fetched {len(manifest_definitions)} unique manifest definitions for weapon reconstruction.")
-                else:
+    else:
                     logger.info("No unique item hashes found in cache to fetch manifest definitions.")
 
                 for item_dict in supabase_response.data:
@@ -144,30 +144,39 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
                         logger.warning(f"Skipping item due to missing 'item_hash': {item_dict}")
                         continue
 
-                    manifest_def = manifest_definitions.get(original_item_hash) # item_hash is int here
+                    manifest_def = manifest_definitions.get(original_item_hash)
 
                     if not manifest_def:
                         logger.warning(f"No manifest definition found for item_hash {original_item_hash}. Skipping weapon reconstruction for this item.")
                         continue
                     
                     display_props = manifest_def.get("displayProperties", {})
-                    
-                    # Ensure perks is a list
-                    perks_data = item_dict.get("perks", "[]") # Default to string '[]'
-                    if isinstance(perks_data, str):
-                        try:
-                            perks_list = json.loads(perks_data)
-                            if not isinstance(perks_list, list): # Ensure it's a list after parsing
-                                logger.warning(f"Perks data for item {original_item_hash} did not parse to a list: {perks_data}. Defaulting to empty list.")
-                                perks_list = []
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse perks JSON for item {original_item_hash}: {perks_data}. Defaulting to empty list.")
-                            perks_list = []
-                    elif isinstance(perks_data, list):
-                        perks_list = perks_data
-                    else:
-                        logger.warning(f"Unexpected type for perks data for item {original_item_hash}: {type(perks_data)}. Defaulting to empty list.")
-                        perks_list = []
+
+                    # Parse each perk column from the DB, defaulting to [] or None as appropriate
+                    def parse_perk_list(val):
+                        if val is None:
+                            return []
+                        if isinstance(val, str):
+                            try:
+                                parsed = json.loads(val)
+                                return parsed if isinstance(parsed, list) else []
+                            except Exception:
+                                return []
+                        if isinstance(val, list):
+                            return val
+                        return []
+                    def parse_perk_obj(val):
+                        if val is None:
+                            return None
+                        if isinstance(val, str):
+                            try:
+                                parsed = json.loads(val)
+                                return parsed if isinstance(parsed, dict) else None
+                            except Exception:
+                                return None
+                        if isinstance(val, dict):
+                            return val
+                        return None
 
                     weapon_data_for_model = {
                         "item_hash": str(original_item_hash), 
@@ -177,17 +186,20 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
                         "icon_url": display_props.get("icon", ""),
                         "tier_type": manifest_def.get("inventory", {}).get("tierTypeName", "Unknown Tier"),
                         "item_type": manifest_def.get("itemTypeDisplayName", "Unknown Item Type"),
-                        "item_sub_type": str(manifest_def.get("itemSubType", 0)), # Ensure string
+                        "item_sub_type": str(manifest_def.get("itemSubType", 0)),
                         "location": item_dict.get("location"),
                         "is_equipped": item_dict.get("is_equipped", False),
-                        # Convert damage_type (hash) to string for the model
-                        "damage_type": str(manifest_def.get("defaultDamageTypeHash", "None")), 
-                        "perks": perks_list
+                        "damage_type": str(manifest_def.get("defaultDamageTypeHash", "None")),
+                        "barrel_perks": parse_perk_list(item_dict.get("barrel_perks")),
+                        "magazine_perks": parse_perk_list(item_dict.get("magazine_perks")),
+                        "trait_perk_col1": parse_perk_list(item_dict.get("trait_perk_col1")),
+                        "trait_perk_col2": parse_perk_list(item_dict.get("trait_perk_col2")),
+                        "origin_trait": parse_perk_obj(item_dict.get("origin_trait")),
                     }
                     try:
                         weapon = Weapon(**weapon_data_for_model)
                         reconstructed_weapons.append(weapon)
-                    except Exception as e: # Catch Pydantic validation errors specifically if possible
+                    except Exception as e:
                         logger.error(f"Pydantic validation error reconstructing weapon {original_item_hash} from cache: {e}. Data: {weapon_data_for_model}")
                 
                 # <<< START ADDED LOGGING >>>

@@ -7,6 +7,7 @@ from .models import Weapon, WeaponPerkDetail # Use explicit relative import, ADD
 from .manifest import SupabaseManifestService # Import the new service
 from .bungie_oauth import OAuthManager # Import OAuthManager
 import time
+from web_app.backend.dim_socket_hashes import SocketCategoryHashes
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,13 @@ DAMAGE_TYPE_MAP = {
     6: "Stasis",
     7: "Strand"
 }
+
+# Build lists from the generated enum for each category
+BARREL_CATEGORY_HASHES = [h.value for h in SocketCategoryHashes if "BARREL" in h.name.upper()]
+MAGAZINE_CATEGORY_HASHES = [h.value for h in SocketCategoryHashes if "MAGAZINE" in h.name.upper()]
+TRAIT_PERK_MAIN_CATEGORY_HASHES = [h.value for h in SocketCategoryHashes if "TRAIT" in h.name.upper()]
+ORIGIN_TRAIT_CATEGORY_HASHES = [h.value for h in SocketCategoryHashes if "ORIGINTRAIT" in h.name.upper()]
+INTRINSIC_CATEGORY_HASHES = [h.value for h in SocketCategoryHashes if "INTRINSIC" in h.name.upper()]
 
 class WeaponAPI:
     def __init__(self, oauth_manager: OAuthManager, manifest_service: SupabaseManifestService):
@@ -168,15 +176,6 @@ class WeaponAPI:
                 weapon_socket_entries = item_def.get("sockets", {}).get("socketEntries", [])
                 weapon_socket_categories = item_def.get("sockets", {}).get("socketCategories", [])
 
-                # --- Known Socket Category Hashes (approximations, verify these with manifest inspection) ---
-                # These hashes can be found by inspecting DestinySocketCategoryDefinition in manifest
-                # Or by looking at weapon definitions (e.g. item_def['sockets']['socketCategories'])
-                BARREL_CATEGORY_HASHES = [4241085061] # Example: "Weapon Barrel"
-                MAGAZINE_CATEGORY_HASHES = [192609005] # Example: "Weapon Magazine"
-                # Trait perks often fall under a general category, might need index-based or plugCategoryIdentifier filtering
-                TRAIT_PERK_MAIN_CATEGORY_HASHES = [2685412097] # Example: "Weapon Perks"
-                ORIGIN_TRAIT_CATEGORY_HASHES = [270265983, 3379164202, 2237050098] # Example hashes for origin traits, REMOVED "reforming_frame_category_hash"
-
                 # Get the actual sockets and their plugged perks for this specific item instance
                 instance_sockets = []
                 if item_instance_id and item_instance_id in item_sockets_data:
@@ -194,51 +193,39 @@ class WeaponAPI:
                 for category in weapon_socket_categories:
                     category_hash = category.get("socketCategoryHash")
                     socket_indexes_in_category = category.get("socketIndexes", [])
-
-                    # logger.debug(f"Weapon: {name}, Category: {category_hash}, Sockets: {socket_indexes_in_category}")
-
+                    # DEBUG: Log the category hash and which sockets are in this category
+                    logger.info(f"Weapon {name} ({item_instance_id}): Processing socket category hash {category_hash} with indexes {socket_indexes_in_category}")
                     for socket_idx in socket_indexes_in_category:
                         plug_hash = socket_index_to_plug_hash_map.get(socket_idx)
                         if not plug_hash: continue
-
                         plug_def = definitions_cache.get(plug_hash)
                         if not plug_def: continue
-
                         plug_display_props = plug_def.get("displayProperties", {})
                         perk_name = plug_display_props.get("name")
                         perk_description = plug_display_props.get("description", "")
                         perk_icon_path = plug_display_props.get("icon", "")
                         perk_icon_url = f"https://www.bungie.net{perk_icon_path}" if perk_icon_path else "https://www.bungie.net/common/destiny2_content/icons/broken_icon.png"
-                        
-                        # Ensure we have a name, skip if it's a hidden/default/empty plug
-                        if not perk_name or "shader" in plug_def.get("plug",{}).get("plugCategoryIdentifier","").lower() or "empty" in perk_name.lower() or "default" in perk_name.lower():
+                        if not perk_name or "shader" in plug_def.get("plug",{}).get("plugCategoryIdentifier"," ").lower() or "empty" in perk_name.lower() or "default" in perk_name.lower():
                             continue
-
                         perk_detail = WeaponPerkDetail(
                             perk_hash=plug_hash,
                             name=perk_name,
                             description=perk_description,
                             icon_url=perk_icon_url
                         )
-
-                        # Categorize the perk
+                        # DEBUG: Log which perk list this will be assigned to
                         if category_hash in BARREL_CATEGORY_HASHES:
+                            logger.info(f"  -> Assigning plug '{perk_name}' (hash {plug_hash}) to BARREL_PERKS")
                             barrel_perks_list.append(perk_detail)
                         elif category_hash in MAGAZINE_CATEGORY_HASHES:
+                            logger.info(f"  -> Assigning plug '{perk_name}' (hash {plug_hash}) to MAGAZINE_PERKS")
                             magazine_perks_list.append(perk_detail)
                         elif category_hash in ORIGIN_TRAIT_CATEGORY_HASHES:
-                            if not origin_trait_detail: # Only take the first one if multiple are somehow present
+                            logger.info(f"  -> Assigning plug '{perk_name}' (hash {plug_hash}) to ORIGIN_TRAIT")
+                            if not origin_trait_detail:
                                 origin_trait_detail = perk_detail
                         elif category_hash in TRAIT_PERK_MAIN_CATEGORY_HASHES:
-                            # This is where it gets tricky. We need to ensure we get the two main trait perks in order.
-                            # We also need to avoid intrinsic perks if they share this category.
-                            # The `socket_indexes_in_category` from weapon_def should represent the order.
-                            # Check if it's an intrinsic plug (sometimes plugCategoryIdentifier helps, e.g. "frames")
-                            plug_category_id = plug_def.get("plug", {}).get("plugCategoryIdentifier", "").lower()
-                            if "frames" in plug_category_id or "intrinsics" in plug_category_id or "enhancements.season" in plug_category_id:
-                                # logger.debug(f"Skipping intrinsic/frame perk {perk_name} in TRAIT_PERK_MAIN_CATEGORY for {name}")
-                                continue # Skip intrinsic frames that might be in the main perk category
-                            
+                            logger.info(f"  -> Assigning plug '{perk_name}' (hash {plug_hash}) to TRAIT_PERK_COL1 or COL2")
                             if socket_idx not in processed_trait_socket_indexes:
                                 if not trait_perk_col1_list:
                                     trait_perk_col1_list.append(perk_detail)
@@ -246,10 +233,8 @@ class WeaponAPI:
                                 elif not trait_perk_col2_list:
                                     trait_perk_col2_list.append(perk_detail)
                                     processed_trait_socket_indexes.add(socket_idx)
-                                # else: logger.debug(f"Already filled trait perk slots for {name}, found extra: {perk_name}")
-
-                        # else:
-                            # logger.debug(f"Perk '{perk_name}' (cat hash {category_hash}) for {name} did not fit predefined categories.")
+                        else:
+                            logger.info(f"  -> Plug '{perk_name}' (hash {plug_hash}) did not match any known category for weapon {name} (category hash {category_hash})")
 
                 return Weapon(
                     item_hash=str(item_hash),

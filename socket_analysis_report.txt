@@ -1,0 +1,4 @@
+Destiny 2 Weapon Socket Analysis Report - 2025-05-10 00:27:04
+================================================================================
+
+Fetching all socket category definitions...

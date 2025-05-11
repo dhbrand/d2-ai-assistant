@@ -1,15 +1,16 @@
-import os
 import sys
+import os
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
 import logging
 import asyncio
+import subprocess
 
-# Adjust path to import from project root
-project_root = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, project_root)
-sys.path.insert(0, os.path.dirname(project_root))
+# Ensure the project root is in sys.path for absolute imports
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 # Import manifest sync logic and table list
 try:
@@ -17,6 +18,10 @@ try:
 except ImportError:
     print("Could not import manifest sync logic from sync_user_data_supabase.py. Please ensure the file exists and is in the correct location.")
     sys.exit(1)
+
+# Always update DIM socket hashes before syncing manifest tables
+update_script_path = os.path.join(os.path.dirname(__file__), "update_dim_hashes.py")
+subprocess.run(["python", update_script_path], check=True)
 
 # --- Configuration & Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
