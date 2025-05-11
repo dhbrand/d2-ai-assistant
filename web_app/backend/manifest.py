@@ -5,8 +5,8 @@ import json
 import zipfile
 import logging
 from typing import Dict, Any, Optional, List
-from supabase import Client as SupabaseClient # Keep for type hint if needed, but will use AsyncClient
-from supabase import AsyncClient # Import AsyncClient
+from supabase import Client as SupabaseClient # Use the synchronous client
+from supabase import AsyncClient # REMOVE AsyncClient import
 import asyncio # <--- Ensure asyncio is imported
 from postgrest import APIError # <--- Import APIError for specific error handling
 
@@ -18,10 +18,10 @@ MAX_HASHES_PER_REQUEST = 100
 # New service for fetching definitions from Supabase
 class SupabaseManifestService:
     """Provides access to Destiny 2 Manifest definitions stored in Supabase."""
-    def __init__(self, sb_client: AsyncClient):
+    def __init__(self, sb_client: SupabaseClient):
         self.sb_client = sb_client
 
-    async def get_definition(self, table_name: str, definition_hash: int) -> Optional[Dict[str, Any]]:
+    def get_definition(self, table_name: str, definition_hash: int) -> Optional[Dict[str, Any]]:
         """Fetches a specific definition from a Supabase manifest table by its hash.
 
         Args:
@@ -35,31 +35,25 @@ class SupabaseManifestService:
         if not self.sb_client:
             logger.error(f"Supabase client not available for fetching definition {definition_hash} from {table_name}.")
             return None
-        
         try:
-            # Ensure table name is lowercase as per our Supabase schema
             query_table_name = table_name.lower()
-            
             logger.debug(f"Fetching definition for hash {definition_hash} from Supabase table {query_table_name}...")
-            response = await self.sb_client.table(query_table_name)\
+            response = self.sb_client.table(query_table_name)\
                 .select("json_data")\
                 .eq("hash", definition_hash)\
                 .maybe_single()\
                 .execute()
-
             if response.data:
-                # The json_data column should already be a dict/JSON object
                 return response.data.get('json_data')
             else:
-                # logger.debug(f"Definition not found for hash {definition_hash} in Supabase table {query_table_name}.")
                 return None
         except Exception as e:
             logger.error(f"Error fetching definition {definition_hash} from Supabase table {table_name}: {e}", exc_info=True)
             return None
 
-    async def get_definitions_batch(self, table_name: str, definition_hashes: List[int]) -> Dict[int, Dict[str, Any]]:
+    def get_definitions_batch(self, table_name: str, definition_hashes: List[int]) -> Dict[int, Dict[str, Any]]:
         """Fetches multiple definitions from a Supabase manifest table by their hashes,
-        chunking requests if necessary and fetching chunks concurrently.
+        chunking requests if necessary and fetching chunks sequentially.
 
         Args:
             table_name: The lowercase name of the Supabase table (e.g., 'destinyinventoryitemdefinition').
@@ -75,70 +69,45 @@ class SupabaseManifestService:
         if not definition_hashes:
             logger.info(f"No definition hashes provided for batch fetching from {table_name}.")
             return {}
-
         query_table_name = table_name.lower()
         all_fetched_definitions: Dict[int, Dict[str, Any]] = {}
-        
         num_hashes = len(definition_hashes)
         num_chunks = (num_hashes + MAX_HASHES_PER_REQUEST - 1) // MAX_HASHES_PER_REQUEST
-
-        logger.info(f"Starting concurrent batch fetch for {num_hashes} definitions from {query_table_name} in {num_chunks} chunk(s).")
-
-        tasks = []
+        logger.info(f"Starting batch fetch for {num_hashes} definitions from {query_table_name} in {num_chunks} chunk(s).")
         for i in range(num_chunks):
             start_index = i * MAX_HASHES_PER_REQUEST
             end_index = start_index + MAX_HASHES_PER_REQUEST
             hash_chunk = definition_hashes[start_index:end_index]
-            # Create a task for each chunk
-            tasks.append(self._fetch_definition_chunk(query_table_name, hash_chunk, i+1, num_chunks))
-
-        # Gather results from all tasks, allowing exceptions to be returned
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for i, result_or_exception in enumerate(results):
-            chunk_num = i + 1
-            if isinstance(result_or_exception, Exception):
-                logger.error(f"Error processing chunk {chunk_num}/{num_chunks} for {query_table_name}: {result_or_exception}", exc_info=isinstance(result_or_exception, APIError)) # Log APIError details if available
-            elif result_or_exception: # Should be a list of records if successful
-                for record in result_or_exception:
-                    record_hash = int(record.get('hash'))
-                    json_data_val = record.get('json_data')
-                    if isinstance(json_data_val, str):
-                        try:
-                            json_data_val = json.loads(json_data_val)
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse json_data for hash {record_hash} in {query_table_name} from chunk {chunk_num}")
+            try:
+                response = self.sb_client.table(query_table_name)\
+                    .select("hash, json_data")\
+                    .in_("hash", hash_chunk)\
+                    .execute()
+                if response.data:
+                    for record in response.data:
+                        record_hash = int(record.get('hash'))
+                        json_data_val = record.get('json_data')
+                        if isinstance(json_data_val, str):
+                            try:
+                                json_data_val = json.loads(json_data_val)
+                            except json.JSONDecodeError:
+                                logger.error(f"Failed to parse json_data for hash {record_hash} in {query_table_name} from chunk {i+1}")
+                                json_data_val = {}
+                        elif not isinstance(json_data_val, dict):
+                            logger.warning(f"json_data for hash {record_hash} in {query_table_name} (chunk {i+1}) is not a dict or string, it's {type(json_data_val)}. Using empty dict.")
                             json_data_val = {}
-                    elif not isinstance(json_data_val, dict):
-                        logger.warning(f"json_data for hash {record_hash} in {query_table_name} (chunk {chunk_num}) is not a dict or string, it's {type(json_data_val)}. Using empty dict.")
-                        json_data_val = {}
-                    all_fetched_definitions[record_hash] = json_data_val
-        
-        logger.info(f"Concurrent batch fetch complete for {query_table_name}. Total definitions fetched: {len(all_fetched_definitions)} out of {num_hashes} requested.")
+                        all_fetched_definitions[record_hash] = json_data_val
+            except Exception as e:
+                logger.error(f"Error processing chunk {i+1}/{num_chunks} for {query_table_name}: {e}", exc_info=True)
+        logger.info(f"Batch fetch complete for {query_table_name}. Total definitions fetched: {len(all_fetched_definitions)} out of {num_hashes} requested.")
         return all_fetched_definitions
 
-    async def _fetch_definition_chunk(self, table_name: str, hash_chunk: List[int], chunk_num: int, total_chunks: int) -> Optional[List[Dict[str, Any]]]:
-        """Helper coroutine to fetch a single chunk of definitions."""
-        logger.debug(f"Fetching chunk {chunk_num}/{total_chunks} with {len(hash_chunk)} hashes from {table_name} concurrently.")
-        try:
-            response = self.sb_client.table(table_name)\
-                .select("hash, json_data")\
-                .in_("hash", hash_chunk)\
-                .execute()
-            return response.data # Return the data part of the response
-        except APIError as e: # Catch PostgREST API errors specifically
-            logger.error(f"Supabase APIError on chunk {chunk_num}/{total_chunks} from {table_name}: {e.message} (Code: {e.code}, Details: {e.details}, Hint: {e.hint})", exc_info=False)
-            raise # Re-raise to be caught by asyncio.gather if return_exceptions=True
-        except Exception as e: # Catch other potential errors
-            logger.error(f"Generic error on chunk {chunk_num}/{total_chunks} from {table_name}: {e}", exc_info=True)
-            raise # Re-raise
-
-    async def close_supabase_client(self):
+    def close_supabase_client(self):
         """Closes the Supabase client connection."""
         if self.sb_client:
-            await self.sb_client.close()
-            logger.info("Supabase client connection closed.")
+            # No await needed for sync client
             self.sb_client = None
+            logger.info("Supabase client connection closed.")
 
 class ManifestManager:
     """Manages downloading, extracting, and accessing the Destiny 2 Manifest SQLite database.
