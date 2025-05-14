@@ -137,4 +137,58 @@ MIT — see [LICENSE](LICENSE)
 
 ## Contributors
 - [Your Name Here]
-- [Contributors...] 
+- [Contributors...]
+
+# Destiny 2 Catalysts & Weapon Inventory Sync
+
+This project syncs your Destiny 2 catalyst progress and detailed weapon inventory (including perks) to a Supabase database using the Bungie API and a manifest service.
+
+## Key Features
+- **Catalyst Sync:** Tracks catalyst completion and objectives for your account.
+- **Weapon Inventory Sync:** Extracts all perks, mods, shaders, and intrinsic frames for each weapon instance, using up-to-date manifest data.
+- **Supabase Integration:** Data is upserted into normalized tables for easy querying and analysis.
+- **Async API Calls:** Both catalyst and weapon sync now use robust async patterns for reliability and performance.
+- **Dynamic Membership Info:** No more hardcoded membership IDs—your membership is fetched dynamically from Bungie.
+- **Improved Error Handling:** All API calls use retry logic and handle Bungie API instability gracefully.
+
+## Requirements
+- Python 3.11+
+- [Supabase Python Client](https://github.com/supabase-community/supabase-py)
+- Bungie API Key (set in `.env` as `BUNGIE_API_KEY`)
+- Supabase project and service role key (set in `.env`)
+- Valid Bungie OAuth token (see `token.json`)
+
+## Setup
+1. **Clone the repo and install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. **Configure your `.env` file:**
+   - `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `BUNGIE_API_KEY`
+3. **Authenticate with Bungie:**
+   - Use the provided OAuth flow to generate a valid `token.json`.
+4. **Run the sync script:**
+   ```bash
+   python scripts/sync_user_data.py
+   ```
+   - This will update both catalyst and weapon tables in Supabase.
+
+## Database Schema
+- See `supabase/migrations/user_weapon_inventory_schema.json` for the latest weapon inventory schema.
+- If you change the schema, create and apply a new SQL migration in `supabase/migrations/`.
+
+## Recent Changes
+- **2024-05:**
+  - Refactored `WeaponAPI` to be fully async and match `CatalystAPI` patterns.
+  - Removed hardcoded membership info; now fetched dynamically.
+  - Improved error handling and retry logic for all Bungie API calls.
+  - Fixed manifest service calls to use `asyncio.to_thread` for async compatibility.
+  - Removed component 300 from weapon profile fetch for improved API stability.
+
+## Troubleshooting
+- If you see repeated 500 errors from Bungie, try again later—API instability is common.
+- Ensure your OAuth token is valid and not expired.
+- Check Supabase table structure matches the latest schema.
+
+## Contributing
+PRs and issues welcome! 

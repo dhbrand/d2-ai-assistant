@@ -1,20 +1,13 @@
 import requests
 import logging
-from typing import List, Dict, Any, Optional
-import asyncio # Import asyncio for potential gather later
+import asyncio # Added for asyncio.to_thread
+from typing import List, Dict, Any, Optional # Added Optional for type hinting
+from requests.adapters import HTTPAdapter # Added import
+from urllib3.util.retry import Retry # Added import
 
-from .models import Weapon, WeaponPerkDetail # Use explicit relative import, ADD WeaponPerkDetail
 from .manifest import SupabaseManifestService # Import the new service
 from .bungie_oauth import OAuthManager # Import OAuthManager
 import time
-from web_app.backend.dim_socket_hashes import (
-    SocketCategoryHashes,
-    COL1_CATEGORIES as BARREL_CATEGORY_HASHES,
-    COL2_CATEGORIES as MAGAZINE_CATEGORY_HASHES,
-    COL3_TRAIT_CATEGORIES as TRAIT_PERK_MAIN_CATEGORY_HASHES,
-    ORIGIN_TRAIT_CATEGORIES as ORIGIN_TRAIT_CATEGORY_HASHES,
-    INTRINSIC_TRAIT_CATEGORIES as INTRINSIC_CATEGORY_HASHES,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +25,14 @@ DAMAGE_TYPE_MAP = {
     7: "Strand"
 }
 
-# # Build lists from the generated enum for each category
-# BARREL_CATEGORY_HASHES = [h.value for h in SocketCategoryHashes if "BARREL" in h.name.upper()]
-# MAGAZINE_CATEGORY_HASHES = [h.value for h in SocketCategoryHashes if "MAGAZINE" in h.name.upper()]
-# TRAIT_PERK_MAIN_CATEGORY_HASHES = [h.value for h in SocketCategoryHashes if "TRAIT" in h.name.upper()]
-# ORIGIN_TRAIT_CATEGORY_HASHES = [h.value for h in SocketCategoryHashes if "ORIGINTRAIT" in h.name.upper()]
-# INTRINSIC_CATEGORY_HASHES = [h.value for h in SocketCategoryHashes if "INTRINSIC" in h.name.upper()]
+# Define PCI sets for _get_plug_category at class or module level if preferred,
+# or directly within the method as it's self-contained.
+# For clarity here, we can define them before the class or as class attributes.
+_PCI_COL1 = {"barrels", "tubes", "bowstrings", "blades", "hafts", "scopes"}
+_PCI_COL2 = {"magazines", "batteries", "guards", "arrows"}
+_TRAIT_PCI = {"grips", "traits"}
+_ORIGIN_PCI = {"origin"}
+_FRAME_PCI = {"frames"} # New set for frame identification for intrinsics
 
 class WeaponAPI:
     def __init__(self, oauth_manager: OAuthManager, manifest_service: SupabaseManifestService):
@@ -48,279 +43,378 @@ class WeaponAPI:
 
     def _create_session(self) -> requests.Session: # Stays synchronous
         session = requests.Session()
-        # ... (retry logic unchanged) ...
+        retry = Retry(
+            total=3,  # Total number of retries
+            backoff_factor=1,  # A delay factor to apply between attempts
+            status_forcelist=[500, 502, 503, 504],  # HTTP status codes to retry on
+            allowed_methods=["HEAD", "GET", "OPTIONS"] # Set of uppercased HTTP method verbs that we should retry on.
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
         return session
 
-    def _get_authenticated_headers(self) -> Dict[str, str]: # Remove access_token param
-        # Get headers from OAuthManager, which handles refresh
+    def _get_headers(self) -> Dict[str, str]: # Modified to match CatalystAPI's _get_authenticated_headers
+        """Gets the necessary headers for authenticated Bungie API requests."""
         return self.oauth_manager.get_headers()
 
-    def get_membership_info(self) -> Optional[Dict[str, Any]]: # Remove access_token param, stays synchronous
-        headers = self._get_authenticated_headers() # Call updated method
+    def _fetch_membership_info_sync(self) -> Optional[Dict[str, str]]:
+        """Synchronous helper to fetch and process membership info."""
+        headers = self._get_headers()
         url = f"{self.base_url}/User/GetMembershipsForCurrentUser/"
         try:
-            response = self.session.get(url, headers=headers)
-            response.raise_for_status()
+            # Using a timeout similar to CatalystAPI
+            response = self.session.get(url, headers=headers, timeout=8)
+            if response.status_code != 200:
+                logger.error(f"Failed to get membership info: {response.status_code} - {response.text}")
+                return None
+                
             data = response.json()
-            if data['ErrorCode'] == 1 and data['Response']['destinyMemberships']:
-                primary_membership_id = data['Response'].get('primaryMembershipId')
-                membership = None
-                if primary_membership_id:
-                     membership = next((m for m in data['Response']['destinyMemberships'] if m['membershipId'] == primary_membership_id), None)
-                if not membership and data['Response']['destinyMemberships']:
-                    membership = data['Response']['destinyMemberships'][0]
-                if membership:
-                     logger.info(f"Found membership: Type={membership['membershipType']}, ID={membership['membershipId']}")
-                     return {
-                         "type": membership['membershipType'], 
-                         "id": membership['membershipId'],
-                         "bungieGlobalDisplayName": membership.get('bungieGlobalDisplayName', ''),
-                         "bungieGlobalDisplayNameCode": membership.get('bungieGlobalDisplayNameCode', '')
-                     }
-                else:
-                     logger.error("No destiny memberships found for user.")
-                     return None
+            # Simplified logic to match CatalystAPI
+            if 'Response' not in data or not data['Response'].get('destinyMemberships'):
+                logger.error("No destiny memberships found in response for WeaponAPI.")
+                return None
+                
+            # Prioritize primaryMembershipId if available, else take the first one.
+            # This part is a bit more robust than CatalystAPI's current simple [0] access.
+            primary_membership_id = data['Response'].get('primaryMembershipId')
+            membership_to_use = None
+            
+            if primary_membership_id:
+                for m in data['Response']['destinyMemberships']:
+                    if m['membershipId'] == primary_membership_id:
+                        membership_to_use = m
+                        break
+            
+            if not membership_to_use and data['Response']['destinyMemberships']:
+                membership_to_use = data['Response']['destinyMemberships'][0]
+
+            if membership_to_use:
+                logger.info(f"WeaponAPI found membership - Type: {membership_to_use['membershipType']}, ID: {membership_to_use['membershipId']}")
+                return {
+                    'type': str(membership_to_use['membershipType']), # Ensure type is string
+                    'id': membership_to_use['membershipId']
+                    # Removed bungieGlobalDisplayName and Code to match CatalystAPI's typical return for this specific method
+                }
             else:
-                logger.error(f"Error fetching membership info: {data.get('Message', 'Unknown error')}")
+                logger.error("No usable destiny membership found after checking primary and first entry.")
                 return None
         except requests.exceptions.RequestException as e:
-            logger.error(f"HTTP Error fetching membership info: {e}", exc_info=True)
+            logger.error(f"HTTP Error fetching membership info for WeaponAPI: {e}", exc_info=True)
             return None
-        except Exception as e:
-            logger.error(f"Error processing membership info: {e}", exc_info=True)
+        except Exception as e: # Catching generic Exception for other issues like JSON parsing
+            logger.error(f"Error processing membership info for WeaponAPI: {e}", exc_info=True)
             return None
 
-    def get_all_weapons(self, membership_type: int, destiny_membership_id: str) -> List[Weapon]:
-        logger.info(f"Fetching all weapons for user {destiny_membership_id}")
-        start_time = time.time()
-        try:
-            # Call the now public get_profile_response method
-            profile_data = self.get_profile_response(
-                membership_type, destiny_membership_id, [102, 201, 205, 300, 305]
-            )
-            # The original profile_components_data was the whole JSON response,
-            # get_profile_response now returns the whole JSON response as well.
-            if not profile_data or "Response" not in profile_data:
-                logger.error("Failed to get profile data or Response key missing")
-                return []
+    async def get_membership_info(self) -> Optional[Dict[str, str]]: # Changed to async
+        """Get the current user's membership info, matching CatalystAPI's async pattern."""
+        logger.info("WeaponAPI: Fetching membership info...")
+        return await asyncio.to_thread(self._fetch_membership_info_sync)
+        
+    def get_single_item_component(self, membership_type: int, destiny_membership_id: str, item_instance_id: str, components: List[int]) -> dict:
+        # This method remains synchronous as it's not directly part of the main failing flow being refactored
+        # If it needs to be async, it would follow a similar pattern.
+        headers = self._get_headers()
+        components_str = ",".join(map(str, components))
+        url = (
+            f"{self.base_url}/Destiny2/{membership_type}/Profile/"
+            f"{destiny_membership_id}/Item/{item_instance_id}/?components={components_str}"
+        )
+        response = self.session.get(url, headers=headers)
+        response.raise_for_status()
+        return response.json()
 
-            response_data = profile_data["Response"]
-            item_sockets_data = response_data.get("itemComponents", {}).get("sockets", {}).get("data", {})
-            plug_objectives_data = response_data.get("itemComponents", {}).get("plugObjectives", {}).get("data", {})
-
-            all_item_hashes = set()
-            all_plug_hashes = set()
-
-            inventories_to_scan = []
-            if response_data.get("characterInventories", {}).get("data"):
-                for char_inv in response_data["characterInventories"]["data"].values():
-                    inventories_to_scan.extend(char_inv.get("items", []))
-            if response_data.get("characterEquipment", {}).get("data"):
-                for char_equip in response_data["characterEquipment"]["data"].values():
-                    inventories_to_scan.extend(char_equip.get("items", []))
-            if response_data.get("profileInventory", {}).get("data"):
-                inventories_to_scan.extend(response_data["profileInventory"]["data"].get("items", []))
-
-            for item_data in inventories_to_scan:
-                if "itemHash" in item_data:
-                    all_item_hashes.add(item_data["itemHash"])
-                    item_instance_id = item_data.get("itemInstanceId")
-                    if item_instance_id and item_instance_id in item_sockets_data:
-                        sockets = item_sockets_data[item_instance_id].get("sockets", [])
-                        for socket in sockets:
-                            if socket.get("plugHash"):
-                                all_plug_hashes.add(socket["plugHash"])
-            
-            all_definition_hashes = list(all_item_hashes.union(all_plug_hashes))
-
-            all_definitions_map: Dict[int, Dict[str, Any]] = {}
-            if all_definition_hashes:
-                logger.info(f"Batch fetching {len(all_definition_hashes)} item/plug definitions.")
-                all_definitions_map = self.manifest_service.get_definitions_batch(
-                    "destinyinventoryitemdefinition", 
-                    all_definition_hashes
-                )
-                logger.info(f"Successfully fetched {len(all_definitions_map)} definitions.")
-            else:
-                logger.info("No item or plug hashes found to fetch definitions for.")
-                return []
-
-            weapons = []
-
-            def process_item_sync(item_data: Dict[str, Any], location_prefix: str, definitions_cache: Dict[int, Dict[str, Any]]) -> Optional[Weapon]:
-                if "itemHash" not in item_data: return None
-                item_hash = item_data["itemHash"]
-                item_instance_id = item_data.get("itemInstanceId")
-                
-                item_def = definitions_cache.get(item_hash)
-                if not item_def or item_def.get('itemType') != ITEM_TYPE_WEAPON:
-                    return None
-                
-                display_props = item_def.get('displayProperties', {})
-                name = display_props.get('name', f"Unknown Weapon {item_hash}")
-                description = display_props.get('description', '')
-                icon_url = "https://www.bungie.net" + display_props.get('icon', '') if display_props.get('icon') else ''
-                tier_type = item_def.get('inventory', {}).get('tierTypeName', 'Unknown')
-                item_type_display = item_def.get('itemTypeDisplayName', 'Unknown Weapon Type')
-                item_sub_type_str = str(item_def.get('itemSubType', 0))
-                damage_type_int = item_def.get("defaultDamageType", 0)
-                damage_type_str = DAMAGE_TYPE_MAP.get(damage_type_int, "Unknown")
-                power_level = item_data.get("primaryStat", {}).get("value") if item_instance_id else None
-
-                barrel_perks_list: List[WeaponPerkDetail] = []
-                magazine_perks_list: List[WeaponPerkDetail] = []
-                trait_perk_col1_list: List[WeaponPerkDetail] = []
-                trait_perk_col2_list: List[WeaponPerkDetail] = []
-                origin_trait_detail: Optional[WeaponPerkDetail] = None
-
-                weapon_socket_categories = item_def.get("sockets", {}).get("socketCategories", [])
-                
-                instance_sockets = []
-                if item_instance_id and item_instance_id in item_sockets_data:
-                    instance_sockets = item_sockets_data[item_instance_id].get("sockets", [])
-
-                socket_index_to_plug_hash_map: Dict[int, int] = {
-                    idx: s.get("plugHash") for idx, s in enumerate(instance_sockets) 
-                    if s.get("plugHash") and s.get("isEnabled", False) and s.get("isVisible", True)
-                }
-
-                processed_trait_socket_indexes = set()
-
-                for category in weapon_socket_categories:
-                    category_hash = category.get("socketCategoryHash")
-                    socket_indexes_in_category = category.get("socketIndexes", [])
-                    for socket_idx in socket_indexes_in_category:
-                        plug_hash = socket_index_to_plug_hash_map.get(socket_idx)
-                        if not plug_hash: continue
-                        plug_def = definitions_cache.get(plug_hash)
-                        if not plug_def: continue
-                        plug_display_props = plug_def.get("displayProperties", {})
-                        perk_name = plug_display_props.get("name")
-                        perk_description = plug_display_props.get("description", "")
-                        perk_icon_path = plug_display_props.get("icon", "")
-                        perk_icon_url = f"https://www.bungie.net{perk_icon_path}" if perk_icon_path else "https://www.bungie.net/common/destiny2_content/icons/broken_icon.png"
-                        if not perk_name or "shader" in plug_def.get("plug",{}).get("plugCategoryIdentifier"," ").lower() or "empty" in perk_name.lower() or "default" in perk_name.lower():
-                            continue
-                        perk_detail = WeaponPerkDetail(
-                            perk_hash=plug_hash,
-                            name=perk_name,
-                            description=perk_description,
-                            icon_url=perk_icon_url
-                        )
-                        if category_hash in BARREL_CATEGORY_HASHES:
-                            barrel_perks_list.append(perk_detail)
-                        elif category_hash in MAGAZINE_CATEGORY_HASHES:
-                            magazine_perks_list.append(perk_detail)
-                        elif category_hash in ORIGIN_TRAIT_CATEGORY_HASHES:
-                            if not origin_trait_detail:
-                                origin_trait_detail = perk_detail
-                        elif category_hash in TRAIT_PERK_MAIN_CATEGORY_HASHES:
-                            if socket_idx not in processed_trait_socket_indexes:
-                                if not trait_perk_col1_list:
-                                    trait_perk_col1_list.append(perk_detail)
-                                    processed_trait_socket_indexes.add(socket_idx)
-                                elif not trait_perk_col2_list:
-                                    trait_perk_col2_list.append(perk_detail)
-                                    processed_trait_socket_indexes.add(socket_idx)
-                return Weapon(
-                    item_hash=str(item_hash),
-                    instance_id=item_instance_id,
-                    name=name, 
-                    description=description, 
-                    icon_url=icon_url if icon_url else None,
-                    tier_type=tier_type, 
-                    item_type=item_type_display, 
-                    item_sub_type=str(item_def.get("itemSubType", 0)),
-                    damage_type=damage_type_str,
-                    power_level=power_level,
-                    barrel_perks=barrel_perks_list, # These are INSTANCE perks
-                    magazine_perks=magazine_perks_list, # These are INSTANCE perks
-                    trait_perk_col1=trait_perk_col1_list, # These are INSTANCE perks
-                    trait_perk_col2=trait_perk_col2_list, # These are INSTANCE perks
-                    origin_trait=origin_trait_detail, # This is an INSTANCE perk
-                    location=location_prefix,
-                    is_equipped="Equipped" in location_prefix,
-                    raw_instance_sockets_list=instance_sockets # Pass along for potential detailed analysis
-                )
-
-            # Process items from character inventories
-            if response_data.get("characterInventories", {}).get("data"):
-                for char_id, char_inv in response_data["characterInventories"]["data"].items():
-                    char_name = response_data.get("characters",{}).get("data",{}).get(char_id,{}).get("characterClassResolved","Character")
-                    for item_data in char_inv.get("items", []):
-                        weapon = process_item_sync(item_data, f"Inventory ({char_name})", all_definitions_map)
-                        if weapon:
-                            weapons.append(weapon)
-            
-            # Process items from character equipment
-            if response_data.get("characterEquipment", {}).get("data"):
-                for char_id, char_equip in response_data["characterEquipment"]["data"].items():
-                    char_name = response_data.get("characters",{}).get("data",{}).get(char_id,{}).get("characterClassResolved","Character")
-                    for item_data in char_equip.get("items", []):
-                        weapon = process_item_sync(item_data, f"Equipped ({char_name})", all_definitions_map)
-                        if weapon:
-                            weapons.append(weapon)
-
-            # Process items from profile inventory (vault)
-            if response_data.get("profileInventory", {}).get("data"):
-                for item_data in response_data["profileInventory"]["data"].get("items", []):
-                    weapon = process_item_sync(item_data, "Vault", all_definitions_map)
-                    if weapon:
-                        weapons.append(weapon)
-            
-            end_time = time.time()
-            logger.info(f"Finished fetching and processing all weapons in {end_time - start_time:.2f} seconds. Found {len(weapons)} weapons.")
-            return weapons
-
-        except Exception as e:
-            logger.error(f"Unexpected error in get_all_weapons: {e}", exc_info=True)
-            return []
-
-    # Renamed from _get_profile_components and made public.
-    # This method fetches the raw profile response from Bungie.
-    def get_profile_response(self, membership_type: int, destiny_membership_id: str, components: List[int]) -> Optional[dict]:
-        headers = self._get_authenticated_headers()
-        if not headers:
-            logger.error("Authentication headers are missing, cannot fetch profile components.")
+    def _fetch_profile_sync(self, membership_type: int, destiny_membership_id: str, components: List[int]) -> Optional[dict]:
+        """Synchronous helper to fetch and process profile data."""
+        headers = self._get_headers()
+        if not headers: # Should not happen if oauth_manager.get_headers() works
+            logger.error("Authentication headers are missing in _fetch_profile_sync (WeaponAPI).")
             return None
 
         components_str = ",".join(map(str, components))
         url = f"{self.base_url}/Destiny2/{membership_type}/Profile/{destiny_membership_id}/?components={components_str}"
         
-        logger.debug(f"Requesting profile components from: {url} with components: {components_str}")
+        logger.debug(f"WeaponAPI requesting profile components from: {url} with components: {components_str}")
 
         try:
-            response = self.session.get(url, headers=headers)
-            response.raise_for_status()  # Raises HTTPError for bad responses (4XX or 5XX)
-            data = response.json() # This can raise ValueError if response is not JSON
+            # Adding a timeout similar to CatalystAPI's get_profile
+            response = self.session.get(url, headers=headers, timeout=15)
+            response.raise_for_status()
+            data = response.json()
             
-            # Check Bungie API's own error code
-            if data.get('ErrorCode') == 1: # 1 typically means success
-                logger.info(f"Successfully fetched profile components for user {destiny_membership_id}.")
-                return data # Return the entire successful response object
+            if data.get('ErrorCode') == 1:
+                logger.info(f"WeaponAPI successfully fetched profile components for user {destiny_membership_id}.")
+                return data
             else:
-                # Log Bungie-specific error if ErrorCode is not 1
                 error_message = data.get('Message', 'Unknown Bungie API error')
                 status = data.get('ErrorStatus', 'Unknown Status')
-                logger.error(f"Bungie API Error fetching profile components: {error_message} (ErrorCode: {data.get('ErrorCode')}, Status: {status}) for URL: {url}")
+                logger.error(f"WeaponAPI: Bungie API Error fetching profile components: {error_message} (ErrorCode: {data.get('ErrorCode')}, Status: {status}) for URL: {url}")
                 return None
         except requests.exceptions.HTTPError as http_err:
-            # This catches 4xx/5xx errors after raise_for_status()
-            logger.error(f"HTTP error occurred while fetching profile components: {http_err} - URL: {url} - Response: {http_err.response.text}", exc_info=True)
+            logger.error(f"WeaponAPI: HTTP error occurred while fetching profile components: {http_err} - URL: {url} - Response: {hasattr(http_err, 'response') and hasattr(http_err.response, 'text') and http_err.response.text}", exc_info=True)
             return None
         except requests.exceptions.RequestException as req_err:
-            # This catches other request-related errors (DNS failure, connection timeout, etc.)
-            logger.error(f"Request error occurred while fetching profile components: {req_err} - URL: {url}", exc_info=True)
+            logger.error(f"WeaponAPI: Request error occurred while fetching profile components: {req_err} - URL: {url}", exc_info=True)
             return None
-        except ValueError as json_err: # Catches JSONDecodeError if response isn't valid JSON
-            logger.error(f"JSON decode error while fetching profile components: {json_err} - URL: {url}", exc_info=True)
-            # It might be useful to log response.text here if it's small enough and not sensitive
-            # logger.debug(f"Non-JSON response text: {response.text}")
+        except ValueError as json_err: 
+            logger.error(f"WeaponAPI: JSON decode error while fetching profile components: {json_err} - URL: {url}", exc_info=True)
             return None
         except Exception as e:
-            # Catch-all for any other unexpected errors
-            logger.error(f"An unexpected error occurred while fetching profile components: {e} - URL: {url}", exc_info=True)
+            logger.error(f"WeaponAPI: An unexpected error occurred while fetching profile components: {e} - URL: {url}", exc_info=True)
             return None
+
+    async def get_profile(self, membership_type: int, destiny_membership_id: str, components: List[int]) -> Optional[dict]: # Renamed and made async
+        """Get the user's profile, matching CatalystAPI's async pattern."""
+        logger.info(f"WeaponAPI: Getting profile for {destiny_membership_id}, type {membership_type} with components {components}")
+        return await asyncio.to_thread(self._fetch_profile_sync, membership_type, destiny_membership_id, components)
+
+    def _get_plug_category(self, plug_def: Dict[str, Any]) -> str:
+        if not plug_def or not isinstance(plug_def, dict):
+            return "other"
+            
+        pci = plug_def.get('plug', {}).get('plugCategoryIdentifier', '').lower()
+        name = plug_def.get('displayProperties', {}).get('name', '')
+        item_type_display_name = plug_def.get('itemTypeDisplayName', '').lower()
+
+        # Check for intrinsic frames first
+        if any(key in pci for key in _FRAME_PCI) or item_type_display_name in ("weapon frame", "intrinsic"): # Adjusted keywords
+            return "intrinsic_frame"
+        elif any(key in pci for key in _PCI_COL1):
+            return "col1_barrel"
+        elif any(key in pci for key in _PCI_COL2):
+            return "col2_magazine"
+        elif any(key in pci for key in _TRAIT_PCI) or \
+             plug_def.get('itemTypeDisplayName') in ("Trait", "Enhanced Trait", "Grip"):
+            return "trait"
+        elif any(key in pci for key in _ORIGIN_PCI) or \
+             plug_def.get('itemTypeDisplayName') == "Origin Trait":
+            return "origin_trait"
+        elif "masterworks.stat." in pci or \
+             (pci.startswith("masterwork.") and ".stat." in pci) or \
+             (pci.endswith(".masterwork") and ".weapon." in pci) or \
+             ('masterworks' in pci and name.startswith('Masterworked:')):
+            return "masterwork"
+        elif "shader" in pci:
+            return "shader"
+        elif "weapon.mod_guns" in pci or "weapon mod" in item_type_display_name:
+            return "weapon_mod"
+        else:
+            return "other"
+
+    def _map_item_location_enum_to_string(self, location_enum: Optional[int]) -> str:
+        if location_enum is None:
+            return "unknown"
+        mapping = {
+            0: "unknown",
+            1: "inventory",  # Character inventory / General
+            2: "vault",
+            3: "vendor",     # Unlikely for owned items being synced
+            4: "postmaster"
+        }
+        # If an item is equipped, its location might still be 1 (Inventory)
+        # The `is_equipped` boolean from item instance data is the definitive source for equipped status.
+        return mapping.get(location_enum, "unknown")
+
+    async def get_all_weapons_with_detailed_perks(self, membership_type: str, destiny_membership_id: str) -> List[Dict[str, Any]]:
+        logger.info(f"WeaponAPI: Fetching all weapons with detailed perks for {destiny_membership_id} (type: {membership_type})")
+        components = [
+            102,  # profileInventory
+            201,  # characterInventories
+            205,  # characterEquipment
+            310   # reusablePlugs (for all selectable perks on an item instance)
+        ]
+
+        profile_response = None # Initialize to None
+        try:
+            # Call the new async get_profile method directly
+            profile_response = await self.get_profile(
+                int(membership_type), # Ensure membership_type is passed as an int
+                destiny_membership_id,
+                components
+            )
+        except Exception as e: 
+            logger.error(f"WeaponAPI: Error calling get_profile: {e}", exc_info=True)
+            return [] 
+
+        if profile_response is None:
+            logger.error(f"WeaponAPI: Failed to get profile response from Bungie API for {destiny_membership_id} (profile_response is None).")
+            return []
+
+        if profile_response.get("ErrorCode", 1) != 1: 
+            error_message = profile_response.get('Message', 'Unknown error or malformed error response')
+            logger.error(f"WeaponAPI: Failed to get profile response from Bungie API for {destiny_membership_id}: {error_message}. ErrorCode: {profile_response.get('ErrorCode')}")
+            return []
+
+        response_data = profile_response.get("Response", {})
+        if not response_data:
+            logger.warning(f"Profile response for {destiny_membership_id} was empty or malformed.")
+            return []
+
+        character_equipment_data = response_data.get("characterEquipment", {}).get("data", {})
+        character_inventories_data = response_data.get("characterInventories", {}).get("data", {})
+        profile_inventory_data = response_data.get("profileInventory", {}).get("data", {})
+        item_instances_data = response_data.get("itemComponents", {}).get("instances", {}).get("data", {})
+        reusable_plugs_data = response_data.get("itemComponents", {}).get("reusablePlugs", {}).get("data", {})
+
+        all_items_from_profile_refs = []
+        if character_equipment_data:
+            for char_id, equip_data in character_equipment_data.items():
+                all_items_from_profile_refs.extend(equip_data.get('items', []))
+        if character_inventories_data:
+            for char_id, inv_data in character_inventories_data.items():
+                all_items_from_profile_refs.extend(inv_data.get('items', []))
+        if profile_inventory_data and profile_inventory_data.get("items"):
+            all_items_from_profile_refs.extend(profile_inventory_data.get('items', []))
+        
+        if not all_items_from_profile_refs:
+            logger.info(f"No items found in profile for {destiny_membership_id}.")
+            return []
+        logger.info(f"Found {len(all_items_from_profile_refs)} item references in total from profile for {destiny_membership_id}.")
+
+        instance_socket_plug_hashes = {}
+        all_unique_plug_hashes = set()
+
+        for item_ref in all_items_from_profile_refs:
+            instance_id = item_ref.get('itemInstanceId')
+            if not instance_id:
+                continue
+            
+            # Plugs for this instance are in reusable_plugs_data.data[instance_id].plugs
+            # This is a dictionary where keys are socketIndexes (strings)
+            # and values are lists of plug objects {'plugItemHash': hash, 'canInsert': bool, ...}
+            instance_component_data = reusable_plugs_data.get(instance_id, {})
+            instance_sockets_dict = instance_component_data.get('plugs', {}) # dict: {socketIndexStr: [plugObj, ...]}
+            
+            socket_to_plug_hashes_map = {}
+            for socket_index_str, plug_object_list in instance_sockets_dict.items():
+                current_socket_plug_hashes = [
+                    p.get("plugItemHash") for p in plug_object_list if p and p.get("plugItemHash")
+                ]
+                if current_socket_plug_hashes:
+                    socket_to_plug_hashes_map[int(socket_index_str)] = current_socket_plug_hashes
+                    all_unique_plug_hashes.update(current_socket_plug_hashes)
+            
+            if socket_to_plug_hashes_map:
+                instance_socket_plug_hashes[instance_id] = socket_to_plug_hashes_map
+
+        if not all_unique_plug_hashes:
+            logger.info("No plug hashes collected from reusable plugs.")
+            # This might mean no items with such plugs or issue in data.
+        else:
+             logger.info(f"WeaponAPI: Collected {len(all_unique_plug_hashes)} unique plug hashes to fetch definitions for.")
+
+
+        plug_definitions = await asyncio.to_thread(
+            self.manifest_service.get_definitions_batch,
+            'DestinyInventoryItemDefinition',
+            list(all_unique_plug_hashes)
+        )
+        if not plug_definitions:
+            logger.warning("No plug definitions returned from manifest service. Perk names might be missing.")
+            plug_definitions = {} # Ensure it's a dict to prevent errors later
+
+
+        detailed_weapon_list = []
+        processed_hashes = set() # To avoid reprocessing if an item appears in multiple lists (e.g. equipped and char inventory)
+
+        for item_ref in all_items_from_profile_refs:
+            item_hash = item_ref.get('itemHash')
+            instance_id = item_ref.get('itemInstanceId')
+
+            if not instance_id or not item_hash:
+                continue
+            
+            # Avoid reprocessing the same instance if it was listed multiple times (e.g. bug in flattening)
+            # However, item_ref itself comes from distinct lists (equip, char inv, profile inv), so this might be redundant.
+            # A single item instance should only be in one place.
+            # If we are just building a list of weapon data, we want one entry per unique instance_id.
+            if instance_id in processed_hashes:
+                continue
+            processed_hashes.add(instance_id)
+
+
+            static_def_item = await asyncio.to_thread(
+                self.manifest_service.get_definition,
+                'DestinyInventoryItemDefinition', 
+                item_hash
+            )
+
+            if not static_def_item or static_def_item.get('itemType') != 3:  # 3 is DestinyItemType.Weapon
+                continue
+
+            item_instance_specifics = item_instances_data.get(instance_id, {})
+            location_enum = item_instance_specifics.get('location')
+            is_equipped = item_instance_specifics.get('isEquipped', False)
+            location_str = self._map_item_location_enum_to_string(location_enum)
+            
+            current_item_socket_plugs_map = instance_socket_plug_hashes.get(instance_id, {})
+            
+            socket_plug_defs = {}
+            for socket_idx, p_hashes in current_item_socket_plugs_map.items():
+                defs = [plug_definitions.get(p_hash) for p_hash in p_hashes if plug_definitions.get(p_hash)]
+                if defs: # Only add if there are valid definitions
+                    socket_plug_defs[socket_idx] = defs
+            
+            trait_socket_indexes = sorted([
+                idx for idx, p_defs_list in socket_plug_defs.items()
+                if any(self._get_plug_category(p_def) == "trait" for p_def in p_defs_list if p_def)
+            ])
+
+            col1_plugs, col2_plugs, col3_trait1, col4_trait2 = set(), set(), set(), set()
+            origin_trait_plugs, masterwork_plugs, weapon_mod_plugs, shader_plugs = set(), set(), set(), set()
+            intrinsic_perk_names = set() # For collecting intrinsic perk names
+
+            for socket_index, plug_defs_list in socket_plug_defs.items():
+                for plug_def in plug_defs_list:
+                    if not plug_def:
+                        continue
+                    
+                    name = plug_def.get('displayProperties', {}).get('name')
+                    if not name: # Skip if plug has no name
+                        continue
+
+                    category = self._get_plug_category(plug_def)
+
+                    if category == "intrinsic_frame": intrinsic_perk_names.add(name)
+                    elif category == "col1_barrel": col1_plugs.add(name)
+                    elif category == "col2_magazine": col2_plugs.add(name)
+                    elif category == "trait":
+                        # Ensure trait sockets are correctly identified and assigned
+                        # This logic assumes trait_socket_indexes are purely based on 'trait' category
+                        # Intrinsic frames are now separate and won't be in trait_socket_indexes
+                        if trait_socket_indexes and socket_index == trait_socket_indexes[0]:
+                            col3_trait1.add(name)
+                        elif len(trait_socket_indexes) > 1 and socket_index == trait_socket_indexes[1]:
+                            col4_trait2.add(name)
+                        # else: # A trait in a socket not matching the first two trait sockets.
+                               # Could be assigned to a generic trait list or ignored based on requirements.
+                               # For now, unassigned if not in col3 or col4 based on current logic.
+                    elif category == "origin_trait": origin_trait_plugs.add(name)
+                    elif category == "masterwork": masterwork_plugs.add(name)
+                    elif category == "weapon_mod": weapon_mod_plugs.add(name)
+                    elif category == "shader": shader_plugs.add(name)
+            
+            weapon_data = {
+                "item_instance_id": instance_id,
+                "item_hash": item_hash,
+                "weapon_name": static_def_item.get("displayProperties", {}).get("name"),
+                "weapon_type": static_def_item.get("itemTypeDisplayName"),
+                "intrinsic_perk": sorted(list(intrinsic_perk_names))[0] if intrinsic_perk_names else None,
+                "location": location_str,
+                "is_equipped": is_equipped,
+                "col1_plugs": sorted(list(col1_plugs)),
+                "col2_plugs": sorted(list(col2_plugs)),
+                "col3_trait1": sorted(list(col3_trait1)),
+                "col4_trait2": sorted(list(col4_trait2)),
+                "origin_trait": sorted(list(origin_trait_plugs)),
+                "masterwork": sorted(list(masterwork_plugs)),
+                "weapon_mods": sorted(list(weapon_mod_plugs)),
+                "shaders": sorted(list(shader_plugs)),
+            }
+            detailed_weapon_list.append(weapon_data)
+
+        logger.info(f"Processed {len(detailed_weapon_list)} weapons with detailed perks for {destiny_membership_id}.")
+        return detailed_weapon_list
 
 # Example usage (for testing this file directly, if needed)
 if __name__ == '__main__':

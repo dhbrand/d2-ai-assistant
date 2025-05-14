@@ -108,57 +108,87 @@ async def sync_catalysts(sb_client: Client, oauth_manager: OAuthManager, catalys
         logger.exception(f"An error occurred during catalyst sync: {e}")
 
 async def sync_weapons(sb_client: Client, oauth_manager: OAuthManager, weapon_api: WeaponAPI):
-    logger.info("Starting weapon sync...")
+    logger.info("Starting weapon sync with detailed perks...")
     try:
         oauth_manager.refresh_if_needed()
         bungie_user_id_for_db = oauth_manager.token_data['membership_id']
         if not bungie_user_id_for_db:
             logger.error("Bungie Membership ID not found in token data. Cannot determine user for DB upsert.")
             return
-        logger.info(f"Fetching Destiny membership info for user {bungie_user_id_for_db}...")
-        membership_info = weapon_api.get_membership_info()
-        if not membership_info:
-            logger.error(f"Could not get Destiny membership info for user {bungie_user_id_for_db}. Cannot sync weapons.")
+
+        logger.info(f"Fetching Destiny membership info for user {bungie_user_id_for_db} via WeaponAPI...")
+        membership_info = await weapon_api.get_membership_info() # Now calling the async version
+        
+        if not membership_info or not membership_info.get('id') or not membership_info.get('type'):
+            logger.error(f"Could not get valid Destiny membership info for user {bungie_user_id_for_db} from WeaponAPI. Cannot sync weapons.")
             return
-        membership_type = membership_info['type']
+        
+        membership_type = str(membership_info['type']) # Ensure type is string, though WeaponAPI should already return it as such
         destiny_membership_id = membership_info['id']
-        logger.info(f"Found Destiny membership type {membership_type}, ID {destiny_membership_id}.")
-        logger.info(f"Fetching weapon data from Bungie API using Destiny ID {destiny_membership_id}...")
-        weapon_list = await weapon_api.get_all_weapons(membership_type, destiny_membership_id)
-        if not weapon_list:
-            logger.warning("No weapon data returned from API.")
+        
+        logger.info(f"Successfully fetched Destiny membership: Type={membership_type}, ID={destiny_membership_id} for Bungie User {bungie_user_id_for_db}.")
+
+        logger.info(f"Fetching detailed weapon data from Bungie API using Destiny ID {destiny_membership_id}...")
+        # Call the new method that returns a list of dictionaries
+        detailed_weapon_list = await weapon_api.get_all_weapons_with_detailed_perks(membership_type, destiny_membership_id)
+
+        if not detailed_weapon_list:
+            logger.warning(f"No detailed weapon data returned from API for user {destiny_membership_id}.")
             return
+
         upsert_list = []
         now_iso = datetime.now(timezone.utc).isoformat()
-        for weapon in weapon_list:
-            if not weapon.instance_id:
+
+        for weapon_data in detailed_weapon_list: # weapon_data is already a dictionary
+            if not weapon_data.get("item_instance_id"):
+                logger.warning(f"Skipping weapon due to missing item_instance_id: {weapon_data.get('weapon_name')}")
                 continue
-            upsert_list.append({
+            
+            # Directly map fields from weapon_data to Supabase schema
+            # Ensure all fields defined in user_weapon_inventory_schema.json are covered
+            record_to_upsert = {
                 "user_id": str(bungie_user_id_for_db),
-                "item_instance_id": weapon.instance_id,
-                "item_hash": int(weapon.item_hash),
-                "location": weapon.location,
-                "is_equipped": weapon.is_equipped,
-                "barrel_perks": [perk.model_dump(mode="json") for perk in weapon.barrel_perks] if weapon.barrel_perks else [],
-                "magazine_perks": [perk.model_dump(mode="json") for perk in weapon.magazine_perks] if weapon.magazine_perks else [],
-                "trait_perk_col1": [perk.model_dump(mode="json") for perk in weapon.trait_perk_col1] if weapon.trait_perk_col1 else [],
-                "trait_perk_col2": [perk.model_dump(mode="json") for perk in weapon.trait_perk_col2] if weapon.trait_perk_col2 else [],
-                "origin_trait": weapon.origin_trait.model_dump(mode="json") if weapon.origin_trait else None,
+                "item_instance_id": weapon_data.get("item_instance_id"),
+                "item_hash": weapon_data.get("item_hash"), # Ensure this is an int if schema expects BIGINT
+                "weapon_name": weapon_data.get("weapon_name"),
+                "weapon_type": weapon_data.get("weapon_type"),
+                "intrinsic_perk": weapon_data.get("intrinsic_perk"), # New field
+                "location": weapon_data.get("location"),
+                "is_equipped": weapon_data.get("is_equipped"),
+                "col1_plugs": weapon_data.get("col1_plugs"), # Already a list of strings
+                "col2_plugs": weapon_data.get("col2_plugs"),
+                "col3_trait1": weapon_data.get("col3_trait1"),
+                "col4_trait2": weapon_data.get("col4_trait2"),
+                "origin_trait": weapon_data.get("origin_trait"),
+                "masterwork": weapon_data.get("masterwork"),
+                "weapon_mods": weapon_data.get("weapon_mods"),
+                "shaders": weapon_data.get("shaders"),
                 "last_updated": now_iso
-            })
+            }
+            upsert_list.append(record_to_upsert)
+
         if not upsert_list:
-            logger.info("No weapon data to upsert.")
+            logger.info(f"No weapon data prepared to upsert for user {bungie_user_id_for_db}.")
             return
-        logger.info(f"Upserting {len(upsert_list)} weapon inventory records into Supabase for user {bungie_user_id_for_db}...")
+
+        logger.info(f"Upserting {len(upsert_list)} detailed weapon inventory records into Supabase for user {bungie_user_id_for_db}...")
         response = sb_client.table("user_weapon_inventory").upsert(upsert_list).execute()
+
         if response.data:
-            logger.info(f"Successfully upserted/processed {len(response.data)} weapon records.")
+            logger.info(f"Successfully upserted/processed {len(response.data)} detailed weapon records.")
         else:
-            logger.info("Weapon upsert executed (response data might be empty on success/no change).")
+            # Check for errors in the response if data is empty or missing
+            # Supabase client might have error details in other parts of the response object
+            # For now, assuming no data might mean no changes or successful execution without returning data.
+            logger.info("Detailed weapon upsert executed. Response data might be empty on success/no change, or check for errors.")
+            # Example to log potential error (might need adjustment based on actual Supabase client library)
+            if hasattr(response, 'error') and response.error:
+                logger.error(f"Supabase upsert error: {response.error}")
+
     except InvalidRefreshTokenError:
-        logger.error("Invalid refresh token. Cannot sync weapons.")
+        logger.error("Invalid refresh token. Cannot sync detailed weapons.")
     except Exception as e:
-        logger.exception(f"An error occurred during weapon sync: {e}")
+        logger.exception(f"An error occurred during detailed weapon sync: {e}")
 
 async def main():
     sb_client, manifest_service, oauth_manager, catalyst_api, weapon_api = initialize_services()
