@@ -1,0 +1,123 @@
+{
+  "table_name": "user_weapon_inventory",
+  "description": "Stores detailed information about each user's weapon instances, including their specific perks.",
+  "columns": [
+    {
+      "name": "user_id",
+      "type": "TEXT",
+      "constraints": "NOT NULL, REFERENCES auth.users(id)",
+      "description": "The User ID from the auth.users table, linking the weapon to a specific user."
+    },
+    {
+      "name": "item_instance_id",
+      "type": "TEXT",
+      "constraints": "PRIMARY KEY",
+      "description": "The unique instance ID of the weapon for that user."
+    },
+    {
+      "name": "item_hash",
+      "type": "BIGINT",
+      "constraints": "NOT NULL",
+      "description": "The definition hash of the weapon item."
+    },
+    {
+      "name": "weapon_name",
+      "type": "TEXT",
+      "description": "The display name of the weapon."
+    },
+    {
+      "name": "weapon_type",
+      "type": "TEXT",
+      "description": "The item type display name (e.g., 'Auto Rifle', 'Hand Cannon')."
+    },
+    {
+      "name": "intrinsic_perk",
+      "type": "TEXT",
+      "constraints": "NULL",
+      "description": "The name of the weapon's intrinsic frame or perk (e.g., 'Lightweight Frame')."
+    },
+    {
+      "name": "location",
+      "type": "TEXT",
+      "description": "Indicates where the item is located (e.g., 'inventory', 'vault', 'character_equipment'). Derived from Bungie API's ItemLocation."
+    },
+    {
+      "name": "is_equipped",
+      "type": "BOOLEAN",
+      "description": "True if the weapon is currently equipped by a character."
+    },
+    {
+      "name": "col1_plugs",
+      "type": "TEXT[]",
+      "description": "Array of plug names for the first perk column (e.g., barrels, scopes)."
+    },
+    {
+      "name": "col2_plugs",
+      "type": "TEXT[]",
+      "description": "Array of plug names for the second perk column (e.g., magazines, batteries)."
+    },
+    {
+      "name": "col3_trait1",
+      "type": "TEXT[]",
+      "description": "Array of plug names for the first trait column."
+    },
+    {
+      "name": "col4_trait2",
+      "type": "TEXT[]",
+      "description": "Array of plug names for the second trait column."
+    },
+    {
+      "name": "origin_trait",
+      "type": "TEXT[]",
+      "description": "Array of plug names for the origin trait."
+    },
+    {
+      "name": "masterwork",
+      "type": "TEXT[]",
+      "description": "Array of plug names for the masterwork."
+    },
+    {
+      "name": "weapon_mods",
+      "type": "TEXT[]",
+      "description": "Array of plug names for applied weapon mods."
+    },
+    {
+      "name": "shaders",
+      "type": "TEXT[]",
+      "description": "Array of plug names for applied shaders."
+    },
+    {
+      "name": "last_updated",
+      "type": "TIMESTAMP WITH TIME ZONE",
+      "constraints": "DEFAULT timezone('utc'::text, now()) NOT NULL",
+      "description": "Timestamp of when this record was last updated."
+    }
+  ],
+  "rls_policies": [
+    {
+      "name": "Enable read access for authenticated users based on user_id",
+      "action": "SELECT",
+      "roles": ["authenticated"],
+      "using": "auth.uid() = user_id::uuid"
+    },
+    {
+      "name": "Enable insert access for authenticated users for their own data",
+      "action": "INSERT",
+      "roles": ["authenticated"],
+      "with_check": "auth.uid() = user_id::uuid"
+    },
+    {
+      "name": "Enable update access for authenticated users for their own data",
+      "action": "UPDATE",
+      "roles": ["authenticated"],
+      "using": "auth.uid() = user_id::uuid",
+      "with_check": "auth.uid() = user_id::uuid"
+    },
+    {
+      "name": "Enable delete access for authenticated users for their own data",
+      "action": "DELETE",
+      "roles": ["authenticated"],
+      "using": "auth.uid() = user_id::uuid"
+    }
+  ]
+} 

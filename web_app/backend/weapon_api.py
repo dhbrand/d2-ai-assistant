@@ -30,9 +30,9 @@ DAMAGE_TYPE_MAP = {
 # For clarity here, we can define them before the class or as class attributes.
 _PCI_COL1 = {"barrels", "tubes", "bowstrings", "blades", "hafts", "scopes"}
 _PCI_COL2 = {"magazines", "batteries", "guards", "arrows"}
-_TRAIT_PCI = {"grips", "traits"}
-_ORIGIN_PCI = {"origin"}
-_FRAME_PCI = {"frames"} # New set for frame identification for intrinsics
+_TRAIT_PCI = {"grips", "frames", "stocks"}
+_ORIGIN_PCI = {"origins"}
+_FRAME_PCI = {"intrinsics"} # New set for frame identification for intrinsics
 
 class WeaponAPI:
     def __init__(self, oauth_manager: OAuthManager, manifest_service: SupabaseManifestService):
@@ -177,17 +177,17 @@ class WeaponAPI:
         item_type_display_name = plug_def.get('itemTypeDisplayName', '').lower()
 
         # Check for intrinsic frames first
-        if any(key in pci for key in _FRAME_PCI) or item_type_display_name in ("weapon frame", "intrinsic"): # Adjusted keywords
+        if any(key in pci for key in _FRAME_PCI) or (item_type_display_name and item_type_display_name in ("Enhanced Intrinsic", "Intrinsic")):
             return "intrinsic_frame"
         elif any(key in pci for key in _PCI_COL1):
             return "col1_barrel"
         elif any(key in pci for key in _PCI_COL2):
             return "col2_magazine"
-        elif any(key in pci for key in _TRAIT_PCI) or \
-             plug_def.get('itemTypeDisplayName') in ("Trait", "Enhanced Trait", "Grip"):
+        elif any(key in pci for key in _TRAIT_PCI) and \
+             (isinstance(plug_def.get('itemTypeDisplayName'), str) and any(sub in plug_def.get('itemTypeDisplayName') for sub in ["Trait", "Enhanced Trait", "Grip"])):
             return "trait"
         elif any(key in pci for key in _ORIGIN_PCI) or \
-             plug_def.get('itemTypeDisplayName') == "Origin Trait":
+             (isinstance(plug_def.get('itemTypeDisplayName'), str) and "Origin Trait" in plug_def.get('itemTypeDisplayName')):
             return "origin_trait"
         elif "masterworks.stat." in pci or \
              (pci.startswith("masterwork.") and ".stat." in pci) or \
@@ -221,6 +221,7 @@ class WeaponAPI:
             102,  # profileInventory
             201,  # characterInventories
             205,  # characterEquipment
+            305,  # itemSockets (for currently equipped plugs on each item instance)
             310   # reusablePlugs (for all selectable perks on an item instance)
         ]
 
@@ -255,6 +256,7 @@ class WeaponAPI:
         profile_inventory_data = response_data.get("profileInventory", {}).get("data", {})
         item_instances_data = response_data.get("itemComponents", {}).get("instances", {}).get("data", {})
         reusable_plugs_data = response_data.get("itemComponents", {}).get("reusablePlugs", {}).get("data", {})
+        item_sockets_data = response_data.get("itemComponents", {}).get("sockets", {}).get("data", {})
 
         all_items_from_profile_refs = []
         if character_equipment_data:
@@ -278,22 +280,26 @@ class WeaponAPI:
             instance_id = item_ref.get('itemInstanceId')
             if not instance_id:
                 continue
-            
             # Plugs for this instance are in reusable_plugs_data.data[instance_id].plugs
             # This is a dictionary where keys are socketIndexes (strings)
             # and values are lists of plug objects {'plugItemHash': hash, 'canInsert': bool, ...}
             instance_component_data = reusable_plugs_data.get(instance_id, {})
-            instance_sockets_dict = instance_component_data.get('plugs', {}) # dict: {socketIndexStr: [plugObj, ...]}
-            
             socket_to_plug_hashes_map = {}
-            for socket_index_str, plug_object_list in instance_sockets_dict.items():
-                current_socket_plug_hashes = [
-                    p.get("plugItemHash") for p in plug_object_list if p and p.get("plugItemHash")
-                ]
-                if current_socket_plug_hashes:
-                    socket_to_plug_hashes_map[int(socket_index_str)] = current_socket_plug_hashes
-                    all_unique_plug_hashes.update(current_socket_plug_hashes)
-            
+            if instance_component_data:  # Use reusable plugs if present
+                for socket_index_str, plug_object_list in instance_component_data.get('plugs', {}).items():
+                    current_socket_plug_hashes = [
+                        p.get("plugItemHash") for p in plug_object_list if p and p.get("plugItemHash")
+                    ]
+                    if current_socket_plug_hashes:
+                        socket_to_plug_hashes_map[int(socket_index_str)] = current_socket_plug_hashes
+                        all_unique_plug_hashes.update(current_socket_plug_hashes)
+            else:  # Fallback: use equipped plugs from itemSockets
+                instance_sockets = item_sockets_data.get(instance_id, {}).get('sockets', [])
+                for idx, socket in enumerate(instance_sockets):
+                    plug_hash = socket.get('plugHash')
+                    if plug_hash:
+                        socket_to_plug_hashes_map[idx] = [plug_hash]
+                        all_unique_plug_hashes.add(plug_hash)
             if socket_to_plug_hashes_map:
                 instance_socket_plug_hashes[instance_id] = socket_to_plug_hashes_map
 

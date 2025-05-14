@@ -57,7 +57,7 @@ async def main():
     )
 
     # Dynamically fetch membership info
-    membership_info = weapon_api.get_membership_info()
+    membership_info = await weapon_api.get_membership_info()
     if not membership_info:
         logger.error("Could not fetch membership info from Bungie API. Make sure your OAuth token is valid.")
         return
@@ -68,12 +68,12 @@ async def main():
     # Fetch two separate responses
     components_reusable = [102, 201, 205, 310]
     components_other = [102, 201, 205, 300, 301, 302, 304, 306, 307, 308, 309, 310]
-    profile_response_reusable = weapon_api.get_profile_response(
+    profile_response_reusable = await weapon_api.get_profile(
         membership_type=membership_type,
         destiny_membership_id=destiny_membership_id,
         components=components_reusable
     )
-    profile_response_other = weapon_api.get_profile_response(
+    profile_response_other = await weapon_api.get_profile(
         membership_type=membership_type,
         destiny_membership_id=destiny_membership_id,
         components=components_other
@@ -104,28 +104,30 @@ async def main():
 
     # --- Step 1: Build a mapping of instance_id -> {socket_index: [plug_hash, ...]} ---
     reusable_plugs_data = profile_response_reusable.get("Response", {}).get("itemComponents", {}).get("reusablePlugs", {}).get("data", {})
-    # print(f"[DEBUG] reusable_plugs_data keys: {list(reusable_plugs_data.keys())} (count: {len(reusable_plugs_data)})")
-    # if len(reusable_plugs_data) > 0:
-    #     first_key = next(iter(reusable_plugs_data))
-    #     print(f"[DEBUG] Sample reusable_plugs_data[{first_key}]: {json.dumps(reusable_plugs_data[first_key], indent=2)}")
+    item_sockets_data = profile_response_other.get("Response", {}).get("itemComponents", {}).get("sockets", {}).get("data", {})
     instance_socket_plug_hashes = {}
     all_plug_hashes = set()
     for item in all_items_from_profile:
         instance_id = item.get('itemInstanceId')
         if not instance_id:
             continue
-        
-        instance_component_data = reusable_plugs_data.get(instance_id, {}) # This is the value for the instance_id key from reusablePlugs.data
-        instance_sockets_dict = instance_component_data.get('plugs', {})  # Get the nested 'plugs' dictionary
-        # print(f"[DEBUG] Processing instance_id: {instance_id} - Found actual sockets dict: {bool(instance_sockets_dict)}")
-        
+        # Try reusable plugs first (for legendaries/craftables)
+        instance_component_data = reusable_plugs_data.get(instance_id, {})
+        instance_sockets_dict = instance_component_data.get('plugs', {})
         socket_plug_hashes = {}
-        # Now iterate over the actual sockets dictionary
-        for socket_index_str, plug_object_list in instance_sockets_dict.items():
-            # plug_object_list is a list of dictionaries, each representing a plug
-            plug_hashes = [p.get("plugItemHash") for p in plug_object_list if p and p.get("plugItemHash")]
-            socket_plug_hashes[int(socket_index_str)] = plug_hashes
-            all_plug_hashes.update(plug_hashes)
+        if instance_sockets_dict:  # If reusable plugs exist, use them
+            for socket_index_str, plug_object_list in instance_sockets_dict.items():
+                plug_hashes = [p.get("plugItemHash") for p in plug_object_list if p and p.get("plugItemHash")]
+                socket_plug_hashes[int(socket_index_str)] = plug_hashes
+                all_plug_hashes.update(plug_hashes)
+        else:
+            # Fallback: use equipped plugs from itemSockets (for exotics/fixed-perk)
+            sockets = item_sockets_data.get(instance_id, {}).get('sockets', [])
+            for idx, socket in enumerate(sockets):
+                plug_hash = socket.get('plugHash')
+                if plug_hash:
+                    socket_plug_hashes[idx] = [plug_hash]
+                    all_plug_hashes.add(plug_hash)
         instance_socket_plug_hashes[instance_id] = socket_plug_hashes
 
     # --- Step 2: Batch fetch all plug definitions ---

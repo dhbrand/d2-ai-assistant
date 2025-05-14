@@ -1,0 +1,47 @@
+==== SUPABASE-LIKE WEAPON DATA FOR FIRST WEAPON ====
+{'barrel_perks': [{'description': 'Barrel optimized for distance.\n'
+                                  '  •  Greatly increases range\n'
+                                  '  •  Decreases stability\n'
+                                  '  •  Slightly decreases handling speed',
+                   'icon_url': 'https://www.bungie.net/common/destiny2_content/icons/40a4bdcf0f5a4e492927f9569eaf529d.png',
+                   'name': 'Full Bore',
+                   'perk_hash': 202670084}],
+ 'damage_type': 'Strand',
+ 'icon_url': 'https://www.bungie.net/common/destiny2_content/icons/1986d831face6f7a188204509383574f.jpg',
+ 'is_equipped': True,
+ 'item_hash': 2987244302,
+ 'item_instance_id': '6917530110443598914',
+ 'item_type_display_name': 'Auto Rifle',
+ 'last_updated': '2025-05-12T11:04:14.176632+00:00',
+ 'location': 'Equipped (Character)',
+ 'magazine_perks': [{'description': 'This weapon has multiple tactical '
+                                    'improvements.\n'
+                                    '  •  Slightly increases stability\n'
+                                    '  •  Increases reload speed\n'
+                                    '  •  Slightly increases magazine size',
+                     'icon_url': 'https://www.bungie.net/common/destiny2_content/icons/f0e309a267b25279a871d182f8910bcc.png',
+                     'name': 'Tactical Mag',
+                     'perk_hash': 106909392}],
+ 'name': 'Adamantite',
+ 'origin_trait': {'description': 'Dealing damage or defeating targets with '
+                                 'this weapon gradually grants increased '
+                                 'stability, handling, reload speed, and '
+                                 'charge rate. This effect gradually decreases '
+                                 'over time but is gained more quickly while '
+                                 'near allies.',
+                  'icon_url': 'https://www.bungie.net/common/destiny2_content/icons/89c12603ac7aa90a67d6c1247cbf3fbf.png',
+                  'name': 'Willing Vessel',
+                  'perk_hash': 878237828},
+ 'power_level': 1962,
+ 'tier_type': 'Legendary',
+ 'trait_perk_col1': [{'description': 'Improved handling and reload speed when '
+                                     'allies are nearby.',
+                      'icon_url': 'https://www.bungie.net/common/destiny2_content/icons/421d6325598857bc63c1df0f25607cde.png',
+                      'name': 'Ensemble',
+                      'perk_hash': 2621346526}],
+ 'trait_perk_col2': [{'description': 'Dealing sustained damage creates an Orb '
+                                     'of Power.',
+                      'icon_url': 'https://www.bungie.net/common/destiny2_content/icons/c2092fae6ae58ca77a7f9b4434e688ef.png',
+                      'name': 'Attrition Orbs',
+                      'perk_hash': 243981275}],
+ 'user_id': '4611686018517808552'}

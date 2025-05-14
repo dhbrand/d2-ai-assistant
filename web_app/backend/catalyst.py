@@ -11,6 +11,7 @@ from .catalyst_hashes import CATALYST_RECORD_HASHES
 import hashlib
 import pathlib
 from .manifest import SupabaseManifestService
+import asyncio
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -284,88 +285,103 @@ class CatalystAPI:
         return "Catalyst" in record_def.get("displayProperties", {}).get("name", "")
             
     async def get_catalyst_status_for_db(self) -> Dict[int, Dict]:
-        """
-        Fetches catalyst status suitable for database update. This is a streamlined version
-        of get_catalysts, focusing on raw progress data and record hashes.
-        It will also use batch fetching for definitions.
+        """Fetches catalyst status suitable for database upsertion.
+        Returns a dictionary keyed by catalyst record hash.
+        Each value is a dictionary with 'is_complete' and 'objectives' (list of dicts).
         """
         logger.info("Getting catalyst status for DB update.")
-        membership_info = await self.get_membership_info()
-        if not membership_info:
-            logger.error("Failed to get membership info for DB catalyst status.")
-            return {}
+        status_map = {}
+        membership = await self.get_membership_info()
+        if not membership:
+            logger.error("Could not retrieve membership info for catalyst status.")
+            return status_map
 
-        profile_data = await self.get_profile(membership_info['type'], membership_info['id'])
-        if not profile_data or 'profileRecords' not in profile_data['Response']:
-            logger.error("Failed to get profile records for DB catalyst status.")
-            return {}
+        profile_data = await self.get_profile(int(membership['type']), membership['id'])
+        if not profile_data:
+            logger.error("Could not retrieve profile data for catalyst status.")
+            return status_map
 
-        profile_records = profile_data['Response']['profileRecords']['data']['records']
-        catalyst_statuses = {}
-
-        # Step 1: Collect relevant record hashes and their objective hashes
-        record_hashes_to_fetch = set()
-        objective_hashes_to_fetch = set()
-
-        for record_hash_str, record_content in profile_records.items():
-            if self.cancel_event.is_set(): break
-            try:
-                record_hash = int(record_hash_str)
-                # Consider only known catalyst hashes for DB update for precision
-                if record_hash in CATALYST_RECORD_HASHES:
-                    record_hashes_to_fetch.add(record_hash)
-                    for obj in record_content.get('objectives', []):
-                        if obj_hash := obj.get('objectiveHash'):
-                            objective_hashes_to_fetch.add(obj_hash)
-            except ValueError:
-                continue
+        # profileRecords.data.records is a dict of {recordHash: recordData}
+        # characterRecords.data[characterId].records is also a dict of {recordHash: recordData}
+        all_player_records_data: Dict[int, Dict] = {}
+        if profile_data.get("Response", {}).get("profileRecords", {}).get("data", {}).get("records"):
+            for record_hash_str, record_instance_data in profile_data["Response"]["profileRecords"]["data"]["records"].items():
+                all_player_records_data[int(record_hash_str)] = record_instance_data
         
-        if self.cancel_event.is_set(): return {}
+        if profile_data.get("Response", {}).get("characterRecords", {}).get("data"):
+            for char_id, char_records_component in profile_data["Response"]["characterRecords"]["data"].items():
+                if char_records_component.get("records"):
+                    for record_hash_str, record_instance_data in char_records_component["records"].items():
+                        # Profile records take precedence if a record appears in both (though unlikely for catalysts)
+                        if int(record_hash_str) not in all_player_records_data:
+                            all_player_records_data[int(record_hash_str)] = record_instance_data
 
-        # Step 2: Batch fetch definitions
-        record_definitions_map: Dict[int, Dict[str, Any]] = {}
-        if record_hashes_to_fetch:
-            logger.info(f"DB Update: Batch fetching {len(record_hashes_to_fetch)} DestinyRecordDefinitions.")
-            record_definitions_map = await self.manifest_service.get_definitions_batch(
-                "DestinyRecordDefinition", list(record_hashes_to_fetch)
-            )
+        if not all_player_records_data:
+            logger.warning("No records found in profile or character data.")
+            return status_map
 
-        # No need to fetch objective definitions for this simplified DB status,
-        # as we only care about the raw objective progress from player data.
+        # Collect all unique record hashes and objective hashes to fetch their definitions in batches
+        all_record_hashes_to_fetch = set(CATALYST_RECORD_HASHES) # Start with known catalyst record hashes
+        all_objective_hashes_to_fetch = set()
 
-        if self.cancel_event.is_set(): return {}
+        for record_hash in CATALYST_RECORD_HASHES:
+            player_record_data = all_player_records_data.get(record_hash)
+            if player_record_data and player_record_data.get('objectives'):
+                for obj_data in player_record_data['objectives']:
+                    if obj_data.get('objectiveHash'):
+                        all_objective_hashes_to_fetch.add(obj_data['objectiveHash'])
+        
+        logger.info(f"DB Update: Batch fetching {len(all_record_hashes_to_fetch)} DestinyRecordDefinitions.")
+        record_definitions_map = await asyncio.to_thread(
+            self.manifest_service.get_definitions_batch,
+            'DestinyRecordDefinition',
+            list(all_record_hashes_to_fetch)
+        )
 
-        # Step 3: Process records
-        for record_hash in record_hashes_to_fetch:
-            if self.cancel_event.is_set(): break
-            
-            record_content = profile_records.get(str(record_hash))
+        logger.info(f"DB Update: Batch fetching {len(all_objective_hashes_to_fetch)} DestinyObjectiveDefinitions.")
+        objective_definitions_map = await asyncio.to_thread(
+            self.manifest_service.get_definitions_batch,
+            'DestinyObjectiveDefinition',
+            list(all_objective_hashes_to_fetch)
+        )
+
+        if not record_definitions_map:
+            logger.warning("Failed to fetch any DestinyRecordDefinitions for catalysts.")
+            # No point continuing if we don't have record definitions
+            return status_map
+        # It's okay if objective_definitions_map is empty if no objectives were found
+
+        for record_hash in CATALYST_RECORD_HASHES:
+            player_record_data = all_player_records_data.get(record_hash)
             record_def = record_definitions_map.get(record_hash)
 
-            if not record_content or not record_def:
-                logger.warning(f"DB Update: Missing content or definition for record {record_hash}. Skipping.")
+            if not player_record_data or not record_def:
+                # logger.debug(f"Skipping catalyst {record_hash}: No player data or definition found.")
                 continue
 
-            state_info = self._get_record_state(record_content)
-            is_complete = state_info.get('complete', False)
+            record_state = self._get_record_state(player_record_data)
+            is_complete = record_state.get('complete', False)
             
-            objectives_data_for_db = []
-            for obj_live_data in record_content.get('objectives', []):
-                objectives_data_for_db.append({
-                    "objectiveHash": obj_live_data.get("objectiveHash"),
-                    "progress": obj_live_data.get("progress", 0),
-                    "completionValue": obj_live_data.get("completionValue", 0), # from live data
-                    "complete": obj_live_data.get("complete", False)
-                })
-
-            catalyst_statuses[record_hash] = {
-                "is_complete": is_complete,
-                "objectives": objectives_data_for_db # Storing raw objectives progress
-                # "record_hash" is the key in catalyst_statuses
+            current_objectives_for_db = []
+            if player_record_data.get('objectives'):
+                for obj_data in player_record_data['objectives']:
+                    obj_hash = obj_data.get('objectiveHash')
+                    # obj_def = objective_definitions_map.get(obj_hash) # Not needed for DB schema
+                    current_objectives_for_db.append({
+                        "objectiveHash": obj_hash,
+                        "progress": obj_data.get('progress', 0),
+                        "completionValue": obj_data.get('completionValue', 1), # Default to 1 to avoid div by zero
+                        "complete": obj_data.get('complete', False)
+                    })
+            
+            status_map[record_hash] = {
+                'is_complete': is_complete,
+                'objectives': current_objectives_for_db
             }
+            # logger.debug(f"Processed catalyst for DB: {record_hash}, Complete: {is_complete}, Objs: {len(current_objectives_for_db)}")
         
-        logger.info(f"DB Update: Prepared status for {len(catalyst_statuses)} catalysts.")
-        return catalyst_statuses
+        logger.info(f"Finished processing catalyst statuses for DB. Found {len(status_map)} relevant catalysts.")
+        return status_map
 
     async def get_catalysts(self) -> List[Dict]:
         """Main function to get detailed catalyst information for the agent."""
