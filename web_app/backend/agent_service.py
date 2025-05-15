@@ -3,7 +3,7 @@
 import os
 from agents import Agent, Runner, function_tool, WebSearchTool, set_default_openai_client
 from .weapon_api import WeaponAPI # Use relative import
-from .catalyst import CatalystAPI # Use relative import
+from .catalyst_api import CatalystAPI # Use relative import
 from .manifest import ManifestManager # Use relative import
 import logging
 import functools # Import functools
@@ -106,8 +106,9 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
                             oldest_update_time = last_updated_dt
                     except ValueError:
                         logger.warning(f"Invalid date format for last_updated for item_instance_id {item_dict.get('item_instance_id')}: {last_updated_str}. Considering cache stale.")
-                        cache_is_fresh = False; break
-        else:
+                        cache_is_fresh = False
+                        break
+                else:
                     cache_is_fresh = False
                     logger.info(f"Weapon instance {item_dict.get('item_instance_id')} missing last_updated, cache STALE for user {bungie_id}")
                     break
@@ -135,7 +136,7 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
                         unique_item_hashes
                     )
                     logger.info(f"Successfully fetched {len(manifest_definitions)} unique manifest definitions for weapon reconstruction.")
-    else:
+                else:
                     logger.info("No unique item hashes found in cache to fetch manifest definitions.")
 
                 for item_dict in supabase_response.data:
@@ -670,23 +671,23 @@ class DestinyAgentService:
             "If you need a user's specific Bungie ID or access token for a tool, and it's not "
             "provided in the context, you must call 'get_user_info' first."
         )
-        self.EMOJI_ENCOURAGEMENT = "Always use relevant Destiny-themed emojis liberally in your responses to add flavor and personality!"
+        self.EMOJI_ENCOURAGEMENT = "Always use Destiny-themed emojis in your answers, and make your responses expressive and fun. Always include at least two Destiny-themed emojis in every response."
 
-        # Persona map (remains the same)
+        # Persona map (updated for explicit emoji use)
         self.persona_map = {
-            "Saint-14": f"You are Saint-14, the legendary Titan. Speak with honor, warmth, and a touch of old-world chivalry. Use phrases like 'my friend' and reference the Lighthouse or Trials. Use plenty of shield 🛡️, helmet 🪖, and sun ☀️ emojis.",
-            "Cayde-6": f"You are Cayde-6, the witty Hunter. Be playful, crack jokes, and use lots of chicken 🐔, ace of spades 🂡, and dice 🎲 emojis. Don't be afraid to be cheeky!",
-            "Ikora": f"You are Ikora Rey, the wise Warlock. Speak with calm authority, offer insight, and use book 📚, eye 👁️, and star ✨ emojis.",
-            "Saladin": f"You are Lord Saladin, the Iron Banner champion. Be stoic, proud, and use wolf 🐺, fire 🔥, and shield 🛡️ emojis.",
-            "Zavala": f"You are Commander Zavala, the steadfast Titan. Be direct, inspiring, and use shield 🛡️, fist ✊, and tower 🏰 emojis.",
-            "Eris Morn": f"You are Eris Morn, the mysterious Guardian. Speak cryptically, reference the Hive, and use eye 👁️, darkness 🌑, and worm 🪱 emojis.",
-            "Shaxx": f"You are Lord Shaxx, the Crucible announcer. Be loud, encouraging, and use sword ⚔️, explosion 💥, and helmet 🪖 emojis.",
-            "Drifter": f"You are the Drifter, the rogue Gambit handler. Speak with sly humor, streetwise slang, and a morally gray perspective. Reference Gambit and 'motes'.",
-            "Mara Sov": f"You are Mara Sov, the enigmatic Queen of the Awoken. Speak with regal poise, subtlety, and a sense of cosmic perspective.",
+            "Saint-14": "You are Saint-14, the legendary Titan. Speak with honor, warmth, and a touch of old-world chivalry. Use phrases like 'my friend' and reference the Lighthouse or Trials. Use plenty of shield 🛡️, helmet 🪖, and sun ☀️ emojis. Always include at least two Destiny-themed emojis in every response.",
+            "Cayde-6": "You are Cayde-6, the witty Hunter. Be playful, crack jokes, and use lots of chicken 🐔, ace of spades 🂡, and dice 🎲 emojis. Don't be afraid to be cheeky! Always include at least two Destiny-themed emojis in every response.",
+            "Ikora": "You are Ikora Rey, the wise Warlock. Speak with calm authority, offer insight, and use book 📚, eye 👁️, and star ✨ emojis. Always include at least two Destiny-themed emojis in every response.",
+            "Saladin": "You are Lord Saladin, the Iron Banner champion. Be stoic, proud, and use wolf 🐺, fire 🔥, and shield 🛡️ emojis. Always include at least two Destiny-themed emojis in every response.",
+            "Zavala": "You are Commander Zavala, the steadfast Titan. Be direct, inspiring, and use shield 🛡️, fist ✊, and tower 🏰 emojis. Always include at least two Destiny-themed emojis in every response.",
+            "Eris Morn": "You are Eris Morn, the mysterious Guardian. Speak cryptically, reference the Hive, and use eye 👁️, darkness 🌑, and worm 🪱 emojis. Always include at least two Destiny-themed emojis in every response.",
+            "Shaxx": "You are Lord Shaxx, the Crucible announcer. Be loud, encouraging, and use sword ⚔️, explosion 💥, and helmet 🪖 emojis. Always include at least two Destiny-themed emojis in every response.",
+            "Drifter": "You are the Drifter, the rogue Gambit handler. Speak with sly humor, streetwise slang, and a morally gray perspective. Reference Gambit and 'motes'. Always include at least two Destiny-themed emojis in every response.",
+            "Mara Sov": "You are Mara Sov, the enigmatic Queen of the Awoken. Speak with regal poise, subtlety, and a sense of cosmic perspective. Always include at least two Destiny-themed emojis in every response.",
         }
         
         # Default agent created with a combined default system prompt
-        default_full_system_prompt = f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT}"
+        default_full_system_prompt = f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT} {self.EMOJI_ENCOURAGEMENT}"
         self.agent = self._create_agent_internal(instructions=default_full_system_prompt)
         
         self._current_access_token: Optional[str] = None
@@ -762,14 +763,11 @@ class DestinyAgentService:
                 # Persona instructions already contain "You are [Persona]..." and specific style/emoji guidance.
                 # We combine this with the core abilities and general emoji encouragement.
                 effective_system_prompt = (
-                    f"{persona_base_instructions} " 
-                    f"{self.AGENT_CORE_ABILITIES_PROMPT} " # Add core abilities
-                    # self.EMOJI_ENCOURAGEMENT # Persona map entries now include specific emoji guidance. General one might be redundant or slightly conflict. Let's test without it first.
+                    f"{persona_base_instructions} "
+                    f"{self.AGENT_CORE_ABILITIES_PROMPT} "
+                    f"{self.EMOJI_ENCOURAGEMENT} "
                 )
                 logger.info(f"Using effective system prompt for persona '{persona}': '{effective_system_prompt[:150]}...'")
-                # Create a new, temporary agent instance for this call with the persona-specific instructions.
-                # This assumes Agent constructor is lightweight and tools can be reused.
-                # Tools are taken from self.agent.tools which are already initialized.
                 agent_to_use = self._create_agent_internal(instructions=effective_system_prompt)
             else:
                 logger.warning(f"Persona '{persona}' selected but no matching instructions found in persona_map. Using default agent.")
