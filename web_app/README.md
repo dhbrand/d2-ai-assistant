@@ -62,6 +62,10 @@ This project uses self-signed certificates for local HTTPS.
     python generate_cert.py
     cd ..
     ```
+    Or, generate them directly with OpenSSL:
+    ```bash
+    openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/CN=localhost"
+    ```
 
 2.  **Backend Configuration:** `web-app/backend/main.py` is configured to automatically use these certificates if they exist when running `python main.py`.
 
