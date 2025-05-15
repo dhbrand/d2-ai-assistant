@@ -13,7 +13,9 @@
     "react-markdown": "^10.1.0",
     "react-router-dom": "^6.20.0",
     "react-scripts": "5.0.1",
-    "recharts": "^2.9.3"
+    "recharts": "^2.9.3",
+    "rehype-raw": "^7.0.0",
+    "remark-gfm": "^4.0.1"
   },
   "scripts": {
     "start": "HTTPS=true SSL_CRT_FILE=$(pwd)/../cert.pem SSL_KEY_FILE=$(pwd)/../key.pem react-scripts start",
