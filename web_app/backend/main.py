@@ -45,6 +45,7 @@ class ChatRequest(BaseModel):
     token_data: Optional[TokenData] = None
     model_name: Optional[str] = None
     conversation_id: Optional[uuid.UUID] = None # Add conversation ID
+    persona: Optional[str] = None  # <-- Add persona support
 
 class ChatResponse(BaseModel):
     message: ChatMessage
@@ -745,7 +746,8 @@ async def assistants_chat_endpoint(
             prompt=user_message_content,
             access_token=access_token,
             bungie_id=bungie_id,
-            history=conversation_history
+            history=conversation_history,
+            persona=request.persona  # <-- Pass persona to agent
         )
         
         agent_response_content = ""

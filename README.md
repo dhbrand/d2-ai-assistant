@@ -191,4 +191,19 @@ This project syncs your Destiny 2 catalyst progress and detailed weapon inventor
 - Check Supabase table structure matches the latest schema.
 
 ## Contributing
-PRs and issues welcome! 
+PRs and issues welcome!
+
+## Unified Development Workflow
+
+To start both the backend (FastAPI, with SSL for Bungie API compatibility) and the frontend (React) in development mode, use the new root-level script:
+
+```bash
+npm run dev
+```
+
+- Run this command from the project root (`/Users/davehiltbrand/Documents/destiny2_catalysts`).
+- This will start both servers in parallel, with output in the same terminal.
+- The backend will use SSL certificates from `web_app/cert.pem` and `web_app/key.pem`.
+- The old `dev` script in `web_app/frontend/package.json` has been removed to avoid confusion.
+
+**Tip:** If you see errors about missing dependencies (e.g., `remark-gfm`, `rehype-raw`), run `npm install` in `web_app/frontend` to install them. 

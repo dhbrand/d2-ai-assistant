@@ -1,5 +1,45 @@
 ---
-description:
-globs:
+description: 
+globs: 
 alwaysApply: false
 ---
+- **General Principles:**
+  - Use clear, descriptive, and consistent names for all files and directories.
+  - Match naming patterns for files with similar roles or context (e.g., catalysts.py and weapons_api.py should be either both singular or both plural, and use similar separators).
+  - Avoid abbreviations unless they are widely recognized in the project or domain.
+  - Do not use spaces or uppercase letters in file or directory names.
+
+- **Python Files:**
+  - Use `snake_case.py` for all Python modules and scripts.
+    - Example: `catalyst_api.py`, `weapon_api.py`, `agent_service.py`
+  - For files representing similar concepts, use parallel naming (e.g., `catalyst_api.py` and `weapon_api.py`, not `catalysts.py` and `weapon_api.py`).
+  - Test files should be prefixed with `test_` (e.g., `test_weapon_api.py`).
+
+- **Directories:**
+  - Use `snake_case` or `kebab-case` for directories, and be consistent within a given level of the project.
+    - Example: `web_app/`, `backend/`, `definition_cache/`
+
+- **Constants and Data Files:**
+  - Use `ALL_CAPS_WITH_UNDERSCORES` for constants in code.
+  - Use `snake_case` for data files (e.g., `catalyst_hashes.py`, `user_profiles.json`).
+
+- **Markdown and Documentation:**
+  - Use `README.md`, `CONTRIBUTING.md`, etc., for documentation files.
+
+- **Config and Environment Files:**
+  - Use lowercase, no spaces (e.g., `requirements.txt`, `.env`, `.gitignore`).
+
+- **DO:**
+  - `catalyst_api.py`, `weapon_api.py`, `test_catalyst_api.py`, `definition_cache/`
+- **DON'T:**
+  - `Catalysts.py`, `WeaponsAPI.py`, `catalysts.py` (if you have `weapon_api.py`), `DefinitionCache/`, `TestWeaponApi.py`
+
+- **Rationale:**
+  - Consistent naming improves codebase readability, discoverability, and maintainability.
+  - Parallel naming for similar files (e.g., APIs, models) helps developers quickly find and understand related code.
+  - Avoiding mixed conventions (e.g., singular vs. plural, snake_case vs. camelCase) reduces confusion and errors.
+
+- **Enforcement:**
+  - When creating or renaming files, always check for similar files and match their naming pattern.
+  - If introducing a new pattern, update this rule and refactor existing files for consistency.
+  - Use this rule as a reference during code reviews and when generating code with AI tools.
