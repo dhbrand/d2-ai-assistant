@@ -1,0 +1,45 @@
+Destiny 2 Catalyst Tracker & AI Assistant — PRD
+
+Overview:
+A modern web tool for tracking Destiny 2 catalysts, featuring an AI assistant with Destiny character personas, emoji-rich responses, and deep integration with Bungie.net and community Google Sheets. The app syncs weapon and catalyst data to a Supabase database for analysis and inventory management.
+
+Features:
+- AI Chat Assistant: Users can ask questions about catalysts, weapons, and Destiny 2 using natural language.
+- Persona System: Users select from Destiny characters (Saint-14, Cayde-6, Ikora, etc.) for unique, emoji-filled responses.
+- Google Sheets Integration: Backend pulls curated weapon and endgame data from public and private Google Sheets (service account support).
+- Session Longevity: JWT refresh endpoint keeps users logged in for 24h+ without repeated Bungie logins.
+- Persona Dropdown: Instantly switch the agent's personality in the chat UI.
+- Secure Token Handling: Refresh tokens and sensitive credentials are never exposed to the frontend or committed to git.
+- Dark/Light Theme: Modern, responsive UI for desktop and mobile.
+- Cross-Platform Web: React frontend, FastAPI backend.
+- Supabase Sync: Syncs catalyst completion, objectives, and weapon inventory (perks, mods, shaders, intrinsic frames) to Supabase tables.
+- Async API Calls: All sync and data fetch operations use async patterns for reliability and performance.
+- Dynamic Membership Info: Membership IDs are fetched dynamically from Bungie, not hardcoded.
+- Improved Error Handling: All API calls use retry logic and handle Bungie API instability gracefully.
+
+Requirements:
+- Python 3.11+
+- React
+- FastAPI
+- Supabase (Python client)
+- Google Sheets API (service account)
+- Bungie API (OAuth2)
+
+User Stories:
+- As a user, I want to log in securely with my Bungie.net account and stay logged in for long sessions.
+- As a user, I want to view and track my Destiny 2 catalysts and weapon inventory, including perks and progress.
+- As a user, I want to chat with an AI assistant that can answer Destiny 2 questions in the style of my favorite character.
+- As a user, I want to see curated weapon and endgame recommendations from Google Sheets.
+- As a user, I want a modern, responsive UI with dark and light themes.
+- As a user, I want my sensitive tokens and credentials to be handled securely and never exposed to the frontend.
+
+Constraints:
+- No desktop/CLI app required.
+- All sensitive files (service_account.json, credentials.json, private keys) must not be committed to git.
+- OAuth2, JWT, and refresh tokens must be handled securely on the backend.
+- Google Sheets and Supabase credentials must be managed via environment variables or secure config.
+
+Nice to Have:
+- Emoji-rich responses from the AI assistant.
+- Dynamic persona switching in the chat UI.
+- Caching of Google Sheets and manifest data for performance. 

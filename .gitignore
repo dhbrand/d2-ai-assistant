@@ -136,4 +136,21 @@ dev-certs/
 
 # New lines from the code block
 web_app/backend/credentials.json
-web_app/backend/service_account.json 
+web_app/backend/service_account.json
+
+# Added by Claude Task Master
+logs
+dev-debug.log
+# Dependency directories
+# Editor directories and files
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+# OS specific
+# Task files
+tasks.json
+tasks/ 
