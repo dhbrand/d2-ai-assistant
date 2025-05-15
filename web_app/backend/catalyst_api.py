@@ -12,6 +12,7 @@ import hashlib
 import pathlib
 from .manifest import SupabaseManifestService
 import asyncio
+from web_app.backend.performance_logging import log_api_performance  # Import the profiling helper
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -56,11 +57,11 @@ class CatalystAPI:
         # Get headers from OAuthManager, which handles refresh
         return self.oauth_manager.get_headers()
         
-    async def get_membership_info(self) -> Optional[Dict[str, str]]:
+    async def get_membership_info(self, user_id: str = None, sb_client: 'AsyncClient' = None) -> Optional[Dict[str, str]]:
         """Get the current user's membership info"""
         if self.cancel_event.is_set():
             return None
-            
+        api_start = time.time()
         try:
             url = f"{self.base_url}/User/GetMembershipsForCurrentUser/"
             logger.info(f"Fetching membership from: {url}")
@@ -81,15 +82,22 @@ class CatalystAPI:
                 'type': membership['membershipType'],
                 'id': membership['membershipId']
             }
-        except Exception as e:
-            logger.error(f"Error getting membership info: {e}")
-            return None
+        finally:
+            api_duration_ms = int((time.time() - api_start) * 1000)
+            if sb_client:
+                await log_api_performance(
+                    sb_client,
+                    endpoint="catalyst_api.get_membership_info",
+                    operation="bungie_api_call",
+                    duration_ms=api_duration_ms,
+                    user_id=user_id
+                )
             
-    async def get_profile(self, membership_type: int, membership_id: str) -> Optional[Dict]:
+    async def get_profile(self, membership_type: int, membership_id: str, user_id: str = None, sb_client: 'AsyncClient' = None) -> Optional[Dict]:
         """Get the user's profile with records"""
         if self.cancel_event.is_set():
             return None
-            
+        api_start = time.time()
         try:
             url = f"{self.base_url}/Destiny2/{membership_type}/Profile/{membership_id}/"
             
@@ -125,9 +133,16 @@ class CatalystAPI:
             
             return data
             
-        except Exception as e:
-            logger.error(f"Error getting profile: {e}")
-            return None
+        finally:
+            api_duration_ms = int((time.time() - api_start) * 1000)
+            if sb_client:
+                await log_api_performance(
+                    sb_client,
+                    endpoint="catalyst_api.get_profile",
+                    operation="bungie_api_call",
+                    duration_ms=api_duration_ms,
+                    user_id=user_id
+                )
             
     def _get_record_state(self, record):
         """Get the state of a record using the same logic as DIM."""
@@ -383,121 +398,134 @@ class CatalystAPI:
         logger.info(f"Finished processing catalyst statuses for DB. Found {len(status_map)} relevant catalysts.")
         return status_map
 
-    async def get_catalysts(self) -> List[Dict]:
+    async def get_catalysts(self, user_id: str = None, sb_client: 'AsyncClient' = None) -> List[Dict]:
         """Main function to get detailed catalyst information for the agent."""
         start_total_time = time.time()
         logger.info("Starting get_catalysts process...")
 
-        membership_info = await self.get_membership_info()
-        if not membership_info:
-            return [{"error": "Failed to get user membership info."}]
+        result = []
+        try:
+            membership_info = await self.get_membership_info(user_id=user_id, sb_client=sb_client)
+            if not membership_info:
+                return [{"error": "Failed to get user membership info."}]
 
-        profile_data = await self.get_profile(membership_info['type'], membership_info['id'])
-        if not profile_data or 'profileRecords' not in profile_data['Response']:
-            logger.error("No profile records found in GetProfile response")
-            return [{"error": "Failed to retrieve profile records."}]
-        
-        profile_records_data = profile_data['Response']['profileRecords']['data']['records']
-        catalysts = []
+            profile_data = await self.get_profile(membership_info['type'], membership_info['id'], user_id=user_id, sb_client=sb_client)
+            if not profile_data or 'profileRecords' not in profile_data['Response']:
+                logger.error("No profile records found in GetProfile response")
+                return [{"error": "Failed to retrieve profile records."}]
+            
+            profile_records_data = profile_data['Response']['profileRecords']['data']['records']
+            catalysts = []
 
-        # --- Step 1: Identify relevant record hashes and their objective hashes ---
-        record_hashes_to_process = set()
-        all_objective_hashes = set()
+            # --- Step 1: Identify relevant record hashes and their objective hashes ---
+            record_hashes_to_process = set()
+            all_objective_hashes = set()
 
-        logger.info(f"Processing all {len(profile_records_data)} profile records (Discovery: {self.discovery_mode}).")
-        for record_hash_str, live_record_data in profile_records_data.items():
-            if self.cancel_event.is_set(): break
-            try:
-                record_hash = int(record_hash_str)
-                is_potential_catalyst = False
-                if self.discovery_mode:
-                    is_potential_catalyst = True # In discovery, consider all for initial def fetch
-                elif record_hash in CATALYST_RECORD_HASHES:
-                    is_potential_catalyst = True
-                
-                if is_potential_catalyst:
-                    record_hashes_to_process.add(record_hash)
-                    for obj_data in live_record_data.get('objectives', []):
-                        if obj_hash := obj_data.get('objectiveHash'):
-                            all_objective_hashes.add(obj_hash)
-            except ValueError:
-                logger.debug(f"Skipping non-integer record hash key: {record_hash_str}")
-                continue
-        
-        if self.cancel_event.is_set():
-            logger.info("get_catalysts operation cancelled during hash collection.")
-            return [{"error": "Operation cancelled."}]
+            logger.info(f"Processing all {len(profile_records_data)} profile records (Discovery: {self.discovery_mode}).")
+            for record_hash_str, live_record_data in profile_records_data.items():
+                if self.cancel_event.is_set(): break
+                try:
+                    record_hash = int(record_hash_str)
+                    is_potential_catalyst = False
+                    if self.discovery_mode:
+                        is_potential_catalyst = True # In discovery, consider all for initial def fetch
+                    elif record_hash in CATALYST_RECORD_HASHES:
+                        is_potential_catalyst = True
+                    
+                    if is_potential_catalyst:
+                        record_hashes_to_process.add(record_hash)
+                        for obj_data in live_record_data.get('objectives', []):
+                            if obj_hash := obj_data.get('objectiveHash'):
+                                all_objective_hashes.add(obj_hash)
+                except ValueError:
+                    logger.debug(f"Skipping non-integer record hash key: {record_hash_str}")
+                    continue
+            
+            if self.cancel_event.is_set():
+                logger.info("get_catalysts operation cancelled during hash collection.")
+                return [{"error": "Operation cancelled."}]
 
-        logger.info(f"Identified {len(record_hashes_to_process)} potential catalyst records and {len(all_objective_hashes)} unique objective hashes.")
+            logger.info(f"Identified {len(record_hashes_to_process)} potential catalyst records and {len(all_objective_hashes)} unique objective hashes.")
 
-        # --- Step 2: Batch fetch all required definitions ---
-        t_def_fetch_start = time.time()
-        record_definitions_map: Dict[int, Dict[str, Any]] = {}
-        objective_definitions_map: Dict[int, Dict[str, Any]] = {}
+            # --- Step 2: Batch fetch all required definitions ---
+            t_def_fetch_start = time.time()
+            record_definitions_map: Dict[int, Dict[str, Any]] = {}
+            objective_definitions_map: Dict[int, Dict[str, Any]] = {}
 
-        if record_hashes_to_process:
-            logger.info(f"Batch fetching {len(record_hashes_to_process)} DestinyRecordDefinitions.")
-            record_definitions_map = await self.manifest_service.get_definitions_batch(
-                "DestinyRecordDefinition", list(record_hashes_to_process)
-            )
-            logger.info(f"Fetched {len(record_definitions_map)} record definitions.")
-        
-        if all_objective_hashes:
-            logger.info(f"Batch fetching {len(all_objective_hashes)} DestinyObjectiveDefinitions.")
-            objective_definitions_map = await self.manifest_service.get_definitions_batch(
-                "DestinyObjectiveDefinition", list(all_objective_hashes)
-            )
-            logger.info(f"Fetched {len(objective_definitions_map)} objective definitions.")
-        
-        t_def_fetch_end = time.time()
-        logger.info(f"Batch definition fetching took {t_def_fetch_end - t_def_fetch_start:.2f} seconds.")
+            if record_hashes_to_process:
+                logger.info(f"Batch fetching {len(record_hashes_to_process)} DestinyRecordDefinitions.")
+                record_definitions_map = await self.manifest_service.get_definitions_batch(
+                    "DestinyRecordDefinition", list(record_hashes_to_process)
+                )
+                logger.info(f"Fetched {len(record_definitions_map)} record definitions.")
+            
+            if all_objective_hashes:
+                logger.info(f"Batch fetching {len(all_objective_hashes)} DestinyObjectiveDefinitions.")
+                objective_definitions_map = await self.manifest_service.get_definitions_batch(
+                    "DestinyObjectiveDefinition", list(all_objective_hashes)
+                )
+                logger.info(f"Fetched {len(objective_definitions_map)} objective definitions.")
+            
+            t_def_fetch_end = time.time()
+            logger.info(f"Batch definition fetching took {t_def_fetch_end - t_def_fetch_start:.2f} seconds.")
 
-        if self.cancel_event.is_set():
-            logger.info("get_catalysts operation cancelled after definition fetching.")
-            return [{"error": "Operation cancelled."}]
+            if self.cancel_event.is_set():
+                logger.info("get_catalysts operation cancelled after definition fetching.")
+                return [{"error": "Operation cancelled."}]
 
-        # --- Step 3: Process each identified record ---
-        logger.info(f"Processing {len(record_hashes_to_process)} potential catalyst records with fetched definitions.")
-        t_processing_start = time.time()
-        for record_hash in record_hashes_to_process:
-            if self.cancel_event.is_set(): break
+            # --- Step 3: Process each identified record ---
+            logger.info(f"Processing {len(record_hashes_to_process)} potential catalyst records with fetched definitions.")
+            t_processing_start = time.time()
+            for record_hash in record_hashes_to_process:
+                if self.cancel_event.is_set(): break
 
-            live_player_record_data = profile_records_data.get(str(record_hash))
-            record_def_from_map = record_definitions_map.get(record_hash)
+                live_player_record_data = profile_records_data.get(str(record_hash))
+                record_def_from_map = record_definitions_map.get(record_hash)
 
-            if not live_player_record_data:
-                logger.debug(f"No live player data for record hash {record_hash}. Skipping.")
-                continue
-            if not record_def_from_map:
-                # This can happen in discovery mode if a record doesn't have a def, or if a known hash is missing a def.
-                logger.debug(f"No record definition found in map for hash {record_hash}. Skipping further processing for this record.")
-                continue
+                if not live_player_record_data:
+                    logger.debug(f"No live player data for record hash {record_hash}. Skipping.")
+                    continue
+                if not record_def_from_map:
+                    # This can happen in discovery mode if a record doesn't have a def, or if a known hash is missing a def.
+                    logger.debug(f"No record definition found in map for hash {record_hash}. Skipping further processing for this record.")
+                    continue
 
-            # Filter based on CATALYST_RECORD_HASHES if not in discovery mode *after* fetching def
-            if not self.discovery_mode and record_hash not in CATALYST_RECORD_HASHES:
-                logger.debug(f"[Standard Mode] Record hash {record_hash} not in known CATALYST_RECORD_HASHES. Skipping post-def-fetch.")
-                continue
+                # Filter based on CATALYST_RECORD_HASHES if not in discovery mode *after* fetching def
+                if not self.discovery_mode and record_hash not in CATALYST_RECORD_HASHES:
+                    logger.debug(f"[Standard Mode] Record hash {record_hash} not in known CATALYST_RECORD_HASHES. Skipping post-def-fetch.")
+                    continue
 
-            catalyst_detail = await self._get_catalyst_info(
-                record_hash, 
-                live_player_record_data, 
-                record_def_from_map, # Pass the specific record def
-                objective_definitions_map # Pass the whole map of objective defs
-            )
-            if catalyst_detail:
-                # Add the record_hash to the returned catalyst_detail for Supabase upsert in agent_service
-                catalyst_detail['record_hash'] = str(record_hash) # Ensure it's a string if needed, or keep as int
-                catalysts.append(catalyst_detail)
-        
-        t_processing_end = time.time()
-        logger.info(f"Detailed catalyst processing took {t_processing_end - t_processing_start:.2f} seconds.")
-        
-        if self.cancel_event.is_set():
-            logger.info("get_catalysts operation cancelled during final processing.")
-            return [{"error": "Operation cancelled."}]
+                catalyst_detail = await self._get_catalyst_info(
+                    record_hash, 
+                    live_player_record_data, 
+                    record_def_from_map, # Pass the specific record def
+                    objective_definitions_map # Pass the whole map of objective defs
+                )
+                if catalyst_detail:
+                    # Add the record_hash to the returned catalyst_detail for Supabase upsert in agent_service
+                    catalyst_detail['record_hash'] = str(record_hash) # Ensure it's a string if needed, or keep as int
+                    catalysts.append(catalyst_detail)
+            
+            t_processing_end = time.time()
+            logger.info(f"Detailed catalyst processing took {t_processing_end - t_processing_start:.2f} seconds.")
+            
+            if self.cancel_event.is_set():
+                logger.info("get_catalysts operation cancelled during final processing.")
+                return [{"error": "Operation cancelled."}]
 
-        logger.info(f"Total get_catalysts execution time: {time.time() - start_total_time:.2f} seconds. Found {len(catalysts)} catalysts.")
-        return catalysts
+            logger.info(f"Total get_catalysts execution time: {time.time() - start_total_time:.2f} seconds. Found {len(catalysts)} catalysts.")
+            result = catalysts
+        finally:
+            total_duration_ms = int((time.time() - start_total_time) * 1000)
+            if sb_client:
+                await log_api_performance(
+                    sb_client,
+                    endpoint="catalyst_api.get_catalysts",
+                    operation="total_method_duration",
+                    duration_ms=total_duration_ms,
+                    user_id=user_id
+                )
+        return result
         
     def cancel_operations(self):
         """Signal any ongoing operations to cancel."""

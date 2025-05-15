@@ -33,6 +33,7 @@ from web_app.backend.catalyst_api import CatalystAPI
 from web_app.backend.weapon_api import WeaponAPI
 from web_app.backend.agent_service import DestinyAgentService
 from .manifest import SupabaseManifestService # Import the new service
+from web_app.backend.performance_logging import log_api_performance  # Import the profiling helper
 
 # --- Pydantic Models for Chat (Moved Up) ---
 class ChatMessage(BaseModel):
@@ -651,6 +652,7 @@ async def assistants_chat_endpoint(
     """
     Chat endpoint using the agent service, handling conversation history with Supabase.
     """
+    total_start = time.time()
     if not agent_service_instance:
         logger.error("Chat request failed: DestinyAgentService not available.")
         raise HTTPException(status_code=503, detail="Chat service is currently unavailable.")
@@ -675,6 +677,7 @@ async def assistants_chat_endpoint(
     current_conversation_id_str: Optional[str] = None # Store as string for Supabase
     next_order_index = 0
 
+    agent_start = time.time()
     try:
         # --- Handle Existing vs New Conversation ---
         if requested_conversation_id_str:
@@ -732,9 +735,10 @@ async def assistants_chat_endpoint(
         insert_user_msg_response = await sb_client.table("messages").insert(user_message_to_save).execute() # <--- Add await
         if not insert_user_msg_response.data:
             logger.error(f"Failed to save user message for conv {current_conversation_id_str} to Supabase.")
-            # Not raising HTTPException here to allow agent to still respond if possible, but log it.
+            user_message_id = None
         else:
             logger.info(f"Saved user message (order: {next_order_index}) for conv {current_conversation_id_str} to Supabase.")
+            user_message_id = insert_user_msg_response.data[0]["id"]
             next_order_index += 1
 
         # --- Prepare for Agent Call ---
@@ -748,6 +752,17 @@ async def assistants_chat_endpoint(
             bungie_id=bungie_id,
             history=conversation_history,
             persona=request.persona  # <-- Pass persona to agent
+        )
+        agent_duration_ms = int((time.time() - agent_start) * 1000)
+        await log_api_performance(
+            sb_client,
+            endpoint="/api/assistants/chat",
+            operation="agent_service_run_chat",
+            duration_ms=agent_duration_ms,
+            user_id=bungie_id,
+            conversation_id=current_conversation_id_str,
+            message_id=user_message_id,
+            extra_data={"status": "success"}
         )
         
         agent_response_content = ""
@@ -801,16 +816,47 @@ async def assistants_chat_endpoint(
             asyncio.create_task(generate_and_save_title(final_conversation_id_uuid))
             logger.info(f"Background task for title generation for {final_conversation_id_uuid} scheduled (uses local DB).")
 
+        total_duration_ms = int((time.time() - total_start) * 1000)
+        await log_api_performance(
+            sb_client,
+            endpoint="/api/assistants/chat",
+            operation="total_request",
+            duration_ms=total_duration_ms,
+            user_id=bungie_id,
+            conversation_id=current_conversation_id_str,
+            message_id=user_message_id,
+            extra_data={"status": "success"}
+        )
         return ChatResponse(message=response_message, conversation_id=final_conversation_id_uuid)
 
     except HTTPException as http_exc:
-        logger.error(f"HTTPException in assistants_chat_endpoint for user {bungie_id}, conv {requested_conversation_id_str}: {http_exc.status_code} - {http_exc.detail}", exc_info=False)
+        total_duration_ms = int((time.time() - total_start) * 1000)
+        await log_api_performance(
+            sb_client,
+            endpoint="/api/assistants/chat",
+            operation="total_request",
+            duration_ms=total_duration_ms,
+            user_id=bungie_id,
+            conversation_id=current_conversation_id_str,
+            message_id=user_message_id,
+            extra_data={"status": "error", "error": str(http_exc.detail)}
+        )
         raise http_exc
     except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err: # <-- CATCH AUTH ERRORS SPECIFICALLY
         logger.warning(f"Authentication error in assistants_chat_endpoint for user {bungie_id}, conv {requested_conversation_id_str}: {auth_err}")
         raise auth_err # Re-raise to be caught by the app-level exception handlers
     except Exception as e:
-        logger.error(f"Unexpected error in assistants_chat_endpoint for user {bungie_id}, conv {requested_conversation_id_str}: {e}", exc_info=True)
+        total_duration_ms = int((time.time() - total_start) * 1000)
+        await log_api_performance(
+            sb_client,
+            endpoint="/api/assistants/chat",
+            operation="total_request",
+            duration_ms=total_duration_ms,
+            user_id=bungie_id,
+            conversation_id=current_conversation_id_str,
+            message_id=user_message_id,
+            extra_data={"status": "error", "error": str(e)}
+        )
         # Attempt to update timestamp on generic error if we have a conversation ID
         if current_conversation_id_str:
             try:

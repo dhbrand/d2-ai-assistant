@@ -4,6 +4,7 @@ import asyncio # Added for asyncio.to_thread
 from typing import List, Dict, Any, Optional # Added Optional for type hinting
 from requests.adapters import HTTPAdapter # Added import
 from urllib3.util.retry import Retry # Added import
+from web_app.backend.performance_logging import log_api_performance  # Import the profiling helper
 
 from .manifest import SupabaseManifestService # Import the new service
 from .bungie_oauth import OAuthManager # Import OAuthManager
@@ -106,10 +107,21 @@ class WeaponAPI:
             logger.error(f"Error processing membership info for WeaponAPI: {e}", exc_info=True)
             return None
 
-    async def get_membership_info(self) -> Optional[Dict[str, str]]: # Changed to async
+    async def get_membership_info(self, user_id: str = None, sb_client: AsyncClient = None) -> Optional[Dict[str, str]]:
         """Get the current user's membership info, matching CatalystAPI's async pattern."""
         logger.info("WeaponAPI: Fetching membership info...")
-        return await asyncio.to_thread(self._fetch_membership_info_sync)
+        api_start = time.time()
+        result = await asyncio.to_thread(self._fetch_membership_info_sync)
+        api_duration_ms = int((time.time() - api_start) * 1000)
+        if sb_client:
+            await log_api_performance(
+                sb_client,
+                endpoint="weapon_api.get_membership_info",
+                operation="bungie_api_call",
+                duration_ms=api_duration_ms,
+                user_id=user_id
+            )
+        return result
         
     def get_single_item_component(self, membership_type: int, destiny_membership_id: str, item_instance_id: str, components: List[int]) -> dict:
         # This method remains synchronous as it's not directly part of the main failing flow being refactored
@@ -163,10 +175,20 @@ class WeaponAPI:
             logger.error(f"WeaponAPI: An unexpected error occurred while fetching profile components: {e} - URL: {url}", exc_info=True)
             return None
 
-    async def get_profile(self, membership_type: int, destiny_membership_id: str, components: List[int]) -> Optional[dict]: # Renamed and made async
-        """Get the user's profile, matching CatalystAPI's async pattern."""
-        logger.info(f"WeaponAPI: Getting profile for {destiny_membership_id}, type {membership_type} with components {components}")
-        return await asyncio.to_thread(self._fetch_profile_sync, membership_type, destiny_membership_id, components)
+    async def get_profile(self, membership_type: int, destiny_membership_id: str, components: List[int], user_id: str = None, sb_client: AsyncClient = None) -> Optional[dict]:
+        """Async wrapper for fetching profile data from Bungie API."""
+        api_start = time.time()
+        result = await asyncio.to_thread(self._fetch_profile_sync, membership_type, destiny_membership_id, components)
+        api_duration_ms = int((time.time() - api_start) * 1000)
+        if sb_client:
+            await log_api_performance(
+                sb_client,
+                endpoint="weapon_api.get_profile",
+                operation="bungie_api_call",
+                duration_ms=api_duration_ms,
+                user_id=user_id
+            )
+        return result
 
     def _get_plug_category(self, plug_def: Dict[str, Any]) -> str:
         if not plug_def or not isinstance(plug_def, dict):
@@ -215,7 +237,7 @@ class WeaponAPI:
         # The `is_equipped` boolean from item instance data is the definitive source for equipped status.
         return mapping.get(location_enum, "unknown")
 
-    async def get_all_weapons_with_detailed_perks(self, membership_type: str, destiny_membership_id: str) -> List[Dict[str, Any]]:
+    async def get_all_weapons_with_detailed_perks(self, membership_type: str, destiny_membership_id: str, user_id: str = None, sb_client: AsyncClient = None) -> List[Dict[str, Any]]:
         logger.info(f"WeaponAPI: Fetching all weapons with detailed perks for {destiny_membership_id} (type: {membership_type})")
         components = [
             102,  # profileInventory
@@ -224,33 +246,37 @@ class WeaponAPI:
             305,  # itemSockets (for currently equipped plugs on each item instance)
             310   # reusablePlugs (for all selectable perks on an item instance)
         ]
-
+        api_start = time.time()
         profile_response = None # Initialize to None
         try:
-            # Call the new async get_profile method directly
             profile_response = await self.get_profile(
-                int(membership_type), # Ensure membership_type is passed as an int
+                int(membership_type),
                 destiny_membership_id,
                 components
             )
         except Exception as e: 
             logger.error(f"WeaponAPI: Error calling get_profile: {e}", exc_info=True)
             return [] 
-
+        api_duration_ms = int((time.time() - api_start) * 1000)
+        if sb_client:
+            await log_api_performance(
+                sb_client,
+                endpoint="weapon_api.get_all_weapons_with_detailed_perks",
+                operation="bungie_api_call",
+                duration_ms=api_duration_ms,
+                user_id=user_id
+            )
         if profile_response is None:
             logger.error(f"WeaponAPI: Failed to get profile response from Bungie API for {destiny_membership_id} (profile_response is None).")
             return []
-
         if profile_response.get("ErrorCode", 1) != 1: 
             error_message = profile_response.get('Message', 'Unknown error or malformed error response')
             logger.error(f"WeaponAPI: Failed to get profile response from Bungie API for {destiny_membership_id}: {error_message}. ErrorCode: {profile_response.get('ErrorCode')}")
             return []
-
         response_data = profile_response.get("Response", {})
         if not response_data:
             logger.warning(f"Profile response for {destiny_membership_id} was empty or malformed.")
             return []
-
         character_equipment_data = response_data.get("characterEquipment", {}).get("data", {})
         character_inventories_data = response_data.get("characterInventories", {}).get("data", {})
         profile_inventory_data = response_data.get("profileInventory", {}).get("data", {})

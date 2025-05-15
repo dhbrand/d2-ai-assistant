@@ -23,6 +23,7 @@ from supabase import Client, AsyncClient
 import json
 from .models import CatalystData, CatalystObjective, Weapon # <--- ensure Weapon is imported
 from .bungie_oauth import AuthenticationRequiredError, InvalidRefreshTokenError # <-- IMPORT THESE
+from web_app.backend.performance_logging import log_api_performance  # Import the profiling helper
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +55,20 @@ def _get_user_info_impl(service: 'DestinyAgentService') -> dict:
         logger.info(f"Cache MISS for user_info for bungie_id {bungie_id}")
 
     # Cache miss or stale, call API
+    import time
+    api_start = time.time()
     try:
         info = service.weapon_api.get_membership_info()
+        api_duration_ms = int((time.time() - api_start) * 1000)
+        # Log Bungie API call duration
+        if hasattr(service, 'sb_client'):
+            asyncio.create_task(log_api_performance(
+                service.sb_client,
+                endpoint="agent_service.get_user_info",
+                operation="weapon_api.get_membership_info",
+                duration_ms=api_duration_ms,
+                user_id=bungie_id
+            ))
         if not info or 'id' not in info or 'type' not in info:
             logger.warning("Agent Tool Impl: get_membership_info returned incomplete data.")
             return {"error": "Could not retrieve valid membership info."}
@@ -69,7 +82,6 @@ def _get_user_info_impl(service: 'DestinyAgentService') -> dict:
         raise # Re-raise auth-specific errors to be caught by FastAPI
     except Exception as e:
         logger.error(f"Agent Tool Impl Error in get_user_info: {e}", exc_info=True)
-        # For other errors, return a dict error for the agent to formulate a response
         return {"error": f"Failed to get user info due to an internal error: {str(e)}"}
 
 async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int, membership_id: str) -> List[Weapon]:
@@ -82,14 +94,22 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
         raise Exception("User context (bungie_id) not available for get_weapons.")
 
     now = datetime.now(timezone.utc)
-    
+    import time
+    supabase_start = time.time()
     try:
         logger.info(f"Attempting to fetch weapons from Supabase cache for user {bungie_id}")
-        # Select columns that exist in user_weapon_inventory
         supabase_response = await (service.sb_client.table("user_weapon_inventory")
             .select("item_instance_id, item_hash, barrel_perks, magazine_perks, trait_perk_col1, trait_perk_col2, origin_trait, location, is_equipped, last_updated")
             .eq("user_id", bungie_id)
             .execute())
+        supabase_duration_ms = int((time.time() - supabase_start) * 1000)
+        await log_api_performance(
+            service.sb_client,
+            endpoint="agent_service.get_weapons",
+            operation="supabase_cache_read",
+            duration_ms=supabase_duration_ms,
+            user_id=bungie_id
+        )
 
         if supabase_response.data:
             logger.info(f"Found {len(supabase_response.data)} weapon instance entries in Supabase for user {bungie_id}")
@@ -226,12 +246,21 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
 
     # Cache miss, stale, or error in cache read/reconstruction: Call API
     logger.info(f"Calling Bungie API for weapons for user {bungie_id} (membership: {membership_type}/{membership_id})")
+    api_start = time.time()
     try:
         # weapon_api.get_all_weapons is expected to return List[Weapon]
         # where Weapon objects are fully populated with manifest data.
         weapons_from_api: List[Weapon] = await service.weapon_api.get_all_weapons(
             membership_type=membership_type,
             destiny_membership_id=membership_id
+        )
+        api_duration_ms = int((time.time() - api_start) * 1000)
+        await log_api_performance(
+            service.sb_client,
+            endpoint="agent_service.get_weapons",
+            operation="weapon_api.get_all_weapons",
+            duration_ms=api_duration_ms,
+            user_id=bungie_id
         )
 
         if weapons_from_api:
@@ -310,15 +339,22 @@ async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
         raise Exception("User context not available for get_catalysts.")
 
     now = datetime.now(timezone.utc)
-    processed_catalysts_from_cache = []
-    all_cache_fresh = True # Assume fresh until a stale or missing entry is found
-
+    import time
+    supabase_start = time.time()
     try:
         logger.info(f"Attempting to fetch catalysts from Supabase cache for user {bungie_id}")
         supabase_response = await service.sb_client.table("user_catalyst_status") \
             .select("catalyst_record_hash, is_complete, objectives, last_updated") \
             .eq("user_id", bungie_id) \
             .execute()
+        supabase_duration_ms = int((time.time() - supabase_start) * 1000)
+        await log_api_performance(
+            service.sb_client,
+            endpoint="agent_service.get_catalysts",
+            operation="supabase_cache_read",
+            duration_ms=supabase_duration_ms,
+            user_id=bungie_id
+        )
 
         if supabase_response.data:
             logger.info(f"Found {len(supabase_response.data)} catalyst entries in Supabase for user {bungie_id}")
@@ -425,10 +461,19 @@ async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
     # If cache was not fresh, or empty, or error during cache check: Call API
     if not all_cache_fresh:
         logger.info(f"Calling Bungie API for catalysts for user {bungie_id} due to cache miss or staleness.")
+        api_start = time.time()
         try:
             # This is expected to return List[CatalystData] or list of dicts that can be validated into it
             # It should include record_hash if it's a list of dicts.
             api_catalysts_result = await service.catalyst_api.get_catalysts()
+            api_duration_ms = int((time.time() - api_start) * 1000)
+            await log_api_performance(
+                service.sb_client,
+                endpoint="agent_service.get_catalysts",
+                operation="catalyst_api.get_catalysts",
+                duration_ms=api_duration_ms,
+                user_id=bungie_id
+            )
 
             # Prepare data for Supabase upsert
             catalysts_to_upsert = []
@@ -763,7 +808,7 @@ class DestinyAgentService:
                 "Q: What's the best weapon for Nightfalls?\n"
                 "A: Power lies not in the weapon, but in the will of its bearer. Choose with wisdom, and the cosmos will conspire in your favor. 🦋✨ The Awoken walk between worlds.\n"
                 "Q: How do I get better at PvP?\n"
-                "A: Every battle is a dance, every opponent a lesson. Move with grace, strike with intent, and remember: the Queen sees all. ��🦋"
+                "A: Every battle is a dance, every opponent a lesson. Move with grace, strike with intent, and remember: the Queen sees all. 🦋🦋"
             ),
         }
         
