@@ -29,7 +29,7 @@ from supabase import create_async_client, AsyncClient # <-- Add async Supabase i
 from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError, TokenData, AuthenticationRequiredError # Import TokenData here
 from web_app.backend.models import init_db, User, CatalystData, Weapon, CallbackData, UserResponse, ConversationSchema, ChatMessageSchema, ChatHistorySessionLocal, Conversation, Message # <--- Added missing imports
 from sqlalchemy.orm import sessionmaker, Session
-from web_app.backend.catalyst import CatalystAPI
+from web_app.backend.catalyst_api import CatalystAPI
 from web_app.backend.weapon_api import WeaponAPI
 from web_app.backend.agent_service import DestinyAgentService
 from .manifest import SupabaseManifestService # Import the new service
