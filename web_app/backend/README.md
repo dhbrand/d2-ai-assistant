@@ -40,6 +40,38 @@ This directory contains the FastAPI backend for the Destiny 2 Catalyst Tracker w
 - For OAuth and Supabase credentials, use the `.env` file at the project root.
 - See the main project README for setup and environment instructions.
 
+## API Performance Profiling & Optimization
+
+The backend implements comprehensive performance profiling and optimization for all major API endpoints and external calls (Bungie, Supabase, LLM, etc.).
+
+### Instrumentation & Logging
+- All key backend operations are instrumented to log timing and profiling data to the `api_performance_logs` table in Supabase.
+- The async helper function `log_api_performance` (see `performance_logging.py`) is used throughout the backend to record:
+  - Endpoint and operation name
+  - Duration (ms)
+  - User, conversation, and message context (where available)
+  - Extra data for debugging/alerting
+
+### Granular Profiling
+- The main chat endpoint and agent service (`run_chat`) log timing for each major sub-operation:
+  - Weapon fetch
+  - Catalyst fetch
+  - Manifest lookups
+  - LLM call
+  - Total request duration
+- All Bungie and Supabase API call sites are instrumented for latency tracking.
+
+### Slow Request Alerting
+- Any sub-operation or total request exceeding 10 seconds is logged as a `slow_request_alert` in Supabase, including full timing context for diagnosis.
+
+### Caching & Optimization
+- The backend uses in-memory and persistent (Supabase) caching for user, weapon, and catalyst data to minimize redundant API calls and improve response times.
+- Refactoring and analysis of performance logs have eliminated unnecessary Bungie API calls and optimized request patterns.
+
+### How to Use/Extend
+- To add profiling to new endpoints or operations, import and call `log_api_performance` with the relevant context.
+- Performance data can be queried in Supabase for ongoing monitoring and further optimization.
+
 ---
 
 For questions or contributions, see the main project documentation or open an issue in the repository. 
