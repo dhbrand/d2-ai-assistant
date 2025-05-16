@@ -21,7 +21,7 @@ class SupabaseManifestService:
     def __init__(self, sb_client: SupabaseClient):
         self.sb_client = sb_client
 
-    def get_definition(self, table_name: str, definition_hash: int) -> Optional[Dict[str, Any]]:
+    async def get_definition(self, table_name: str, definition_hash: int) -> Optional[Dict[str, Any]]:
         """Fetches a specific definition from a Supabase manifest table by its hash.
 
         Args:
@@ -38,7 +38,7 @@ class SupabaseManifestService:
         try:
             query_table_name = table_name.lower()
             logger.debug(f"Fetching definition for hash {definition_hash} from Supabase table {query_table_name}...")
-            response = self.sb_client.table(query_table_name)\
+            response = await self.sb_client.table(query_table_name)\
                 .select("json_data")\
                 .eq("hash", definition_hash)\
                 .maybe_single()\
@@ -51,7 +51,7 @@ class SupabaseManifestService:
             logger.error(f"Error fetching definition {definition_hash} from Supabase table {table_name}: {e}", exc_info=True)
             return None
 
-    def get_definitions_batch(self, table_name: str, definition_hashes: List[int]) -> Dict[int, Dict[str, Any]]:
+    async def get_definitions_batch(self, table_name: str, definition_hashes: List[int]) -> Dict[int, Dict[str, Any]]:
         """Fetches multiple definitions from a Supabase manifest table by their hashes,
         chunking requests if necessary and fetching chunks sequentially.
 
@@ -79,7 +79,7 @@ class SupabaseManifestService:
             end_index = start_index + MAX_HASHES_PER_REQUEST
             hash_chunk = definition_hashes[start_index:end_index]
             try:
-                response = self.sb_client.table(query_table_name)\
+                response = await self.sb_client.table(query_table_name)\
                     .select("hash, json_data")\
                     .in_("hash", hash_chunk)\
                     .execute()

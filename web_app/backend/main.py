@@ -452,7 +452,7 @@ async def list_conversations(
     archived: bool = Query(False, description="Set to true to show archived conversations")
 ):
     """Lists all (optionally archived) conversations for the currently authenticated user."""
-    user_bungie_id = str(current_user.bungie_id)
+    user_bungie_id = str(current_user.id)
     if not user_bungie_id:
         raise HTTPException(status_code=401, detail="User Bungie ID not found in token")
     
@@ -486,7 +486,7 @@ async def get_conversation_messages(
     sb_client: AsyncClient = Depends(get_supabase_db) # <--- Changed to Supabase client
 ):
     """Gets all messages for a specific conversation from Supabase, verifying ownership."""
-    user_bungie_id = str(current_user.bungie_id) # Ensure it's a string for comparison
+    user_bungie_id = str(current_user.id) # Ensure it's a string for comparison
     if not user_bungie_id:
         raise HTTPException(status_code=401, detail="User Bungie ID not found in token")
 
@@ -666,7 +666,7 @@ async def assistants_chat_endpoint(
         raise HTTPException(status_code=400, detail="No message content provided")
 
     access_token = current_user.access_token
-    bungie_id = str(current_user.bungie_id) # Ensure string
+    bungie_id = str(current_user.id) # Ensure string
     requested_conversation_id_str = str(request.conversation_id) if request.conversation_id else None
 
     if not access_token or not bungie_id:
@@ -922,14 +922,14 @@ async def delete_conversation(
     sb_client: AsyncClient = Depends(get_supabase_db) # Changed to Supabase client
 ):
     """Deletes a conversation from Supabase."""
-    logger.info(f"Attempting to delete conversation {conversation_id} for user {current_user.bungie_id}")
+    logger.info(f"Attempting to delete conversation {conversation_id} for user {current_user.id}")
     try:
         # Supabase cascade delete should handle messages if configured on the DB via foreign keys.
         delete_result = await (
             sb_client.table("conversations")
             .delete()
             .eq("id", str(conversation_id)) # Ensure UUID is cast to string for query
-            .eq("user_id", current_user.bungie_id)
+            .eq("user_id", current_user.id)
             .execute()
         )
         
@@ -938,11 +938,11 @@ async def delete_conversation(
         # For now, we assume if it doesn't error and user_id matches, it's fine.
         # If delete_result.data is empty and no error, it implies no row matched the criteria (or delete doesn't return data).
         # Add more specific checks if a direct count of deleted items is needed and available from the client.
-        logger.info(f"Delete operation for conversation {conversation_id} for user {current_user.bungie_id} completed. Result: {delete_result}")
+        logger.info(f"Delete operation for conversation {conversation_id} for user {current_user.id} completed. Result: {delete_result}")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     except Exception as e:
-        logger.error(f"Error deleting conversation {conversation_id} for user {current_user.bungie_id}: {e}", exc_info=True)
+        logger.error(f"Error deleting conversation {conversation_id} for user {current_user.id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not delete conversation")
 
 # --- NEW: Archive Conversation Endpoint ---
@@ -953,18 +953,18 @@ async def archive_conversation(
     sb_client: AsyncClient = Depends(get_supabase_db) # Changed to Supabase client
 ):
     """Archives a conversation by setting its 'archived' status to True."""
-    logger.info(f"Attempting to archive conversation {conversation_id} for user {current_user.bungie_id}")
+    logger.info(f"Attempting to archive conversation {conversation_id} for user {current_user.id}")
     try:
         update_result = await (
             sb_client.table("conversations")
             .update({"archived": True, "updated_at": datetime.now(timezone.utc).isoformat()})
             .eq("id", str(conversation_id)) # Ensure UUID is cast to string for query
-            .eq("user_id", current_user.bungie_id)
+            .eq("user_id", current_user.id)
             .execute()
         )
 
         if not update_result.data:
-            logger.warning(f"Archive failed: Conversation {conversation_id} not found for user {current_user.bungie_id} or no update occurred.")
+            logger.warning(f"Archive failed: Conversation {conversation_id} not found for user {current_user.id} or no update occurred.")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found or not authorized to archive")
 
         return ConversationSchema(**update_result.data[0])
@@ -972,7 +972,7 @@ async def archive_conversation(
     except HTTPException: # Re-raise HTTPException
         raise
     except Exception as e:
-        logger.error(f"Error archiving conversation {conversation_id} for user {current_user.bungie_id}: {e}", exc_info=True)
+        logger.error(f"Error archiving conversation {conversation_id} for user {current_user.id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not archive conversation")
 
 # --- NEW: Rename Conversation Endpoint ---
@@ -990,7 +990,7 @@ async def rename_conversation(
     sb_client: AsyncClient = Depends(get_supabase_db)
 ):
     """Renames a conversation (changes its title) in Supabase."""
-    logger.info(f"Attempting to rename conversation {conversation_id} for user {current_user.bungie_id} to '{req.title}'")
+    logger.info(f"Attempting to rename conversation {conversation_id} for user {current_user.id} to '{req.title}'")
     
     if not req.title.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Title cannot be empty.")
@@ -1000,12 +1000,12 @@ async def rename_conversation(
             sb_client.table("conversations")
             .update({"title": req.title, "updated_at": datetime.now(timezone.utc).isoformat()})
             .eq("id", str(conversation_id))
-            .eq("user_id", current_user.bungie_id)
+            .eq("user_id", current_user.id)
             .execute()
         )
 
         if not update_result.data:
-            logger.warning(f"Rename failed: Conversation {conversation_id} not found for user {current_user.bungie_id} or no update occurred.")
+            logger.warning(f"Rename failed: Conversation {conversation_id} not found for user {current_user.id} or no update occurred.")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found or not authorized to rename")
 
         return ConversationSchema(**update_result.data[0])
@@ -1013,7 +1013,7 @@ async def rename_conversation(
     except HTTPException: # Re-raise HTTPException
         raise
     except Exception as e:
-        logger.error(f"Error renaming conversation {conversation_id} for user {current_user.bungie_id}: {e}", exc_info=True)
+        logger.error(f"Error renaming conversation {conversation_id} for user {current_user.id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not rename conversation")
 
 @app.post("/auth/refresh")

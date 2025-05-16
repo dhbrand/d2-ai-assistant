@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional # Added Optional for type hinting
 from requests.adapters import HTTPAdapter # Added import
 from urllib3.util.retry import Retry # Added import
 from web_app.backend.performance_logging import log_api_performance  # Import the profiling helper
+from supabase import AsyncClient
 
 from .manifest import SupabaseManifestService # Import the new service
 from .bungie_oauth import OAuthManager # Import OAuthManager
@@ -336,8 +337,7 @@ class WeaponAPI:
              logger.info(f"WeaponAPI: Collected {len(all_unique_plug_hashes)} unique plug hashes to fetch definitions for.")
 
 
-        plug_definitions = await asyncio.to_thread(
-            self.manifest_service.get_definitions_batch,
+        plug_definitions = await self.manifest_service.get_definitions_batch(
             'DestinyInventoryItemDefinition',
             list(all_unique_plug_hashes)
         )
@@ -365,8 +365,7 @@ class WeaponAPI:
             processed_hashes.add(instance_id)
 
 
-            static_def_item = await asyncio.to_thread(
-                self.manifest_service.get_definition,
+            static_def_item = await self.manifest_service.get_definition(
                 'DestinyInventoryItemDefinition', 
                 item_hash
             )
