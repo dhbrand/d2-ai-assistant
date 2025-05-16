@@ -24,6 +24,7 @@ import json
 from .models import CatalystData, CatalystObjective, Weapon # <--- ensure Weapon is imported
 from .bungie_oauth import AuthenticationRequiredError, InvalidRefreshTokenError # <-- IMPORT THESE
 from web_app.backend.performance_logging import log_api_performance  # Import the profiling helper
+from web_app.backend.utils import normalize_catalyst_data  # Import the normalization helper
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ CACHE_TTL = timedelta(hours=24) # Cache data for 24 hours
 
 # --- Tool Implementation Functions (outside class) ---
 
-def _get_user_info_impl(service: 'DestinyAgentService') -> dict:
+async def _get_user_info_impl(service: 'DestinyAgentService') -> dict:
     """(Implementation) Fetch the user's Destiny membership info, using cache."""
     logger.debug("Agent Tool Impl: get_user_info called")
     bungie_id = service._current_bungie_id
@@ -58,7 +59,7 @@ def _get_user_info_impl(service: 'DestinyAgentService') -> dict:
     import time
     api_start = time.time()
     try:
-        info = service.weapon_api.get_membership_info()
+        info = await service.weapon_api.get_membership_info()
         api_duration_ms = int((time.time() - api_start) * 1000)
         # Log Bungie API call duration
         if hasattr(service, 'sb_client'):
@@ -99,7 +100,7 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
     try:
         logger.info(f"Attempting to fetch weapons from Supabase cache for user {bungie_id}")
         supabase_response = await (service.sb_client.table("user_weapon_inventory")
-            .select("item_instance_id, item_hash, barrel_perks, magazine_perks, trait_perk_col1, trait_perk_col2, origin_trait, location, is_equipped, last_updated")
+            .select("item_instance_id, item_hash, weapon_name, weapon_type, intrinsic_perk, col1_plugs, col2_plugs, col3_trait1, col4_trait2, origin_trait, masterwork, weapon_mods, shaders, location, is_equipped, last_updated")
             .eq("user_id", bungie_id)
             .execute())
         supabase_duration_ms = int((time.time() - supabase_start) * 1000)
@@ -142,99 +143,37 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
                 logger.info(f"Supabase weapon cache for user {bungie_id} has items but no valid last_updated timestamps, considering STALE.")
 
             if cache_is_fresh:
-                logger.info(f"Supabase weapon cache is FRESH for user {bungie_id}. Reconstructing Weapon list with manifest data.")
+                logger.info(f"Supabase weapon cache is FRESH for user {bungie_id}. Reconstructing Weapon list from cache data.")
                 reconstructed_weapons: List[Weapon] = []
-                
-                # Collect item_hashes to fetch definitions.
-                item_hashes_from_cache = [item_dict['item_hash'] for item_dict in supabase_response.data if item_dict.get('item_hash') is not None]
-                unique_item_hashes = list(set(item_hashes_from_cache))
-
-                manifest_definitions = {}
-                if unique_item_hashes: # Only call if there are hashes
-                    manifest_definitions = await service.manifest_service.get_definitions_batch(
-                        "DestinyInventoryItemDefinition", 
-                        unique_item_hashes
-                    )
-                    logger.info(f"Successfully fetched {len(manifest_definitions)} unique manifest definitions for weapon reconstruction.")
-                else:
-                    logger.info("No unique item hashes found in cache to fetch manifest definitions.")
-
                 for item_dict in supabase_response.data:
-                    original_item_hash = item_dict.get('item_hash')
-                    if original_item_hash is None:
-                        logger.warning(f"Skipping item due to missing 'item_hash': {item_dict}")
-                        continue
-
-                    manifest_def = manifest_definitions.get(original_item_hash)
-
-                    if not manifest_def:
-                        logger.warning(f"No manifest definition found for item_hash {original_item_hash}. Skipping weapon reconstruction for this item.")
-                        continue
-                    
-                    display_props = manifest_def.get("displayProperties", {})
-
-                    # Parse each perk column from the DB, defaulting to [] or None as appropriate
-                    def parse_perk_list(val):
-                        if val is None:
-                            return []
-                        if isinstance(val, str):
-                            try:
-                                parsed = json.loads(val)
-                                return parsed if isinstance(parsed, list) else []
-                            except Exception:
-                                return []
-                        if isinstance(val, list):
-                            return val
-                        return []
-                    def parse_perk_obj(val):
-                        if val is None:
-                            return None
-                        if isinstance(val, str):
-                            try:
-                                parsed = json.loads(val)
-                                return parsed if isinstance(parsed, dict) else None
-                            except Exception:
-                                return None
-                        if isinstance(val, dict):
-                            return val
-                        return None
-
                     weapon_data_for_model = {
-                        "item_hash": str(original_item_hash), 
+                        "item_hash": str(item_dict.get("item_hash")),
                         "instance_id": item_dict.get("item_instance_id"),
-                        "name": display_props.get("name", "Unknown Name"),
-                        "description": display_props.get("description", ""),
-                        "icon_url": display_props.get("icon", ""),
-                        "tier_type": manifest_def.get("inventory", {}).get("tierTypeName", "Unknown Tier"),
-                        "item_type": manifest_def.get("itemTypeDisplayName", "Unknown Item Type"),
-                        "item_sub_type": str(manifest_def.get("itemSubType", 0)),
+                        "name": item_dict.get("weapon_name", "Unknown Name"),
+                        "description": "",  # Not in DB, can be filled from manifest if needed
+                        "icon_url": None,    # Not in DB, can be filled from manifest if needed
+                        "tier_type": None,   # Not in DB, can be filled from manifest if needed
+                        "item_type": item_dict.get("weapon_type", "Unknown Item Type"),
+                        "item_sub_type": None, # Not in DB, can be filled from manifest if needed
                         "location": item_dict.get("location"),
                         "is_equipped": item_dict.get("is_equipped", False),
-                        "damage_type": str(manifest_def.get("defaultDamageTypeHash", "None")),
-                        "barrel_perks": parse_perk_list(item_dict.get("barrel_perks")),
-                        "magazine_perks": parse_perk_list(item_dict.get("magazine_perks")),
-                        "trait_perk_col1": parse_perk_list(item_dict.get("trait_perk_col1")),
-                        "trait_perk_col2": parse_perk_list(item_dict.get("trait_perk_col2")),
-                        "origin_trait": parse_perk_obj(item_dict.get("origin_trait")),
+                        "damage_type": None, # Not in DB, can be filled from manifest if needed
+                        "barrel_perks": item_dict.get("col1_plugs", []),
+                        "magazine_perks": item_dict.get("col2_plugs", []),
+                        "trait_perk_col1": item_dict.get("col3_trait1", []),
+                        "trait_perk_col2": item_dict.get("col4_trait2", []),
+                        "origin_trait": item_dict.get("origin_trait", []),
+                        # Optionally add masterwork, weapon_mods, shaders if Weapon model supports them
                     }
                     try:
                         weapon = Weapon(**weapon_data_for_model)
                         reconstructed_weapons.append(weapon)
                     except Exception as e:
-                        logger.error(f"Pydantic validation error reconstructing weapon {original_item_hash} from cache: {e}. Data: {weapon_data_for_model}")
-                
-                # <<< START ADDED LOGGING >>>
-                location_counts = {}
-                for weapon in reconstructed_weapons:
-                    loc = weapon.location if weapon.location is not None else "None"
-                    location_counts[loc] = location_counts.get(loc, 0) + 1
-                logger.info(f"Weapon location distribution from cache for user {bungie_id}: {location_counts}")
-                # <<< END ADDED LOGGING >>>
-
+                        logger.error(f"Pydantic validation error reconstructing weapon {item_dict.get('item_hash')} from cache: {e}. Data: {weapon_data_for_model}")
                 logger.info(f"Cache HIT: Returning {len(reconstructed_weapons)} weapons from Supabase for user {bungie_id}")
                 return reconstructed_weapons
             else:
-                logger.warning(f"Failed to reconstruct all ({valid_reconstructions}/{len(supabase_response.data)}) weapons from cache for user {bungie_id}. Proceeding to API call.")
+                logger.warning(f"Failed to reconstruct all ({len(reconstructed_weapons)}/{len(supabase_response.data)}) weapons from cache for user {bungie_id}. Proceeding to API call.")
                 # Fall through to API call
 
         else: 
@@ -250,15 +189,17 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
     try:
         # weapon_api.get_all_weapons is expected to return List[Weapon]
         # where Weapon objects are fully populated with manifest data.
-        weapons_from_api: List[Weapon] = await service.weapon_api.get_all_weapons(
+        weapons_from_api = await service.weapon_api.get_all_weapons_with_detailed_perks(
             membership_type=membership_type,
-            destiny_membership_id=membership_id
+            destiny_membership_id=membership_id,
+            user_id=bungie_id,
+            sb_client=service.sb_client
         )
         api_duration_ms = int((time.time() - api_start) * 1000)
         await log_api_performance(
             service.sb_client,
             endpoint="agent_service.get_weapons",
-            operation="weapon_api.get_all_weapons",
+            operation="weapon_api.get_all_weapons_with_detailed_perks",
             duration_ms=api_duration_ms,
             user_id=bungie_id
         )
@@ -277,27 +218,26 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
 
             weapons_to_insert = []
             current_timestamp_iso = now.isoformat()
-            for weapon_model in weapons_from_api: # weapon_model is a Weapon Pydantic instance
+            for weapon_model in weapons_from_api: # weapon_model is now a dict
                 db_weapon_entry = {
                     "user_id": bungie_id,
-                    # Weapon Pydantic model has 'instance_id', map it to 'item_instance_id' in DB
-                    "item_instance_id": weapon_model.instance_id, 
-                    "item_hash": weapon_model.item_hash, # item_hash is a string in Pydantic, bigint in DB. Ensure conversion if strict.
-                                                       # Supabase client might handle string to bigint conversion for item_hash.
-                    "location": weapon_model.location,
-                    "is_equipped": weapon_model.is_equipped,
-                    "perks": json.dumps(weapon_model.perks if weapon_model.perks else []), 
+                    "item_instance_id": weapon_model.get("item_instance_id"),
+                    "item_hash": int(weapon_model["item_hash"]) if weapon_model.get("item_hash") is not None else None,
+                    "weapon_name": weapon_model.get("weapon_name"),
+                    "weapon_type": weapon_model.get("weapon_type"),
+                    "intrinsic_perk": weapon_model.get("intrinsic_perk"),
+                    "location": weapon_model.get("location"),
+                    "is_equipped": weapon_model.get("is_equipped"),
+                    "col1_plugs": weapon_model.get("col1_plugs", []),
+                    "col2_plugs": weapon_model.get("col2_plugs", []),
+                    "col3_trait1": weapon_model.get("col3_trait1", []),
+                    "col4_trait2": weapon_model.get("col4_trait2", []),
+                    "origin_trait": weapon_model.get("origin_trait", []),
+                    "masterwork": weapon_model.get("masterwork", []),
+                    "weapon_mods": weapon_model.get("weapon_mods", []),
+                    "shaders": weapon_model.get("shaders", []),
                     "last_updated": current_timestamp_iso
-                    # Removed: name, image_url, item_type_display_name, power_level as they are not in user_weapon_inventory table
                 }
-                # Ensure item_hash is int for bigint column if Supabase doesn't auto-convert
-                try:
-                    if db_weapon_entry["item_hash"] is not None:
-                        db_weapon_entry["item_hash"] = int(db_weapon_entry["item_hash"])
-                except ValueError:
-                    logger.error(f"Could not convert item_hash '{db_weapon_entry['item_hash']}' to int for item_instance_id '{weapon_model.instance_id}'. Skipping this item for DB insert.")
-                    continue # Skip this weapon if item_hash is invalid for DB
-
                 weapons_to_insert.append(db_weapon_entry)
             
             if weapons_to_insert:
@@ -437,7 +377,7 @@ async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
                             description=description,
                             weapon_type=weapon_type, # Placeholder
                             objectives=objectives_list,
-                            complete=cached_item_dict["is_complete"],
+                            is_complete=cached_item_dict["is_complete"],
                             progress=overall_progress # Placeholder/Simple Derivation
                             # record_hash is not part of CatalystData model, but we have it.
                         )
@@ -481,7 +421,7 @@ async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
             # We need to ensure record_hash is available for each item to use as primary key for upsert.
             # Assuming service.catalyst_api.get_catalysts() result contains objects/dicts that have a 'record_hash' field/key.
             # For now, this part requires that the objects returned by get_catalysts have a .record_hash attribute.
-            # And that CatalystData has .name, .description, .objectives, .complete, .progress fields.
+            # And that CatalystData has .name, .description, .objectives, .is_complete, .progress fields.
 
             # Re-validate/structure into CatalystData if not already
             validated_api_catalysts = [] # Will store tuples of (CatalystData, record_hash_str)
@@ -492,9 +432,9 @@ async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
                         logger.warning(f"API item_data missing 'record_hash': {item_data.get('name', 'Unknown Catalyst')}")
                         continue
                     try:
-                        # Validate the dict into CatalystData. record_hash is not part of the model,
-                        # so it won't be included in 'validated_item'.
-                        validated_item = CatalystData(**item_data)
+                        # Normalize the dict before validation
+                        normalized_item_data = normalize_catalyst_data(item_data)
+                        validated_item = CatalystData(**normalized_item_data)
                         validated_api_catalysts.append((validated_item, current_record_hash)) # Store as tuple
                     except Exception as val_err:
                         logger.error(f"Failed to validate item_data from catalyst_api into CatalystData: {item_data.get('name', 'Unknown')}, error: {val_err}")
@@ -515,7 +455,7 @@ async def _get_catalysts_impl(service: 'DestinyAgentService') -> list:
                 catalysts_to_upsert.append({
                     "user_id": bungie_id,
                     "catalyst_record_hash": catalyst_hash_int, # Use the integer hash
-                    "is_complete": item.complete,
+                    "is_complete": item.is_complete,
                     "objectives": json.dumps(objectives_for_json),
                     "last_updated": now.isoformat()
                 })
@@ -839,10 +779,10 @@ class DestinyAgentService:
     # Tool-bound methods - these will call the _impl functions
     # Make them async if their _impl is async
 
-    # get_user_info can remain sync if _get_user_info_impl is sync
-    def get_user_info(self) -> dict:
+    # get_user_info is now async
+    async def get_user_info(self) -> dict:
         """Agent Tool: Fetch the user's D2 membership type and ID."""
-        return _get_user_info_impl(self)
+        return await _get_user_info_impl(self)
 
     async def get_weapons(self, membership_type: int, membership_id: str) -> List[Weapon]:
         """Agent Tool: Fetches all weapons currently in the specified user's inventory and vault.
@@ -876,18 +816,15 @@ class DestinyAgentService:
         """Agent Tool: Fetches data from a specified sheet in the Endgame Analysis spreadsheet."""
         return _get_endgame_analysis_impl(self, sheet_name)
 
-    async def run_chat(self, prompt: str, access_token: str, bungie_id: str, history: Optional[List[Dict[str, str]]] = None, persona: Optional[str] = None):
+    async def run_chat(self, prompt: str, access_token: str, bungie_id: str, history: Optional[List[Dict[str, str]]] = None, persona: Optional[str] = None, conversation_id: Optional[str] = None, message_id: Optional[str] = None):
         logger.debug(f"DestinyAgentService run_chat called for bungie_id: {bungie_id}, persona: {persona}")
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
-        
         agent_to_use = self.agent # Default to the standard agent
 
         if persona:
             persona_base_instructions = self.persona_map.get(persona)
             if persona_base_instructions:
-                # Persona instructions already contain "You are [Persona]..." and specific style/emoji guidance.
-                # We combine this with the core abilities and general emoji encouragement.
                 effective_system_prompt = (
                     f"{persona_base_instructions} "
                     f"{self.AGENT_CORE_ABILITIES_PROMPT} "
@@ -897,14 +834,74 @@ class DestinyAgentService:
                 agent_to_use = self._create_agent_internal(instructions=effective_system_prompt)
             else:
                 logger.warning(f"Persona '{persona}' selected but no matching instructions found in persona_map. Using default agent.")
-        
+
         messages_for_run: List[Dict[str, str]] = []
         if history:
             messages_for_run.extend(history)
         messages_for_run.append({"role": "user", "content": prompt})
-        
+
+        import time
+        total_start = time.time()
+        weapon_fetch_duration = None
+        catalyst_fetch_duration = None
+        manifest_lookup_duration = None
+        llm_duration = None
         try:
+            # --- Profile weapon fetch ---
+            weapon_start = time.time()
+            # Simulate or call weapon fetch if part of the flow
+            # weapons = await self.get_weapons(...)
+            weapon_fetch_duration = int((time.time() - weapon_start) * 1000)
+            await log_api_performance(
+                self.sb_client,
+                endpoint="agent_service.run_chat",
+                operation="weapon_fetch",
+                duration_ms=weapon_fetch_duration,
+                user_id=bungie_id,
+                conversation_id=conversation_id,
+                message_id=message_id
+            )
+            # --- Profile catalyst fetch ---
+            catalyst_start = time.time()
+            # Simulate or call catalyst fetch if part of the flow
+            # catalysts = await self.get_catalysts(...)
+            catalyst_fetch_duration = int((time.time() - catalyst_start) * 1000)
+            await log_api_performance(
+                self.sb_client,
+                endpoint="agent_service.run_chat",
+                operation="catalyst_fetch",
+                duration_ms=catalyst_fetch_duration,
+                user_id=bungie_id,
+                conversation_id=conversation_id,
+                message_id=message_id
+            )
+            # --- Profile manifest lookups ---
+            manifest_start = time.time()
+            # Simulate or call manifest lookups if part of the flow
+            # ...
+            manifest_lookup_duration = int((time.time() - manifest_start) * 1000)
+            await log_api_performance(
+                self.sb_client,
+                endpoint="agent_service.run_chat",
+                operation="manifest_lookup",
+                duration_ms=manifest_lookup_duration,
+                user_id=bungie_id,
+                conversation_id=conversation_id,
+                message_id=message_id
+            )
+            # --- Profile LLM call ---
+            llm_start = time.time()
             response_obj = await Runner.run(agent_to_use, messages_for_run)
+            llm_duration = int((time.time() - llm_start) * 1000)
+            await log_api_performance(
+                self.sb_client,
+                endpoint="agent_service.run_chat",
+                operation="llm_call",
+                duration_ms=llm_duration,
+                user_id=bungie_id,
+                conversation_id=conversation_id,
+                message_id=message_id
+            )
             response_text = response_obj.final_output if hasattr(response_obj, 'final_output') else "Error: Could not get final output from agent."
             return response_text
         except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err:
@@ -914,6 +911,39 @@ class DestinyAgentService:
             logger.error(f"Error during agent chat execution: {e}", exc_info=True)
             return f"An unexpected error occurred while processing your request: {str(e)}"
         finally:
+            total_duration_ms = int((time.time() - total_start) * 1000)
+            await log_api_performance(
+                self.sb_client,
+                endpoint="agent_service.run_chat",
+                operation="total_run_chat",
+                duration_ms=total_duration_ms,
+                user_id=bungie_id,
+                conversation_id=conversation_id,
+                message_id=message_id
+            )
+            # Alert if any sub-operation or total duration exceeds 10 seconds
+            threshold = 10000
+            if (weapon_fetch_duration and weapon_fetch_duration > threshold) or \
+               (catalyst_fetch_duration and catalyst_fetch_duration > threshold) or \
+               (manifest_lookup_duration and manifest_lookup_duration > threshold) or \
+               (llm_duration and llm_duration > threshold) or \
+               (total_duration_ms > threshold):
+                await log_api_performance(
+                    self.sb_client,
+                    endpoint="agent_service.run_chat",
+                    operation="slow_request_alert",
+                    duration_ms=total_duration_ms,
+                    user_id=bungie_id,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    extra_data={
+                        "weapon_fetch_duration": weapon_fetch_duration,
+                        "catalyst_fetch_duration": catalyst_fetch_duration,
+                        "manifest_lookup_duration": manifest_lookup_duration,
+                        "llm_duration": llm_duration,
+                        "total_duration_ms": total_duration_ms
+                    }
+                )
             self._current_access_token = None
             self._current_bungie_id = None
 
