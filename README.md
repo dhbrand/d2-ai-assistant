@@ -206,4 +206,51 @@ npm run dev
 - The backend will use SSL certificates from `web_app/cert.pem` and `web_app/key.pem`.
 - The old `dev` script in `web_app/frontend/package.json` has been removed to avoid confusion.
 
-**Tip:** If you see errors about missing dependencies (e.g., `remark-gfm`, `rehype-raw`), run `npm install` in `web_app/frontend` to install them. 
+**Tip:** If you see errors about missing dependencies (e.g., `remark-gfm`, `rehype-raw`), run `npm install` in `web_app/frontend` to install them.
+
+# Python Environment & Dependency Management
+
+This project now uses [uv](https://github.com/astral-sh/uv) as the official Python dependency and environment manager. All developers should use uv for creating virtual environments and managing dependencies.
+
+### Getting Started
+
+1. **Install uv (recommended via pipx):**
+   ```bash
+   pipx install uv
+   ```
+   If you don't have pipx:
+   ```bash
+   brew install pipx
+   pipx ensurepath
+   # Restart your terminal or run: source ~/.zshrc
+   pipx install uv
+   ```
+
+2. **Create a virtual environment:**
+   ```bash
+   uv venv .venv
+   source .venv/bin/activate
+   ```
+
+3. **Install dependencies:**
+   ```bash
+   uv pip install
+   ```
+   This will install all dependencies listed in `pyproject.toml` and lock them in `uv.lock`.
+
+4. **Add new dependencies:**
+   ```bash
+   uv pip install <package>
+   ```
+   This will update both `pyproject.toml` and `uv.lock`.
+
+5. **Run your app/scripts as usual.**
+
+---
+
+**Note:**
+- Do not use `pip`, `pipenv`, or `venv` directly for this project.
+- All dependency and environment management should be done with uv.
+- If you are migrating from pip, ensure your dependencies are listed in `pyproject.toml` under `[project] dependencies`.
+
+--- 

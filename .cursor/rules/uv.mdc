@@ -1,0 +1,28 @@
+---
+description: installing python packages
+globs: 
+alwaysApply: false
+---
+- **All Python dependency and environment management must use [uv](mdc:https:/github.com/astral-sh/uv).**
+  - Do not use pip, pipenv, or venv directly for this project.
+  - All developers must create and activate virtual environments with `uv venv .venv` and install dependencies with `uv pip install`.
+  - Add new dependencies with `uv pip install <package>` to ensure both `pyproject.toml` and `uv.lock` are updated.
+  - If migrating from pip, ensure all dependencies are listed in `pyproject.toml` under `[project] dependencies`.
+  - See the [README.md](mdc:README.md) for setup and usage instructions.
+
+**DO:**
+```sh
+uv venv .venv
+source .venv/bin/activate
+uv pip install
+uv pip install fastapi
+```
+
+**DON'T:**
+```sh
+pip install ...
+pipenv install ...
+python3 -m venv ...
+```
+
+- Update this rule if the project ever migrates to a different dependency manager.
