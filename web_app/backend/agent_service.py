@@ -25,11 +25,15 @@ from .models import CatalystData, CatalystObjective, Weapon # <--- ensure Weapon
 from .bungie_oauth import AuthenticationRequiredError, InvalidRefreshTokenError # <-- IMPORT THESE
 from web_app.backend.performance_logging import log_api_performance  # Import the profiling helper
 from web_app.backend.utils import normalize_catalyst_data  # Import the normalization helper
+from agents.mcp import MCPServerStdio
 
 logger = logging.getLogger(__name__)
 
 # Define Cache Time-To-Live (TTL)
 CACHE_TTL = timedelta(hours=24) # Cache data for 24 hours
+
+SUPABASE_ACCESS_TOKEN = os.getenv("SUPABASE_ACCESS_TOKEN")
+REFRESH_INTERVAL = timedelta(hours=24)
 
 # --- Tool Implementation Functions (outside class) ---
 
@@ -629,16 +633,21 @@ def _get_endgame_analysis_impl(service: 'DestinyAgentService', sheet_name: Optio
         logger.error(f"Failed to fetch/parse sheet '{selected_sheet}' (gid={gid}): {e}")
         return f"Error: Failed to fetch or parse the sheet '{selected_sheet}'. {e}"
 
-# --- Agent Service Class ---
+# --- Data Refresh Logic ---
+async def refresh_user_data_if_stale(user_id, sb_client, bungie_api):
+    result = await sb_client.table("user_weapon_inventory").select("last_updated").eq("user_id", user_id).order("last_updated", desc=True).limit(1).execute()
+    last_updated = None
+    if result.data and result.data[0].get("last_updated"):
+        last_updated = datetime.fromisoformat(result.data[0]["last_updated"])
+    if last_updated is None or (datetime.utcnow() - last_updated) > REFRESH_INTERVAL:
+        weapons = await bungie_api.fetch_weapons(user_id)
+        catalysts = await bungie_api.fetch_catalysts(user_id)
+        await sb_client.table("user_weapon_inventory").upsert(weapons).execute()
+        await sb_client.table("user_catalyst_status").upsert(catalysts).execute()
 
+# --- DestinyAgentService Refactor ---
 class DestinyAgentService:
-    def __init__(self, 
-                 openai_client: OpenAI, 
-                 catalyst_api: CatalystAPI, 
-                 weapon_api: WeaponAPI,
-                 sb_client: AsyncClient, 
-                 manifest_service: Any, 
-                 ):
+    def __init__(self, openai_client, catalyst_api, weapon_api, sb_client, manifest_service):
         logger.info("Initializing DestinyAgentService with pre-configured API clients and Supabase client.")
         self.openai_client = openai_client
         set_default_openai_client(self.openai_client) # Set for the agents library
@@ -761,6 +770,8 @@ class DestinyAgentService:
         self._user_info_cache: Dict[str, tuple[datetime, dict]] = {}
         self._sheet_cache: Dict[str, tuple[datetime, list[dict]]] = {}
 
+        self.supabase_mcp_server = None
+
     def _create_agent_internal(self, instructions: str) -> Agent:
         """Internal helper to create an agent instance with specific instructions."""
         logger.debug(f"Creating agent with instructions: '{instructions[:100]}...'") # Log first 100 chars
@@ -814,6 +825,38 @@ class DestinyAgentService:
     def get_endgame_analysis_data(self, sheet_name: Optional[str] = None) -> list[dict] | str:
         """Agent Tool: Fetches data from a specified sheet in the Endgame Analysis spreadsheet."""
         return _get_endgame_analysis_impl(self, sheet_name)
+
+    async def setup_supabase_agent(self):
+        self.supabase_mcp_server = MCPServerStdio(
+            params={
+                "command": "npx",
+                "args": [
+                    "-y",
+                    "@supabase/mcp-server-supabase@latest",
+                    "--access-token",
+                    SUPABASE_ACCESS_TOKEN,
+                ],
+            }
+        )
+        await self.supabase_mcp_server.__aenter__()
+        self.agent = Agent(
+            name="MCP Agent",
+            instructions="You are a helpful assistant with access to Supabase tools.",
+            mcp_servers=[self.supabase_mcp_server],
+        )
+
+    async def close_supabase_agent(self):
+        if self.supabase_mcp_server:
+            await self.supabase_mcp_server.__aexit__(None, None, None)
+
+    async def answer_user_query(self, user_input: str):
+        # Use the MCP agent for all weapons/catalyst queries
+        result = await Runner.run(self.agent, input=user_input)
+        return result
+
+    # Optionally, keep legacy methods for direct DB/API access for refresh only
+    async def refresh_user_data(self, user_id):
+        await refresh_user_data_if_stale(user_id, self.sb_client, self.weapon_api)
 
     async def run_chat(self, prompt: str, access_token: str, bungie_id: str, history: Optional[List[Dict[str, str]]] = None, persona: Optional[str] = None, conversation_id: Optional[str] = None, message_id: Optional[str] = None):
         logger.debug(f"DestinyAgentService run_chat called for bungie_id: {bungie_id}, persona: {persona}")

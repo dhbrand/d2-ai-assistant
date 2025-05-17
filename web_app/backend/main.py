@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query, Header, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response, Query, Header, BackgroundTasks, Body
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -742,8 +742,6 @@ async def assistants_chat_endpoint(
             next_order_index += 1
 
         # --- Prepare for Agent Call ---
-        conversation_history.append({"role": "user", "content": user_message_content})
-        
         logger.info(f"Passing chat request to agent service for user {bungie_id}, conversation {current_conversation_id_str}")
         
         run_result = await agent_service_instance.run_chat(
@@ -1137,6 +1135,34 @@ async def invalid_refresh_token_exception_handler(request: Request, exc: Invalid
         status_code=status.HTTP_401_UNAUTHORIZED,
         content={"error": "invalid_refresh_token", "message": str(exc) or "Invalid refresh token. Please log in again."}
     )
+
+# --- Agent Ask Endpoint ---
+from pydantic import BaseModel
+from fastapi import Body
+
+class AgentAskRequest(BaseModel):
+    query: str
+    persona: str | None = None
+    bungie_id: str | None = None
+    access_token: str | None = None
+
+@app.post("/agent/ask")
+async def agent_ask_endpoint(
+    req: AgentAskRequest = Body(...)
+):
+    global agent_service_instance
+    if not agent_service_instance:
+        raise HTTPException(status_code=503, detail="Agent service not initialized.")
+    try:
+        result = await agent_service_instance.run_chat(
+            prompt=req.query,
+            access_token=req.access_token,
+            bungie_id=req.bungie_id,
+            persona=req.persona,
+        )
+        return {"result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
