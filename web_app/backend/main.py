@@ -150,7 +150,7 @@ app.add_middleware(
 # supabase_manifest_service is initialized earlier
 oauth_manager: Optional[OAuthManager] = None
 openai_client = None # Initialized globally earlier, but can be re-confirmed or modified in startup
-agent_service_instance: Optional[DestinyAgentService] = None
+agent_service_instance = None # Removed: agent_service_instance: Optional[DestinyAgentService] = None
 catalyst_api_instance: Optional[CatalystAPI] = None
 weapon_api_instance: Optional[WeaponAPI] = None
 # scheduler = BackgroundScheduler() # Keep scheduler if used
@@ -159,6 +159,7 @@ weapon_api_instance: Optional[WeaponAPI] = None
 @app.on_event("startup")
 async def startup_event():
     """Run initialization tasks when the application starts."""
+    logger.info(f"Startup running in PID: {os.getpid()}")
     logger.info("Running application startup tasks...")
     # Declare all globals that are referenced or assigned to within this function
     global oauth_manager, supabase_client, supabase_manifest_service, openai_client, catalyst_api_instance, weapon_api_instance
@@ -211,21 +212,21 @@ async def startup_event():
         logger.error("OAuthManager or SupabaseManifestService not available. Cannot initialize CatalystAPI or WeaponAPI.")
 
     # Initialize AgentService with the API instances
-    # agent_service_instance is already declared global at the module level and its assignment is handled by the global keyword below
     if openai_client and catalyst_api_instance and weapon_api_instance and supabase_client:
         try:
             logger.info("Attempting to initialize DestinyAgentService...")
-            agent_service_instance = DestinyAgentService(
+            agent_service = DestinyAgentService(
                 openai_client=openai_client,
                 catalyst_api=catalyst_api_instance,
                 weapon_api=weapon_api_instance,
                 sb_client=supabase_client,
                 manifest_service=supabase_manifest_service
             )
-            logger.info("DestinyAgentService initialized.")
+            app.state.agent_service_instance = agent_service
+            logger.info("DestinyAgentService initialized and stored in app.state.")
         except Exception as e:
             logger.exception(f"Error initializing DestinyAgentService: {e}")
-            agent_service_instance = None
+            app.state.agent_service_instance = None
     else:
         missing_deps = []
         if not openai_client: missing_deps.append("OpenAI Client (global)")
@@ -233,6 +234,7 @@ async def startup_event():
         if not weapon_api_instance: missing_deps.append("WeaponAPI (global)")
         if not supabase_client: missing_deps.append("Supabase Client (global)")
         logger.error(f"DestinyAgentService could not be initialized. Missing: {', '.join(missing_deps)}")
+        app.state.agent_service_instance = None
 
     logger.info("Application startup tasks finished.")
 
@@ -621,14 +623,17 @@ async def generate_and_save_title(conversation_id: uuid.UUID):
 # --- REWRITTEN: Chat Endpoint <--- 
 @app.post("/api/assistants/chat", response_model=ChatResponse)
 async def assistants_chat_endpoint(
-    request: ChatRequest,
+    request: Request,
+    chat_request: ChatRequest,
     current_user: SupabaseUser = Depends(get_supabase_user_from_token),
     sb_client: AsyncClient = Depends(get_supabase_db),
 ):
     """
     Chat endpoint using the agent service, handling conversation history with Supabase.
     """
+    logger.info(f"Chat endpoint running in PID: {os.getpid()}")
     total_start = time.time()
+    agent_service_instance = request.app.state.agent_service_instance
     if not agent_service_instance:
         logger.error("Chat request failed: DestinyAgentService not available.")
         raise HTTPException(status_code=503, detail="Chat service is currently unavailable.")
@@ -637,14 +642,14 @@ async def assistants_chat_endpoint(
         logger.error("OpenAI API key missing.")
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
-    user_message_content = request.messages[-1].content if request.messages else ""
+    user_message_content = chat_request.messages[-1].content if chat_request.messages else ""
     if not user_message_content:
         raise HTTPException(status_code=400, detail="No message content provided")
 
     bungie_id = current_user.uuid # This is the Supabase UUID
-    requested_conversation_id_str = str(request.conversation_id) if request.conversation_id else None
+    requested_conversation_id_str = str(chat_request.conversation_id) if chat_request.conversation_id else None
 
-    # Fetch Bungie access token from Supabase user metadata
+    # Fetch Bungie access token from Supabase user metadata (optional)
     access_token = None
     try:
         user_resp = await sb_client.table("users").select("raw_user_meta_data").eq("id", bungie_id).maybe_single().execute()
@@ -652,11 +657,11 @@ async def assistants_chat_endpoint(
             meta = user_resp.data["raw_user_meta_data"]
             access_token = meta.get("bungie_access_token")
         if not access_token:
-            logger.error(f"Bungie access token missing in Supabase metadata for user {bungie_id}")
-            raise HTTPException(status_code=401, detail="Authentication token missing in Supabase metadata")
+            logger.warning(f"Bungie access token missing in Supabase metadata for user {bungie_id}. Proceeding without it.")
+            # Do NOT raise an error; allow chat to proceed
     except Exception as e:
-        logger.error(f"Error fetching Bungie access token from Supabase metadata: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch Bungie access token from Supabase metadata")
+        logger.error(f"Error fetching Bungie access token from Supabase metadata: {e}. Proceeding without it.")
+        access_token = None
 
     conversation_history = []
     current_conversation_id_str: Optional[str] = None # Store as string for Supabase
@@ -734,7 +739,7 @@ async def assistants_chat_endpoint(
             access_token=access_token,
             bungie_id=bungie_id,
             history=conversation_history,
-            persona=request.persona  # <-- Pass persona to agent
+            persona=chat_request.persona  # <-- Pass persona to agent
         )
         agent_duration_ms = int((time.time() - agent_start) * 1000)
         await log_api_performance(
@@ -792,7 +797,7 @@ async def assistants_chat_endpoint(
         final_conversation_id_uuid = uuid.UUID(current_conversation_id_str)
 
         # Trigger title generation if it was a new chat and first exchange (next_order_index would be 1 after saving user msg)
-        if not request.conversation_id and next_order_index == 1: # User message saved, assistant response is about to be generated
+        if not chat_request.conversation_id and next_order_index == 1: # User message saved, assistant response is about to be generated
             logger.info(f"Condition met for title generation for new conversation {final_conversation_id_uuid}. Note: title gen uses local DB.")
             asyncio.create_task(generate_and_save_title(final_conversation_id_uuid))
             logger.info(f"Background task for title generation for {final_conversation_id_uuid} scheduled (uses local DB).")
@@ -1230,6 +1235,26 @@ async def bungie_callback_endpoint(callback_data: CallbackData, request: Request
     except Exception as e:
         logger.error(f"[BUNGIE-ONLY] Error in bungie_callback_endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=f"Bungie-only authentication failed: {str(e)}")
+
+@app.get("/api/profile")
+async def get_user_profile(current_user: SupabaseUser = Depends(get_supabase_user_from_token)):
+    """
+    Returns the current user's profile from public.profiles using the admin Supabase client.
+    Only accessible with a valid JWT (backend-issued).
+    """
+    try:
+        if not sb_admin:
+            logger.error("Supabase admin client not initialized.")
+            raise HTTPException(status_code=500, detail="Supabase admin client not available.")
+        user_id = current_user.uuid
+        resp = sb_admin.table("profiles").select("*").eq("id", user_id).maybe_single().execute()
+        if not resp.data:
+            logger.warning(f"Profile not found for user {user_id}")
+            raise HTTPException(status_code=404, detail="Profile not found.")
+        return resp.data
+    except Exception as e:
+        logger.error(f"Error fetching profile for user {getattr(current_user, 'uuid', None)}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch user profile.")
 
 if __name__ == "__main__":
     import uvicorn

@@ -296,32 +296,29 @@ export const AuthProvider = ({ children }) => {
   }, [logout, checkAndSetUserUuid]); // Include logout and checkAndSetUserUuid dependency
 
 
-  // Fetch user profile from Supabase when userUuid changes
+  // Fetch user profile from backend when userUuid or token changes
   useEffect(() => {
     const fetchProfile = async () => {
-      if (!userUuid) {
+      if (!token) {
         setUserProfile(null);
         return;
       }
       setProfileLoading(true);
       setProfileError(null);
       try {
-        const { data, error } = await supabase
-          .from('profiles')
-          .select('*')
-          .eq('id', userUuid)
-          .single();
-        if (error) throw error;
-        setUserProfile(data);
+        const response = await axios.get(`${API_URL}/api/profile`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        setUserProfile(response.data);
       } catch (err) {
         setUserProfile(null);
-        setProfileError(err.message || 'Failed to fetch profile');
+        setProfileError(err.response?.data?.detail || err.message || 'Failed to fetch profile');
       } finally {
         setProfileLoading(false);
       }
     };
     fetchProfile();
-  }, [userUuid]);
+  }, [userUuid, token]);
 
 
   // const contextValue: AuthContextType = { // If using TypeScript
