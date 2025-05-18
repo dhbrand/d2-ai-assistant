@@ -8,14 +8,4 @@ mcp:
         - '@supabase/mcp-server-supabase@latest'
         - --access-token
         - <personal-access-token>
-    fetch:
-      command: npx
-      args:
-        - -y
-        - '@modelcontextprotocol/server-fetch'
-    filesystem:
-      command: npx
-      args:
-        - -y
-        - '@modelcontextprotocol/server-filesystem'
-        - . 
+    

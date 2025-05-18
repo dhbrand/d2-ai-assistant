@@ -22,7 +22,7 @@ async def main():
         tools = await supabase_server.list_tools()
         print("Available tools from Supabase MCP:")
         for tool in tools:
-            print("-", tool.name)
+            print("-", tool.name, '-', tool.description)
             # For debugging, you can also print: print(vars(tool))
 
         agent = Agent(

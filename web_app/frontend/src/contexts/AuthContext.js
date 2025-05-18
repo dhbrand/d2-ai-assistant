@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
+import { supabase } from '../supabaseClient';
 
 const API_URL = 'https://localhost:8000'; // Use HTTPS and port 8000
 const MAX_AUTH_RETRIES = 3;
@@ -40,6 +41,10 @@ export const AuthProvider = ({ children }) => {
   const [token, setToken] = useState(() => localStorage.getItem('bungie_token')); // Initialize token from localStorage
   const [retryCount, setRetryCount] = useState(0); // State for retries - remove if using direct parameter passing
   const isCheckingAuth = useRef(false); // Ref to prevent multiple concurrent checks
+  const [userUuid, setUserUuid] = useState(() => localStorage.getItem('supabase_user_uuid'));
+  const [userProfile, setUserProfile] = useState(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState(null);
 
 
   // Function to check if token expiry stored in localStorage is past
@@ -136,21 +141,47 @@ export const AuthProvider = ({ children }) => {
   }, [isTokenExpired, logout]); // Dependencies: isTokenExpired, logout
 
 
-  // Effect runs on initial mount to check auth status
+  const checkAndSetUserUuid = useCallback(async (jwt) => {
+    // Call backend endpoint to get Supabase user UUID for this session
+    try {
+      const response = await axios.get(`${API_URL}/api/auth/user`, {
+        headers: { 'Authorization': `Bearer ${jwt}` },
+      });
+      if (response.data && response.data.user_uuid) {
+        setUserUuid(response.data.user_uuid);
+        localStorage.setItem('supabase_user_uuid', response.data.user_uuid);
+      } else {
+        setUserUuid(null);
+        localStorage.removeItem('supabase_user_uuid');
+      }
+    } catch (err) {
+      setUserUuid(null);
+      localStorage.removeItem('supabase_user_uuid');
+      // Optionally log error
+    }
+  }, []);
+
+
+  // Effect runs on initial mount to check auth status and fetch user UUID
   useEffect(() => {
     console.log("AuthContext: Initial mount useEffect running checkAuthStatus.");
-    checkAuthStatus(0); // Start the check sequence
+    checkAuthStatus(0);
+    const jwt = localStorage.getItem('app_jwt');
+    if (jwt) {
+      checkAndSetUserUuid(jwt);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Run only once on mount
 
 
   const login = useCallback(async () => {
-    // (Keep existing login logic, ensure it clears state/localStorage properly before redirect)
     try {
       console.log('AuthContext: Starting login process');
       // Clear existing state *before* getting URL
       logout(); // Use logout function to ensure cleanup
       setIsLoading(true); // Set loading true during redirect preparation
+
+      // No longer need to get Supabase UUID before redirect; backend handles user creation/lookup
 
       // Anti-redirect loop check
       const now = new Date().getTime();
@@ -182,19 +213,24 @@ export const AuthProvider = ({ children }) => {
         console.error('AuthContext: Invalid response data from /auth/url:', response.data);
         throw new Error('No auth_url received from server');
       }
+
+      // After successful login, fetch user UUID
+      const jwt = localStorage.getItem('app_jwt');
+      if (jwt) {
+        await checkAndSetUserUuid(jwt);
+      }
     } catch (err) {
       console.error('AuthContext: Login error:', err);
       setError(`Failed to initiate authentication: ${err.message || 'Unknown error'}`);
       setIsLoading(false); // Ensure loading is false on error
       // Don't re-throw, allow component to handle the error state
     }
-  }, [logout]); // Include logout in dependency array
+  }, [logout, checkAndSetUserUuid]); // Include logout and checkAndSetUserUuid in dependency array
 
 
   const handleCallback = useCallback(async (code, state) => {
-    // (Keep existing handleCallback logic, ensure it sets token state on success)
-     setIsLoading(true); // Ensure loading is true during callback processing
-     console.log('AuthContext: Handling callback with code and state');
+    setIsLoading(true); // Ensure loading is true during callback processing
+    console.log('AuthContext: Handling callback with code and state');
 
     try {
       // Stale callback check
@@ -218,8 +254,9 @@ export const AuthProvider = ({ children }) => {
       localStorage.removeItem('auth_redirect_time');
       localStorage.removeItem('last_auth_attempt');
 
-      console.log('AuthContext: Making callback request to backend...');
-      const response = await axios.post(`${API_URL}/auth/callback`, { code });
+      // No longer need supabase_uuid for callback; backend handles user creation/lookup
+      console.log('AuthContext: Making POST to /auth/bungie-callback with:', { code });
+      const response = await axios.post(`${API_URL}/auth/bungie-callback`, { code });
 
       // -- Updated logic for JWT response --
       if (response.data && response.data.access_token && response.data.token_type === 'bearer') {
@@ -240,6 +277,9 @@ export const AuthProvider = ({ children }) => {
         setIsAuthenticated(true);
         setError(null);
         console.log("AuthContext: Callback successful, user authenticated with JWT.");
+
+        // After successful callback, fetch user UUID
+        await checkAndSetUserUuid(receivedJwt);
       } else {
          console.error('AuthContext: Invalid JWT data received from callback:', response.data);
         throw new Error('Invalid token data received from server.');
@@ -253,7 +293,35 @@ export const AuthProvider = ({ children }) => {
     } finally {
         setIsLoading(false); // Ensure loading is false after processing
     }
-  }, [logout]); // Include logout dependency
+  }, [logout, checkAndSetUserUuid]); // Include logout and checkAndSetUserUuid dependency
+
+
+  // Fetch user profile from Supabase when userUuid changes
+  useEffect(() => {
+    const fetchProfile = async () => {
+      if (!userUuid) {
+        setUserProfile(null);
+        return;
+      }
+      setProfileLoading(true);
+      setProfileError(null);
+      try {
+        const { data, error } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', userUuid)
+          .single();
+        if (error) throw error;
+        setUserProfile(data);
+      } catch (err) {
+        setUserProfile(null);
+        setProfileError(err.message || 'Failed to fetch profile');
+      } finally {
+        setProfileLoading(false);
+      }
+    };
+    fetchProfile();
+  }, [userUuid]);
 
 
   // const contextValue: AuthContextType = { // If using TypeScript
@@ -262,6 +330,10 @@ export const AuthProvider = ({ children }) => {
     isLoading,
     error,
     token, // Provide token in context
+    userUuid, // Expose Supabase user UUID
+    userProfile, // Expose Supabase profile
+    profileLoading,
+    profileError,
     login,
     logout,
     handleCallback,

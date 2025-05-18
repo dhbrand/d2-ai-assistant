@@ -18,6 +18,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True)
     bungie_id = Column(String, unique=True, index=True)
+    supabase_uuid = Column(String, unique=True, index=True, nullable=True)
     access_token = Column(String)
     refresh_token = Column(String)
     access_token_expires = Column(DateTime)

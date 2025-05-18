@@ -27,13 +27,31 @@ from supabase import create_async_client, AsyncClient # <-- Add async Supabase i
 
 # Use absolute imports
 from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError, TokenData, AuthenticationRequiredError # Import TokenData here
-from web_app.backend.models import init_db, User, CatalystData, Weapon, CallbackData, UserResponse, ConversationSchema, ChatMessageSchema, ChatHistorySessionLocal, Conversation, Message # <--- Added missing imports
-from sqlalchemy.orm import sessionmaker, Session
 from web_app.backend.catalyst_api import CatalystAPI
 from web_app.backend.weapon_api import WeaponAPI
 from web_app.backend.agent_service import DestinyAgentService
 from .manifest import SupabaseManifestService # Import the new service
 from web_app.backend.performance_logging import log_api_performance  # Import the profiling helper
+from web_app.backend.models import CallbackData, UserResponse, ConversationSchema, ChatMessageSchema
+
+# Configure logging to file and console
+log_dir = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file_path = os.path.join(log_dir, "app.log")
+
+# Remove all handlers if reloading (for dev hot reload)
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s:%(name)s:%(message)s',
+    handlers=[
+        logging.FileHandler(log_file_path, mode='w'),  # Overwrite on each start
+        logging.StreamHandler()  # Console
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # --- Pydantic Models for Chat (Moved Up) ---
 class ChatMessage(BaseModel):
@@ -62,10 +80,6 @@ class ModelListResponse(BaseModel):
 
 # --- End Moved Models ---
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # --- Environment Variables and Configuration ---
 BUNGIE_CLIENT_ID = os.getenv("BUNGIE_CLIENT_ID")
 BUNGIE_CLIENT_SECRET = os.getenv("BUNGIE_CLIENT_SECRET")
@@ -86,14 +100,22 @@ if not all([BUNGIE_CLIENT_ID, BUNGIE_CLIENT_SECRET, BUNGIE_API_KEY]):
 # Use environment variables for Supabase credentials
 # These should be set in your .env file
 SUPABASE_URL = os.getenv("SUPABASE_URL") # <-- Use name from .env
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") # <-- Use name from .env
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") # <-- Use name from .env
 
 supabase_client: Optional[AsyncClient] = None # <-- Initialize to None
 supabase_manifest_service: Optional[SupabaseManifestService] = None # <-- Initialize to None
 
-# --- Database Setup ---
-# engine, SessionLocal = init_db(DATABASE_URL) # Commented out if only Supabase is used now
-engine = None # Placeholder if engine is needed elsewhere, otherwise remove.
+# --- Supabase Admin Client (for backend-only operations) ---
+sb_admin = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    try:
+        sb_admin = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        logger.info("Supabase ADMIN client initialized for backend operations.")
+    except Exception as e:
+        logger.error(f"Failed to initialize Supabase ADMIN client: {e}")
+        sb_admin = None
+else:
+    logger.error("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not found in environment variables. Supabase admin operations will not be available.")
 
 # --- FastAPI App Instance ---
 app = FastAPI(
@@ -132,8 +154,6 @@ agent_service_instance: Optional[DestinyAgentService] = None
 catalyst_api_instance: Optional[CatalystAPI] = None
 weapon_api_instance: Optional[WeaponAPI] = None
 # scheduler = BackgroundScheduler() # Keep scheduler if used
-db_session_local: Optional[sessionmaker[Session]] = None 
-engine: Optional[any] = None # Add placeholder for engine as it's used in startup global
 
 # --- FastAPI Startup Event --- 
 @app.on_event("startup")
@@ -141,13 +161,13 @@ async def startup_event():
     """Run initialization tasks when the application starts."""
     logger.info("Running application startup tasks...")
     # Declare all globals that are referenced or assigned to within this function
-    global oauth_manager, engine, db_session_local, supabase_client, supabase_manifest_service, openai_client, catalyst_api_instance, weapon_api_instance, agent_service_instance
+    global oauth_manager, supabase_client, supabase_manifest_service, openai_client, catalyst_api_instance, weapon_api_instance
 
     # Initialize Supabase Client and Manifest Service FIRST
-    if SUPABASE_URL and SUPABASE_KEY:
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
         try:
             # Use create_async_client for an asynchronous client
-            supabase_client = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
+            supabase_client = await create_async_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
             logger.info("Supabase ASYNC client initialized in startup.")
 
             # Initialize SupabaseManifestService (depends on supabase_client)
@@ -159,18 +179,6 @@ async def startup_event():
             # supabase_client and supabase_manifest_service will remain None
     else:
         logger.error("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not found in environment variables. Supabase services will not be available.")
-
-    # Initialize the old SQLite DB for User/Token storage
-    try:
-        logger.info(f"Initializing SQLite database at {DATABASE_URL}...")
-        # Call init_db, which now returns engine and the configured sessionmaker
-        local_engine, configured_session_local = init_db(DATABASE_URL) 
-        engine = local_engine # Store engine if needed globally
-        db_session_local = configured_session_local # Store the session factory globally
-        logger.info("SQLite database initialization complete (tables checked/created, session factory configured).")
-    except Exception as e:
-        logger.error(f"Failed to initialize SQLite database during startup: {e}", exc_info=True)
-        # App might not function correctly without user DB
 
     # Initialize OAuthManager
     try:
@@ -230,10 +238,8 @@ async def startup_event():
 
 # --- Caching Setup ---
 CACHE_DURATION = timedelta(minutes=5)
-_catalyst_cache: Dict[str, Tuple[datetime, List[CatalystData]]] = {}
 
 WEAPON_CACHE_DURATION = timedelta(minutes=10) # Add weapon cache duration
-_weapon_cache: Dict[str, Tuple[datetime, List[Weapon]]] = {}
 
 # In-memory mapping: user_id -> thread_id (for demo; replace with DB for production)
 user_thread_map = defaultdict(str)
@@ -273,13 +279,14 @@ def get_chat_db():
         db.close()
 # --- End NEW Dependency Function ---
 
-# oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token") # Dummy URL, we use /auth/callback
 # Use the standard scheme but expect the JWT in the Authorization header
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/dummy_token_url") 
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/dummy_token_url")
 
-# Dependency for getting the current user from JWT
-async def get_current_user_from_token(jwt_token: str = Depends(oauth2_scheme), db: Session = Depends(get_db_session)) -> User:
-    """Dependency to get the current user from a JWT, fetching user data from DB."""
+class SupabaseUser(BaseModel):
+    uuid: str
+    bungie_id: Optional[str] = None
+
+async def get_supabase_user_from_token(jwt_token: str = Depends(oauth2_scheme)) -> SupabaseUser:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -287,32 +294,13 @@ async def get_current_user_from_token(jwt_token: str = Depends(oauth2_scheme), d
     )
     try:
         payload = jwt.decode(jwt_token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        bungie_id: str = payload.get("bng")
-        if user_id is None or bungie_id is None:
-            logger.error("JWT missing 'sub' or 'bng' claim.")
+        user_uuid: str = payload.get("sub")
+        bungie_id: Optional[str] = payload.get("bng")
+        if not user_uuid:
             raise credentials_exception
-        
-        # Fetch user from DB using the injected session `db`
-        user = db.query(User).filter(User.id == int(user_id)).first()
-        if not user:
-             logger.error(f"User with DB ID {user_id} (from JWT) not found in DB.")
-             raise credentials_exception
-        # Optional: Double-check Bungie ID matches
-        if str(user.bungie_id) != bungie_id:
-             logger.error(f"JWT Bungie ID ({bungie_id}) mismatch with DB Bungie ID ({user.bungie_id}) for user DB ID {user_id}")
-             raise credentials_exception
-        
-        # TODO: Implement Bungie token refresh logic if needed here or elsewhere
-        # based on user.access_token_expires compared to now.
-        
-        return user
-    except JWTError:
-        logger.error("JWTError decoding token.", exc_info=True)
-        raise credentials_exception
+        return SupabaseUser(uuid=user_uuid, bungie_id=bungie_id)
     except Exception as e:
-        logger.error(f"Unexpected error in get_current_user_from_token: {e}", exc_info=True)
-        # Don't raise generic 500, stick to 401 for auth failures
+        logger.error(f"JWT decode failed: {e}")
         raise credentials_exception
 
 # --- API Endpoints ---
@@ -327,8 +315,8 @@ def get_auth_url():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/auth/callback")
-async def handle_auth_callback(callback_data: CallbackData, request: Request, db: Session = Depends(get_db_session)):
-    """Handle the OAuth callback, exchange code for tokens, and store tokens for the user."""
+async def handle_auth_callback(callback_data: CallbackData, request: Request, sb_client: AsyncClient = Depends(get_supabase_db)):
+    """Handle the OAuth callback, exchange code for tokens, and store tokens for the user in Supabase metadata."""
     code = callback_data.code
     logger.info(f"Handling callback for code (start): {code[:5]}...") # Log start
     try:
@@ -361,53 +349,42 @@ async def handle_auth_callback(callback_data: CallbackData, request: Request, db
              raise HTTPException(status_code=500, detail="Failed to verify user identity with Bungie")
         logger.info(f"Retrieved Bungie ID: {bungie_id}")
 
-        # Find or create user in DB
-        user = db.query(User).filter(User.bungie_id == bungie_id).first()
-        
-        if user:
-            logger.info(f"Updating tokens for existing user ID: {user.id}")
-            user.access_token = access_token
-            user.refresh_token = refresh_token
-            user.access_token_expires = expires_at_utc
-        else:
-            logger.info(f"Creating new user for Bungie ID: {bungie_id}")
-            user = User(
-                bungie_id=bungie_id, 
-                access_token=access_token, 
-                refresh_token=refresh_token, 
-                access_token_expires=expires_at_utc
-            )
-            db.add(user)
-        
-        db.commit()
-        logger.info(f"Successfully stored/updated tokens for user {bungie_id}")
+        # --- Get Supabase Auth UUID from frontend (required) ---
+        supabase_uuid = getattr(callback_data, 'supabase_uuid', None)
+        if not supabase_uuid:
+            logger.error("Supabase UUID not provided by frontend. Cannot continue.")
+            raise HTTPException(status_code=400, detail="Supabase UUID is required in the callback. Please ensure the frontend sends it.")
+        logger.info(f"Using Supabase UUID from frontend: {supabase_uuid}")
+
+        # --- Store Bungie tokens and Bungie ID in Supabase user metadata ---
+        try:
+            # Prepare metadata update
+            metadata_update = {
+                "bungie_id": str(bungie_id),
+                "bungie_access_token": access_token,
+                "bungie_refresh_token": refresh_token,
+                "bungie_token_expires": expires_at_utc.isoformat()
+            }
+            update_resp = await sb_client.table("users").update({"raw_user_meta_data": metadata_update}).eq("id", supabase_uuid).execute()
+            if update_resp.error:
+                logger.error(f"Failed to update Supabase user metadata: {update_resp.error}")
+                raise HTTPException(status_code=500, detail="Failed to update Supabase user metadata.")
+            logger.info(f"Successfully updated Supabase user metadata for UUID {supabase_uuid}")
+        except Exception as e:
+            logger.error(f"Error updating Supabase user metadata: {e}")
+            raise HTTPException(status_code=500, detail="Failed to update Supabase user metadata.")
 
         # --- Create JWT ---
         jwt_expires = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        # Use the user ID from the database record we just committed
-        db.refresh(user) # Ensure we have the ID if it was a new user
-        user_id = user.id 
-        
         jwt_payload = {
-            "sub": str(user_id), # Subject (standard claim), use database user ID
+            "sub": supabase_uuid, # Subject (standard claim), use Supabase Auth UUID
             "bng": str(bungie_id), # Custom claim for Bungie ID
             "exp": jwt_expires   # Expiration time (standard claim)
         }
-        
         encoded_jwt = jwt.encode(jwt_payload, SECRET_KEY, algorithm=ALGORITHM)
-        logger.info(f"Generated JWT for user ID {user_id} (Bungie ID {bungie_id})")
+        logger.info(f"Generated JWT for user (sub={supabase_uuid}) (Bungie ID {bungie_id})")
         # --- End Create JWT ---
 
-        # --- Return JWT to frontend ---
-        # Return only access token and expiry to frontend - OLD RETURN
-        # return {
-        #     "status": "success", 
-        #     "token_data": {
-        #         "access_token": access_token,
-        #         "expires_in": expires_in
-        #         # DO NOT send refresh_token to frontend
-        #     }
-        # }
         return {
             "status": "success", 
             "access_token": encoded_jwt, # Send the JWT
@@ -421,15 +398,12 @@ async def handle_auth_callback(callback_data: CallbackData, request: Request, db
         raise http_exc
     except Exception as e:
         logger.error(f"Unexpected error in auth_callback for code {code[:5]}...: {e}", exc_info=True) # Log other exceptions
-        db.rollback() # Rollback DB changes on error
         raise HTTPException(status_code=400, detail=f"Authentication callback failed: {str(e)}")
 
-@app.get("/auth/verify", response_model=UserResponse) # Use UserResponse
-# Update dependency to use the new function name
-async def verify_token(current_user: User = Depends(get_current_user_from_token)):
+@app.get("/auth/verify", response_model=UserResponse)
+async def verify_token(current_user: SupabaseUser = Depends(get_supabase_user_from_token)):
     """Verify the authentication token (JWT)"""
-    # Keep current_user parameter name for consistency in endpoint signature if desired
-    return {"status": "ok", "bungie_id": current_user.bungie_id}
+    return {"status": "ok", "user_uuid": current_user.uuid, "bungie_id": current_user.bungie_id}
 
 # --- Endpoint commented out - Use agent tools instead ---
 # @app.get("/catalysts/all", response_model=List[CatalystData])
@@ -447,12 +421,13 @@ async def verify_token(current_user: User = Depends(get_current_user_from_token)
 
 @app.get("/api/conversations", response_model=List[ConversationSchema])
 async def list_conversations(
-    current_user: User = Depends(get_current_user_from_token),
+    current_user: SupabaseUser = Depends(get_supabase_user_from_token),
     db_client: AsyncClient = Depends(get_supabase_db), # <--- Reinstate Depends
     archived: bool = Query(False, description="Set to true to show archived conversations")
 ):
     """Lists all (optionally archived) conversations for the currently authenticated user."""
-    user_bungie_id = str(current_user.id)
+    logger.info(f"[API] Using Supabase UUID: {current_user.uuid}")
+    user_bungie_id = current_user.uuid
     if not user_bungie_id:
         raise HTTPException(status_code=401, detail="User Bungie ID not found in token")
     
@@ -482,11 +457,12 @@ async def list_conversations(
 @app.get("/api/conversations/{conversation_id}/messages", response_model=List[ChatMessageSchema])
 async def get_conversation_messages(
     conversation_id: uuid.UUID,
-    current_user: User = Depends(get_current_user_from_token),
+    current_user: SupabaseUser = Depends(get_supabase_user_from_token),
     sb_client: AsyncClient = Depends(get_supabase_db) # <--- Changed to Supabase client
 ):
     """Gets all messages for a specific conversation from Supabase, verifying ownership."""
-    user_bungie_id = str(current_user.id) # Ensure it's a string for comparison
+    logger.info(f"[API] Using Supabase UUID: {current_user.uuid}")
+    user_bungie_id = current_user.uuid # Ensure it's a string for comparison
     if not user_bungie_id:
         raise HTTPException(status_code=401, detail="User Bungie ID not found in token")
 
@@ -646,8 +622,8 @@ async def generate_and_save_title(conversation_id: uuid.UUID):
 @app.post("/api/assistants/chat", response_model=ChatResponse)
 async def assistants_chat_endpoint(
     request: ChatRequest,
-    current_user: User = Depends(get_current_user_from_token),
-    sb_client: AsyncClient = Depends(get_supabase_db) # <--- Changed to Supabase client
+    current_user: SupabaseUser = Depends(get_supabase_user_from_token),
+    sb_client: AsyncClient = Depends(get_supabase_db),
 ):
     """
     Chat endpoint using the agent service, handling conversation history with Supabase.
@@ -665,13 +641,22 @@ async def assistants_chat_endpoint(
     if not user_message_content:
         raise HTTPException(status_code=400, detail="No message content provided")
 
-    access_token = current_user.access_token
-    bungie_id = str(current_user.id) # Ensure string
+    bungie_id = current_user.uuid # This is the Supabase UUID
     requested_conversation_id_str = str(request.conversation_id) if request.conversation_id else None
 
-    if not access_token or not bungie_id:
-        logger.error(f"Auth info missing for user {current_user.id}")
-        raise HTTPException(status_code=401, detail="Authentication token or user ID missing")
+    # Fetch Bungie access token from Supabase user metadata
+    access_token = None
+    try:
+        user_resp = await sb_client.table("users").select("raw_user_meta_data").eq("id", bungie_id).maybe_single().execute()
+        if user_resp.data and user_resp.data.get("raw_user_meta_data"):
+            meta = user_resp.data["raw_user_meta_data"]
+            access_token = meta.get("bungie_access_token")
+        if not access_token:
+            logger.error(f"Bungie access token missing in Supabase metadata for user {bungie_id}")
+            raise HTTPException(status_code=401, detail="Authentication token missing in Supabase metadata")
+    except Exception as e:
+        logger.error(f"Error fetching Bungie access token from Supabase metadata: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch Bungie access token from Supabase metadata")
 
     conversation_history = []
     current_conversation_id_str: Optional[str] = None # Store as string for Supabase
@@ -688,7 +673,7 @@ async def assistants_chat_endpoint(
                 .eq("id", requested_conversation_id_str) \
                 .eq("user_id", bungie_id) \
                 .maybe_single() \
-                .execute() # <--- Add await
+                .execute()
 
             if not conv_response.data:
                 logger.warning(f"Conversation {requested_conversation_id_str} not found for user {bungie_id} or access denied.")
@@ -701,7 +686,7 @@ async def assistants_chat_endpoint(
                 .select("sender, content, order_index") \
                 .eq("conversation_id", current_conversation_id_str) \
                 .order("order_index", desc=False) \
-                .execute() # <--- Add await
+                .execute()
             
             if messages_response.data:
                 for msg_data in messages_response.data:
@@ -714,7 +699,7 @@ async def assistants_chat_endpoint(
             # Start new conversation in Supabase
             logger.info(f"Starting new conversation for user {bungie_id}")
             new_conv_data = {"user_id": bungie_id, "title": None} # title can be generated later
-            insert_response = await sb_client.table("conversations").insert(new_conv_data).execute() # <--- Add await
+            insert_response = await sb_client.table("conversations").insert(new_conv_data).execute()
             
             if not insert_response.data:
                 logger.error(f"Failed to insert new conversation for user {bungie_id} into Supabase.")
@@ -732,7 +717,7 @@ async def assistants_chat_endpoint(
             "order_index": next_order_index
             # Supabase handles 'created_at' (timestamp) and 'id' (message UUID)
         }
-        insert_user_msg_response = await sb_client.table("messages").insert(user_message_to_save).execute() # <--- Add await
+        insert_user_msg_response = await sb_client.table("messages").insert(user_message_to_save).execute()
         if not insert_user_msg_response.data:
             logger.error(f"Failed to save user message for conv {current_conversation_id_str} to Supabase.")
             user_message_id = None
@@ -785,7 +770,7 @@ async def assistants_chat_endpoint(
             "content": agent_response_content,
             "order_index": next_order_index
         }
-        insert_asst_msg_response = await sb_client.table("messages").insert(assistant_message_to_save).execute() # <--- Add await
+        insert_asst_msg_response = await sb_client.table("messages").insert(assistant_message_to_save).execute()
         if not insert_asst_msg_response.data:
             logger.error(f"Failed to save assistant message for conv {current_conversation_id_str} to Supabase.")
         else:
@@ -794,7 +779,7 @@ async def assistants_chat_endpoint(
         # --- Update Conversation Timestamp in Supabase ---
         # This happens regardless of assistant message save success, as user message was processed.
         update_conv_ts_response = await sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
-            .eq("id", current_conversation_id_str).execute() # <--- Add await
+            .eq("id", current_conversation_id_str).execute()
         if not update_conv_ts_response.data:
              logger.error(f"Failed to update timestamp for conversation {current_conversation_id_str} in Supabase.")
         else:
@@ -808,8 +793,6 @@ async def assistants_chat_endpoint(
 
         # Trigger title generation if it was a new chat and first exchange (next_order_index would be 1 after saving user msg)
         if not request.conversation_id and next_order_index == 1: # User message saved, assistant response is about to be generated
-            # The generate_and_save_title function still uses local DB. This needs to be addressed separately.
-            # For now, it might fail or operate on a different data source if not updated.
             logger.info(f"Condition met for title generation for new conversation {final_conversation_id_uuid}. Note: title gen uses local DB.")
             asyncio.create_task(generate_and_save_title(final_conversation_id_uuid))
             logger.info(f"Background task for title generation for {final_conversation_id_uuid} scheduled (uses local DB).")
@@ -840,9 +823,9 @@ async def assistants_chat_endpoint(
             extra_data={"status": "error", "error": str(http_exc.detail)}
         )
         raise http_exc
-    except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err: # <-- CATCH AUTH ERRORS SPECIFICALLY
+    except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err:
         logger.warning(f"Authentication error in assistants_chat_endpoint for user {bungie_id}, conv {requested_conversation_id_str}: {auth_err}")
-        raise auth_err # Re-raise to be caught by the app-level exception handlers
+        raise auth_err
     except Exception as e:
         total_duration_ms = int((time.time() - total_start) * 1000)
         await log_api_performance(
@@ -855,7 +838,6 @@ async def assistants_chat_endpoint(
             message_id=user_message_id,
             extra_data={"status": "error", "error": str(e)}
         )
-        # Attempt to update timestamp on generic error if we have a conversation ID
         if current_conversation_id_str:
             try:
                 await sb_client.table("conversations").update({"updated_at": datetime.now(timezone.utc).isoformat()}) \
@@ -916,18 +898,18 @@ def shutdown_event():
 @app.delete("/api/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_conversation(
     conversation_id: uuid.UUID,
-    current_user: User = Depends(get_current_user_from_token),
+    current_user: SupabaseUser = Depends(get_supabase_user_from_token),
     sb_client: AsyncClient = Depends(get_supabase_db) # Changed to Supabase client
 ):
     """Deletes a conversation from Supabase."""
-    logger.info(f"Attempting to delete conversation {conversation_id} for user {current_user.id}")
+    logger.info(f"Attempting to delete conversation {conversation_id} for user {current_user.uuid}")
     try:
         # Supabase cascade delete should handle messages if configured on the DB via foreign keys.
         delete_result = await (
             sb_client.table("conversations")
             .delete()
             .eq("id", str(conversation_id)) # Ensure UUID is cast to string for query
-            .eq("user_id", current_user.id)
+            .eq("user_id", current_user.uuid)
             .execute()
         )
         
@@ -936,33 +918,33 @@ async def delete_conversation(
         # For now, we assume if it doesn't error and user_id matches, it's fine.
         # If delete_result.data is empty and no error, it implies no row matched the criteria (or delete doesn't return data).
         # Add more specific checks if a direct count of deleted items is needed and available from the client.
-        logger.info(f"Delete operation for conversation {conversation_id} for user {current_user.id} completed. Result: {delete_result}")
+        logger.info(f"Delete operation for conversation {conversation_id} for user {current_user.uuid} completed. Result: {delete_result}")
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     except Exception as e:
-        logger.error(f"Error deleting conversation {conversation_id} for user {current_user.id}: {e}", exc_info=True)
+        logger.error(f"Error deleting conversation {conversation_id} for user {current_user.uuid}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not delete conversation")
 
 # --- NEW: Archive Conversation Endpoint ---
 @app.patch("/api/conversations/{conversation_id}/archive", response_model=ConversationSchema)
 async def archive_conversation(
     conversation_id: uuid.UUID,
-    current_user: User = Depends(get_current_user_from_token),
+    current_user: SupabaseUser = Depends(get_supabase_user_from_token),
     sb_client: AsyncClient = Depends(get_supabase_db) # Changed to Supabase client
 ):
     """Archives a conversation by setting its 'archived' status to True."""
-    logger.info(f"Attempting to archive conversation {conversation_id} for user {current_user.id}")
+    logger.info(f"Attempting to archive conversation {conversation_id} for user {current_user.uuid}")
     try:
         update_result = await (
             sb_client.table("conversations")
             .update({"archived": True, "updated_at": datetime.now(timezone.utc).isoformat()})
             .eq("id", str(conversation_id)) # Ensure UUID is cast to string for query
-            .eq("user_id", current_user.id)
+            .eq("user_id", current_user.uuid)
             .execute()
         )
 
         if not update_result.data:
-            logger.warning(f"Archive failed: Conversation {conversation_id} not found for user {current_user.id} or no update occurred.")
+            logger.warning(f"Archive failed: Conversation {conversation_id} not found for user {current_user.uuid} or no update occurred.")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found or not authorized to archive")
 
         return ConversationSchema(**update_result.data[0])
@@ -970,7 +952,7 @@ async def archive_conversation(
     except HTTPException: # Re-raise HTTPException
         raise
     except Exception as e:
-        logger.error(f"Error archiving conversation {conversation_id} for user {current_user.id}: {e}", exc_info=True)
+        logger.error(f"Error archiving conversation {conversation_id} for user {current_user.uuid}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not archive conversation")
 
 # --- NEW: Rename Conversation Endpoint ---
@@ -984,11 +966,11 @@ class RenameConversationRequest(BaseModel): # Ensure this uses the pydantic.Base
 async def rename_conversation(
     conversation_id: uuid.UUID,
     req: RenameConversationRequest,
-    current_user: User = Depends(get_current_user_from_token),
+    current_user: SupabaseUser = Depends(get_supabase_user_from_token),
     sb_client: AsyncClient = Depends(get_supabase_db)
 ):
     """Renames a conversation (changes its title) in Supabase."""
-    logger.info(f"Attempting to rename conversation {conversation_id} for user {current_user.id} to '{req.title}'")
+    logger.info(f"Attempting to rename conversation {conversation_id} for user {current_user.uuid} to '{req.title}'")
     
     if not req.title.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Title cannot be empty.")
@@ -998,12 +980,12 @@ async def rename_conversation(
             sb_client.table("conversations")
             .update({"title": req.title, "updated_at": datetime.now(timezone.utc).isoformat()})
             .eq("id", str(conversation_id))
-            .eq("user_id", current_user.id)
+            .eq("user_id", current_user.uuid)
             .execute()
         )
 
         if not update_result.data:
-            logger.warning(f"Rename failed: Conversation {conversation_id} not found for user {current_user.id} or no update occurred.")
+            logger.warning(f"Rename failed: Conversation {conversation_id} not found for user {current_user.uuid} or no update occurred.")
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found or not authorized to rename")
 
         return ConversationSchema(**update_result.data[0])
@@ -1011,16 +993,16 @@ async def rename_conversation(
     except HTTPException: # Re-raise HTTPException
         raise
     except Exception as e:
-        logger.error(f"Error renaming conversation {conversation_id} for user {current_user.id}: {e}", exc_info=True)
+        logger.error(f"Error renaming conversation {conversation_id} for user {current_user.uuid}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not rename conversation")
 
 @app.post("/auth/refresh")
-def refresh_jwt_token(Authorization: str = Header(None), db: Session = Depends(get_db_session)):
+async def refresh_jwt_token(Authorization: str = Header(None), sb_client: AsyncClient = Depends(get_supabase_db)):
     """
     Issue a new JWT if the backend has a valid Bungie refresh token for the user.
     The frontend should call this if it gets a 401 due to JWT expiry.
     """
-    logger.info("/auth/refresh called. Attempting to refresh JWT using backend refresh token.")
+    logger.info("/auth/refresh called. Attempting to refresh JWT using Supabase refresh token.")
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not refresh credentials. Please log in again.",
@@ -1033,44 +1015,52 @@ def refresh_jwt_token(Authorization: str = Header(None), db: Session = Depends(g
     try:
         # Decode JWT ignoring expiry to get user info
         payload = jwt.decode(jwt_token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": False})
-        user_id: str = payload.get("sub")
+        user_sub: str = payload.get("sub")
         bungie_id: str = payload.get("bng")
-        if user_id is None or bungie_id is None:
+        if user_sub is None or bungie_id is None:
             logger.error("JWT missing 'sub' or 'bng' claim.")
             raise credentials_exception
-        user = db.query(User).filter(User.id == int(user_id)).first()
-        if not user:
-            logger.error(f"User with DB ID {user_id} not found in DB.")
-            raise credentials_exception
-        if str(user.bungie_id) != bungie_id:
-            logger.error(f"JWT Bungie ID ({bungie_id}) mismatch with DB Bungie ID ({user.bungie_id}) for user DB ID {user_id}")
-            raise credentials_exception
-        # Check for refresh token
-        if not user.refresh_token:
-            logger.error("No refresh token stored for user. Cannot refresh.")
+        # Fetch refresh token from Supabase user metadata
+        user_resp = await sb_client.table("users").select("raw_user_meta_data").eq("id", user_sub).maybe_single().execute()
+        refresh_token = None
+        if user_resp.data and user_resp.data.get("raw_user_meta_data"):
+            meta = user_resp.data["raw_user_meta_data"]
+            refresh_token = meta.get("bungie_refresh_token")
+        if not refresh_token:
+            logger.error(f"No refresh token stored in Supabase metadata for user {user_sub}. Cannot refresh.")
             raise credentials_exception
         # Refresh Bungie access token if needed
         try:
-            new_token_data = oauth_manager.refresh_token(user.refresh_token)
-            user.access_token = new_token_data["access_token"]
-            user.refresh_token = new_token_data["refresh_token"]
+            new_token_data = oauth_manager.refresh_token(refresh_token)
+            access_token = new_token_data["access_token"]
+            refresh_token = new_token_data["refresh_token"]
             expires_in = new_token_data["expires_in"]
             now_utc = datetime.now(timezone.utc)
-            user.access_token_expires = now_utc + timedelta(seconds=expires_in)
-            db.commit()
-            logger.info(f"Refreshed Bungie access token for user {user_id}.")
+            expires_at_utc = now_utc + timedelta(seconds=expires_in)
+            # Update Supabase metadata with new tokens
+            metadata_update = {
+                "bungie_id": bungie_id,
+                "bungie_access_token": access_token,
+                "bungie_refresh_token": refresh_token,
+                "bungie_token_expires": expires_at_utc.isoformat()
+            }
+            update_resp = await sb_client.table("users").update({"raw_user_meta_data": metadata_update}).eq("id", user_sub).execute()
+            if update_resp.error:
+                logger.error(f"Failed to update Supabase user metadata: {update_resp.error}")
+                raise credentials_exception
+            logger.info(f"Refreshed Bungie access token for user {user_sub} and updated Supabase metadata.")
         except Exception as e:
             logger.error(f"Failed to refresh Bungie token: {e}")
             raise credentials_exception
         # Issue new JWT
         jwt_expires = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         jwt_payload = {
-            "sub": str(user.id),
-            "bng": str(user.bungie_id),
+            "sub": user_sub,
+            "bng": str(bungie_id),
             "exp": jwt_expires
         }
         encoded_jwt = jwt.encode(jwt_payload, SECRET_KEY, algorithm=ALGORITHM)
-        logger.info(f"Issued new JWT for user {user_id} (Bungie ID {bungie_id}) via /auth/refresh.")
+        logger.info(f"Issued new JWT for user (sub={user_sub}) (Bungie ID {bungie_id}) via /auth/refresh.")
         return {
             "status": "success",
             "access_token": encoded_jwt,
@@ -1163,6 +1153,83 @@ async def agent_ask_endpoint(
         return {"result": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/auth/user")
+async def get_supabase_user_uuid(current_user: SupabaseUser = Depends(get_supabase_user_from_token)):
+    """Returns the Supabase Auth user UUID for the current session/user."""
+    user_uuid = current_user.uuid
+    logger.info(f"/api/auth/user: Returning Supabase user UUID {user_uuid} for user {getattr(current_user, 'bungie_id', None)}")
+    return {"user_uuid": user_uuid}
+
+@app.post("/auth/bungie-callback")
+async def bungie_callback_endpoint(callback_data: CallbackData, request: Request):
+    """
+    Handle Bungie OAuth callback, create/find Supabase user, update metadata, and issue JWT.
+    """
+    code = callback_data.code
+    logger.info(f"[BUNGIE-ONLY] Handling Bungie callback for code: {code[:5]}...")
+    try:
+        if not code:
+            logger.error("Callback received empty/missing code in request body.")
+            raise HTTPException(status_code=400, detail="Code parameter is required")
+        # Exchange code for Bungie tokens
+        token_data = oauth_manager.handle_callback(code)
+        access_token = token_data.get('access_token')
+        refresh_token = token_data.get('refresh_token')
+        expires_in = token_data.get('expires_in')
+        if not all([access_token, refresh_token, expires_in]):
+            logger.error("Token exchange response missing required fields.", extra={"token_data": token_data})
+            raise HTTPException(status_code=500, detail="Failed to get complete token data from Bungie")
+        # Get Bungie ID
+        bungie_id = oauth_manager.get_bungie_id(access_token)
+        if not bungie_id:
+            logger.error("Failed to get Bungie ID using the new access token.")
+            raise HTTPException(status_code=500, detail="Failed to verify user identity with Bungie")
+        logger.info(f"[BUNGIE-ONLY] Retrieved Bungie ID: {bungie_id}")
+        # Find or create Supabase user by Bungie ID in metadata
+        user_id = None
+        # Try to find user by Bungie ID in metadata
+        resp = sb_admin.table("profiles").select("*").eq("bungie_id", str(bungie_id)).maybe_single().execute()
+        if resp.data:
+            user_id = resp.data["id"]
+            logger.info(f"[BUNGIE-ONLY] Found existing Supabase user for Bungie ID {bungie_id}: {user_id}")
+        else:
+            # Create user with fake email
+            fake_email = f"{bungie_id}@bungie.local"
+            user_resp = sb_admin.auth.admin.create_user({
+                "email": fake_email,
+                "email_confirm": False,
+                "user_metadata": {"bungie_id": str(bungie_id)}
+            })
+            user_id = user_resp.user.id
+            logger.info(f"[BUNGIE-ONLY] Created new Supabase user for Bungie ID {bungie_id}: {user_id}")
+        # Update user metadata with Bungie tokens
+        metadata_update = {
+            "bungie_id": str(bungie_id),
+            "bungie_access_token": access_token,
+            "bungie_refresh_token": refresh_token,
+            "bungie_token_expires": (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+        }
+        sb_admin.auth.admin.update_user_by_id(user_id, {"user_metadata": metadata_update})
+        logger.info(f"[BUNGIE-ONLY] Updated Supabase user metadata for {user_id}")
+        # Issue a JWT for the user (custom, signed with SECRET_KEY)
+        jwt_expires = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        jwt_payload = {
+            "sub": user_id,
+            "bng": str(bungie_id),
+            "exp": jwt_expires
+        }
+        encoded_jwt = jwt.encode(jwt_payload, SECRET_KEY, algorithm=ALGORITHM)
+        logger.info(f"[BUNGIE-ONLY] Issued JWT for user {user_id}")
+        return {
+            "status": "success",
+            "access_token": encoded_jwt,
+            "token_type": "bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        }
+    except Exception as e:
+        logger.error(f"[BUNGIE-ONLY] Error in bungie_callback_endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Bungie-only authentication failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

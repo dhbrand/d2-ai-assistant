@@ -253,4 +253,39 @@ This project now uses [uv](https://github.com/astral-sh/uv) as the official Pyth
 - All dependency and environment management should be done with uv.
 - If you are migrating from pip, ensure your dependencies are listed in `pyproject.toml` under `[project] dependencies`.
 
+---
+
+## Supabase Auth Migration & User Management
+
+**All user, session, and token management is now handled via Supabase Auth and user metadata.**
+
+- Bungie OAuth tokens and Bungie ID are stored in the `raw_user_meta_data` field of the Supabase `auth.users` table.
+- The backend no longer uses SQLite or SQLAlchemy for user/session/token management.
+- All authentication, session, and token operations are performed using Supabase Auth and the Supabase Python client.
+
+### Migrating Existing Data
+
+If you have existing user/token data in the old SQLite database (`catalysts.db`), use the migration script:
+
+```bash
+python scripts/migrate_sqlite_users_to_supabase.py
+```
+
+This script reads from `users_for_supabase_migration.csv` (exported from SQLite) and updates Supabase user metadata for each user.
+
+### Deleting the Old SQLite Database
+
+Once you have confirmed that all user/token data has been migrated and the application is running correctly with Supabase Auth:
+
+1. **Delete the old SQLite database file:**
+   ```bash
+   rm catalysts.db
+   ```
+2. **Remove any obsolete code or references to SQLite/SQLAlchemy user management.**
+   - The backend codebase has already been refactored to remove these dependencies.
+
+### Troubleshooting
+- If you encounter issues with authentication or token refresh, ensure that the Supabase environment variables are set correctly and that user metadata is being updated as expected.
+- All user management, authentication, and token refresh logic is now handled via Supabase Auth and user metadata.
+
 --- 

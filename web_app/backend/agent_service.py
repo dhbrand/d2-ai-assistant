@@ -1,7 +1,7 @@
 # Placeholder for DestinyAgentService class
 
 import os
-from agents import Agent, Runner, function_tool, WebSearchTool, set_default_openai_client
+from agents import Agent, Runner, function_tool, WebSearchTool, set_default_openai_client, RunContextWrapper
 from .weapon_api import WeaponAPI # Use relative import
 from .catalyst_api import CatalystAPI # Use relative import
 from .manifest import ManifestManager # Use relative import
@@ -92,20 +92,28 @@ async def _get_user_info_impl(service: 'DestinyAgentService') -> dict:
 async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int, membership_id: str) -> List[Weapon]:
     """(Implementation) Fetch all weapons for a user, using Supabase as cache."""
     logger.debug(f"Agent Tool Impl: get_weapons called for {membership_type}/{membership_id}")
-    bungie_id = service._current_bungie_id
+    access_token = service._current_access_token
+    user_uuid = service._current_user_uuid  # Must be a valid UUID string
 
-    if not bungie_id:
-        logger.error("Agent Tool Impl Error: Bungie ID not set in context for get_weapons.")
-        raise Exception("User context (bungie_id) not available for get_weapons.")
+    # TODO: Ensure _current_user_uuid is set at authentication/session start
+    import uuid
+    if not user_uuid or not isinstance(user_uuid, str):
+        logger.error(f"Supabase user_uuid is not set or not a string: {user_uuid}")
+        raise Exception("Supabase user_uuid must be set to a valid UUID string before querying weapons.")
+    try:
+        uuid.UUID(user_uuid)
+    except Exception:
+        logger.error(f"Supabase user_uuid is not a valid UUID: {user_uuid}")
+        raise Exception("Supabase user_uuid must be a valid UUID string.")
 
     now = datetime.now(timezone.utc)
     import time
     supabase_start = time.time()
     try:
-        logger.info(f"Attempting to fetch weapons from Supabase cache for user {bungie_id}")
+        logger.info(f"Attempting to fetch weapons from Supabase cache for user {user_uuid}")
         supabase_response = await (service.sb_client.table("user_weapon_inventory")
             .select("item_instance_id, item_hash, weapon_name, weapon_type, intrinsic_perk, col1_plugs, col2_plugs, col3_trait1, col4_trait2, origin_trait, masterwork, weapon_mods, shaders, location, is_equipped, last_updated")
-            .eq("user_id", bungie_id)
+            .eq("user_id", user_uuid)
             .execute())
         supabase_duration_ms = int((time.time() - supabase_start) * 1000)
         await log_api_performance(
@@ -113,11 +121,11 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
             endpoint="agent_service.get_weapons",
             operation="supabase_cache_read",
             duration_ms=supabase_duration_ms,
-            user_id=bungie_id
+            user_id=user_uuid
         )
 
         if supabase_response.data:
-            logger.info(f"Found {len(supabase_response.data)} weapon instance entries in Supabase for user {bungie_id}")
+            logger.info(f"Found {len(supabase_response.data)} weapon instance entries in Supabase for user {user_uuid}")
             
             cache_is_fresh = True
             oldest_update_time = None 
@@ -135,19 +143,19 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
                         break
                 else:
                     cache_is_fresh = False
-                    logger.info(f"Weapon instance {item_dict.get('item_instance_id')} missing last_updated, cache STALE for user {bungie_id}")
+                    logger.info(f"Weapon instance {item_dict.get('item_instance_id')} missing last_updated, cache STALE for user {user_uuid}")
                     break
             
             if cache_is_fresh and oldest_update_time is not None:
                 if (now - oldest_update_time > CACHE_TTL):
                     cache_is_fresh = False
-                    logger.info(f"Supabase weapon cache is STALE for user {bungie_id} (oldest item updated at {oldest_update_time}).")
+                    logger.info(f"Supabase weapon cache is STALE for user {user_uuid} (oldest item updated at {oldest_update_time}).")
             elif cache_is_fresh and oldest_update_time is None and supabase_response.data: 
                 cache_is_fresh = False
-                logger.info(f"Supabase weapon cache for user {bungie_id} has items but no valid last_updated timestamps, considering STALE.")
+                logger.info(f"Supabase weapon cache for user {user_uuid} has items but no valid last_updated timestamps, considering STALE.")
 
             if cache_is_fresh:
-                logger.info(f"Supabase weapon cache is FRESH for user {bungie_id}. Reconstructing Weapon list from cache data.")
+                logger.info(f"Supabase weapon cache is FRESH for user {user_uuid}. Reconstructing Weapon list from cache data.")
                 reconstructed_weapons: List[Weapon] = []
                 for item_dict in supabase_response.data:
                     weapon_data_for_model = {
@@ -174,21 +182,21 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
                         reconstructed_weapons.append(weapon)
                     except Exception as e:
                         logger.error(f"Pydantic validation error reconstructing weapon {item_dict.get('item_hash')} from cache: {e}. Data: {weapon_data_for_model}")
-                logger.info(f"Cache HIT: Returning {len(reconstructed_weapons)} weapons from Supabase for user {bungie_id}")
+                logger.info(f"Cache HIT: Returning {len(reconstructed_weapons)} weapons from Supabase for user {user_uuid}")
                 return reconstructed_weapons
             else:
-                logger.warning(f"Failed to reconstruct all ({len(reconstructed_weapons)}/{len(supabase_response.data)}) weapons from cache for user {bungie_id}. Proceeding to API call.")
+                logger.warning(f"Failed to reconstruct all ({len(reconstructed_weapons)}/{len(supabase_response.data)}) weapons from cache for user {user_uuid}. Proceeding to API call.")
                 # Fall through to API call
 
         else: 
-            logger.info(f"Cache MISS: No weapon data in Supabase for user {bungie_id}")
+            logger.info(f"Cache MISS: No weapon data in Supabase for user {user_uuid}")
 
     except Exception as e:
-        logger.error(f"Error during Supabase weapon cache read or reconstruction for user {bungie_id}: {e}", exc_info=True)
+        logger.error(f"Error during Supabase weapon cache read or reconstruction for user {user_uuid}: {e}", exc_info=True)
         # Fall through to API call on any error
 
     # Cache miss, stale, or error in cache read/reconstruction: Call API
-    logger.info(f"Calling Bungie API for weapons for user {bungie_id} (membership: {membership_type}/{membership_id})")
+    logger.info(f"Calling Bungie API for weapons for user {user_uuid} (membership: {membership_type}/{membership_id})")
     api_start = time.time()
     try:
         # weapon_api.get_all_weapons is expected to return List[Weapon]
@@ -196,7 +204,7 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
         weapons_from_api = await service.weapon_api.get_all_weapons_with_detailed_perks(
             membership_type=membership_type,
             destiny_membership_id=membership_id,
-            user_id=bungie_id,
+            user_id=user_uuid,
             sb_client=service.sb_client
         )
         api_duration_ms = int((time.time() - api_start) * 1000)
@@ -205,26 +213,26 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
             endpoint="agent_service.get_weapons",
             operation="weapon_api.get_all_weapons_with_detailed_perks",
             duration_ms=api_duration_ms,
-            user_id=bungie_id
+            user_id=user_uuid
         )
 
         if weapons_from_api:
-            logger.info(f"Fetched {len(weapons_from_api)} weapons from API. Storing instance data in Supabase for user {bungie_id}.")
+            logger.info(f"Fetched {len(weapons_from_api)} weapons from API. Storing instance data in Supabase for user {user_uuid}.")
             
             try:
                 await (service.sb_client.table("user_weapon_inventory")
                     .delete()
-                    .eq("user_id", bungie_id)
+                    .eq("user_id", user_uuid)
                     .execute())
-                logger.info(f"Successfully deleted old weapon inventory for user {bungie_id} from Supabase.")
+                logger.info(f"Successfully deleted old weapon inventory for user {user_uuid} from Supabase.")
             except Exception as del_e:
-                logger.error(f"Failed to delete old weapon inventory for user {bungie_id} from Supabase: {del_e}", exc_info=True)
+                logger.error(f"Failed to delete old weapon inventory for user {user_uuid} from Supabase: {del_e}", exc_info=True)
 
             weapons_to_insert = []
             current_timestamp_iso = now.isoformat()
             for weapon_model in weapons_from_api: # weapon_model is now a dict
                 db_weapon_entry = {
-                    "user_id": bungie_id,
+                    "user_id": user_uuid,
                     "item_instance_id": weapon_model.get("item_instance_id"),
                     "item_hash": int(weapon_model["item_hash"]) if weapon_model.get("item_hash") is not None else None,
                     "weapon_name": weapon_model.get("weapon_name"),
@@ -251,17 +259,17 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
                         .execute())
                     
                     if hasattr(insert_response, 'error') and insert_response.error:
-                         logger.error(f"Supabase insert error for weapons user {bungie_id}: {insert_response.error}")
+                         logger.error(f"Supabase insert error for weapons user {user_uuid}: {insert_response.error}")
                     elif insert_response.data:
-                         logger.info(f"Successfully inserted {len(insert_response.data)} weapon instances in Supabase for user {bungie_id}.")
+                         logger.info(f"Successfully inserted {len(insert_response.data)} weapon instances in Supabase for user {user_uuid}.")
                     else:
-                         logger.info(f"Weapon instance insert for user {bungie_id} completed; no data/error in response.")
+                         logger.info(f"Weapon instance insert for user {user_uuid} completed; no data/error in response.")
                 except Exception as ins_e:
-                    logger.error(f"Failed to insert weapon instances in Supabase for user {bungie_id}: {ins_e}", exc_info=True)
+                    logger.error(f"Failed to insert weapon instances in Supabase for user {user_uuid}: {ins_e}", exc_info=True)
             else:
-                logger.info(f"No valid weapons from API to insert into Supabase for user {bungie_id}.")
+                logger.info(f"No valid weapons from API to insert into Supabase for user {user_uuid}.")
         else:
-            logger.info(f"No weapons returned from API for user {bungie_id}. Cache will not be updated.")
+            logger.info(f"No weapons returned from API for user {user_uuid}. Cache will not be updated.")
         
         return weapons_from_api
 
@@ -282,6 +290,7 @@ async def _get_catalysts_impl(service: 'DestinyAgentService', user_uuid: str) ->
         raise Exception("User context not available for get_catalysts.")
 
     now = datetime.now(timezone.utc)
+    processed_catalysts_from_cache = []
     import time
     supabase_start = time.time()
     try:
@@ -760,73 +769,45 @@ class DestinyAgentService:
             ),
         }
         
+        self.supabase_mcp_server = None
+        self.supabase_mcp_server_started = False
+        self._main_agent_mcp_servers = []
         # Default agent created with a combined default system prompt
         default_full_system_prompt = f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT} {self.EMOJI_ENCOURAGEMENT}"
         self.agent = self._create_agent_internal(instructions=default_full_system_prompt)
-        
+        # Add MCP servers to agent if any (will be updated by start_supabase_mcp_server)
+        if self._main_agent_mcp_servers:
+            self.agent.mcp_servers = self._main_agent_mcp_servers
+
         self._current_access_token: Optional[str] = None
         self._current_bungie_id: Optional[str] = None
+        self._current_user_uuid: Optional[str] = None
         
         self._user_info_cache: Dict[str, tuple[datetime, dict]] = {}
         self._sheet_cache: Dict[str, tuple[datetime, list[dict]]] = {}
 
-        self.supabase_mcp_server = None
-
     def _create_agent_internal(self, instructions: str) -> Agent:
         """Internal helper to create an agent instance with specific instructions."""
-        logger.debug(f"Creating agent with instructions: '{instructions[:100]}...'") # Log first 100 chars
+        logger.debug(f"Creating agent with instructions: '{instructions[:100]}...'" ) # Log first 100 chars
         tools = [
-            function_tool(self.get_user_info),
-            function_tool(self.get_weapons),
-            function_tool(self.get_catalysts),
-            function_tool(self.get_pve_bis_weapons_from_sheet),
-            function_tool(self.get_pve_activity_bis_weapons_from_sheet),
-            function_tool(self.get_endgame_analysis_data)
+            get_user_info,
+            get_weapons,
+            get_catalysts,
+            get_pve_bis_weapons_from_sheet,
+            get_pve_activity_bis_weapons_from_sheet,
+            get_endgame_analysis_data
         ]
-        # OpenAI client is set globally via set_default_openai_client
-        return Agent(name="Destiny2Assistant", instructions=instructions, tools=tools)
+        return Agent(
+            name="Destiny2Assistant",
+            instructions=instructions,
+            tools=tools,
+            mcp_servers=getattr(self, '_main_agent_mcp_servers', [])
+        )
 
-    # Tool-bound methods - these will call the _impl functions
-    # Make them async if their _impl is async
-
-    # get_user_info is now async
-    async def get_user_info(self) -> dict:
-        """Agent Tool: Fetch the user's D2 membership type and ID."""
-        return await _get_user_info_impl(self)
-
-    async def get_weapons(self, membership_type: int, membership_id: str) -> List[Weapon]:
-        """Agent Tool: Fetches all weapons currently in the specified user's inventory and vault.
-        Returns a list of weapon objects. Each weapon object includes fields such as:
-        - 'item_hash' (string): The unique identifier for the weapon type.
-        - 'instance_id' (string, optional): The unique identifier for this specific instance of the weapon.
-        - 'name' (string): The name of the weapon.
-        - 'location' (string, optional): Where the weapon is located (e.g., 'Vault', 'Character Inventory', 'Character Equipped').
-        - 'is_equipped' (boolean, optional): Whether the weapon is currently equipped by a character.
-        - 'perks' (list of strings): A list of perk names or identifiers on the weapon.
-        - 'tier_type' (string): The rarity tier of the weapon (e.g., 'Exotic', 'Legendary').
-        - 'item_type' (string): The type of weapon (e.g., 'Auto Rifle', 'Hand Cannon').
-        - 'damage_type' (string, optional): The elemental damage type of the weapon (e.g., 'Kinetic', 'Void', 'Solar', 'Arc', 'Stasis', 'Strand').
-        """
-        return await _get_weapons_impl(self, membership_type, membership_id)
-
-    async def get_catalysts(self, user_uuid: str) -> list:
-        """Agent Tool: Fetch all catalyst progress for the current D2 user."""
-        return await _get_catalysts_impl(self, user_uuid)
-
-    # Google Sheet tools remain synchronous
-    def get_pve_bis_weapons_from_sheet(self) -> list[dict]:
-        """Agent Tool: Fetches PvE BiS weapons from the community Google Sheet."""
-        return _get_pve_bis_weapons_impl(self)
-
-    def get_pve_activity_bis_weapons_from_sheet(self) -> list[dict]:
-        """Agent Tool: Fetches PvE BiS weapons BY ACTIVITY from the community Google Sheet."""
-        return _get_pve_activity_bis_weapons_impl(self)
-    
-    def get_endgame_analysis_data(self, sheet_name: Optional[str] = None) -> list[dict] | str:
-        """Agent Tool: Fetches data from a specified sheet in the Endgame Analysis spreadsheet."""
-        return _get_endgame_analysis_impl(self, sheet_name)
-
-    async def setup_supabase_agent(self):
+    async def start_supabase_mcp_server(self):
+        """Start the Supabase MCP server and add it to the main agent's mcp_servers list if not already present."""
+        if self.supabase_mcp_server_started:
+            return  # Already started
         self.supabase_mcp_server = MCPServerStdio(
             params={
                 "command": "npx",
@@ -839,19 +820,21 @@ class DestinyAgentService:
             }
         )
         await self.supabase_mcp_server.__aenter__()
-        self.agent = Agent(
-            name="MCP Agent",
-            instructions="You are a helpful assistant with access to Supabase tools.",
-            mcp_servers=[self.supabase_mcp_server],
-        )
+        # Add to agent's mcp_servers if not already present
+        if not hasattr(self.agent, "mcp_servers"):
+            self.agent.mcp_servers = []
+        if self.supabase_mcp_server not in self.agent.mcp_servers:
+            self.agent.mcp_servers.append(self.supabase_mcp_server)
+        self.supabase_mcp_server_started = True
 
-    async def close_supabase_agent(self):
-        if self.supabase_mcp_server:
+    async def close_supabase_mcp_server(self):
+        if self.supabase_mcp_server and self.supabase_mcp_server_started:
             await self.supabase_mcp_server.__aexit__(None, None, None)
+            self.supabase_mcp_server_started = False
 
     async def answer_user_query(self, user_input: str):
         # Use the MCP agent for all weapons/catalyst queries
-        result = await Runner.run(self.agent, input=user_input)
+        result = await Runner.run(self.agent, input=user_input, context=self)
         return result
 
     # Optionally, keep legacy methods for direct DB/API access for refresh only
@@ -862,6 +845,7 @@ class DestinyAgentService:
         logger.debug(f"DestinyAgentService run_chat called for bungie_id: {bungie_id}, persona: {persona}")
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
+        self._current_user_uuid = bungie_id  # Use bungie_id as user_uuid
         agent_to_use = self.agent # Default to the standard agent
 
         if persona:
@@ -933,7 +917,7 @@ class DestinyAgentService:
             )
             # --- Profile LLM call ---
             llm_start = time.time()
-            response_obj = await Runner.run(agent_to_use, messages_for_run)
+            response_obj = await Runner.run(agent_to_use, messages_for_run, context=self)
             llm_duration = int((time.time() - llm_start) * 1000)
             await log_api_performance(
                 self.sb_client,
@@ -988,6 +972,7 @@ class DestinyAgentService:
                 )
             self._current_access_token = None
             self._current_bungie_id = None
+            self._current_user_uuid = None
 
     def get_persona_prompt(self, persona_name: str) -> str:
         # This method might become less necessary or simplified
@@ -995,6 +980,49 @@ class DestinyAgentService:
         # and combined with core abilities in run_chat.
         # For now, let it return the base persona instruction from the map.
         return self.persona_map.get(persona_name, f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT}")
+
+# --- Agent tool functions for OpenAI Agents SDK ---
+@function_tool
+async def get_user_info(ctx: RunContextWrapper['DestinyAgentService']) -> dict:
+    """
+    Fetch the user's D2 membership type and ID. Use this tool to retrieve the user's Bungie membership information when needed for other operations.
+    """
+    return await _get_user_info_impl(ctx.context)
+
+@function_tool
+async def get_weapons(ctx: RunContextWrapper['DestinyAgentService'], membership_type: int, membership_id: str) -> list:
+    """
+    Fetch all weapons for a user, using Supabase as cache.
+    """
+    return await _get_weapons_impl(ctx.context, membership_type, membership_id)
+
+@function_tool
+async def get_catalysts(ctx: RunContextWrapper['DestinyAgentService'], user_uuid: str) -> list:
+    """
+    Fetch all catalyst progress for a user, using Supabase as cache.
+    """
+    return await _get_catalysts_impl(ctx.context, user_uuid)
+
+@function_tool
+async def get_pve_bis_weapons_from_sheet(ctx: RunContextWrapper['DestinyAgentService']) -> list:
+    """
+    Fetches PvE BiS weapons from the public Google Sheet.
+    """
+    return _get_pve_bis_weapons_impl(ctx.context)
+
+@function_tool
+async def get_pve_activity_bis_weapons_from_sheet(ctx: RunContextWrapper['DestinyAgentService']) -> list:
+    """
+    Fetches PvE BiS weapons BY ACTIVITY from the public Google Sheet.
+    """
+    return _get_pve_activity_bis_weapons_impl(ctx.context)
+
+@function_tool
+async def get_endgame_analysis_data(ctx: RunContextWrapper['DestinyAgentService'], sheet_name: str = None) -> list | str:
+    """
+    Fetches data from a specific sheet in the Endgame Analysis spreadsheet using the Google Sheets API and a service account.
+    """
+    return _get_endgame_analysis_impl(ctx.context, sheet_name)
 
 # Function to get AgentService (dependency for FastAPI)
 # This needs to be updated if AgentService __init__ changes significantly,
