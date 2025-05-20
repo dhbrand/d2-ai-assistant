@@ -738,6 +738,7 @@ async def assistants_chat_endpoint(
             prompt=user_message_content,
             access_token=access_token,
             bungie_id=bungie_id,
+            supabase_uuid=current_user.uuid,  # Pass the real Supabase UUID
             history=conversation_history,
             persona=chat_request.persona  # <-- Pass persona to agent
         )

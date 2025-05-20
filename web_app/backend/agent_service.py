@@ -26,6 +26,7 @@ from .bungie_oauth import AuthenticationRequiredError, InvalidRefreshTokenError 
 from web_app.backend.performance_logging import log_api_performance  # Import the profiling helper
 from web_app.backend.utils import normalize_catalyst_data  # Import the normalization helper
 from agents.mcp import MCPServerStdio
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,11 @@ CACHE_TTL = timedelta(hours=24) # Cache data for 24 hours
 
 SUPABASE_ACCESS_TOKEN = os.getenv("SUPABASE_ACCESS_TOKEN")
 REFRESH_INTERVAL = timedelta(hours=24)
+
+@dataclass
+class AgentContext:
+    user_uuid: str
+    # Add other fields as needed (e.g., logger, session, etc.)
 
 # --- Tool Implementation Functions (outside class) ---
 
@@ -673,29 +679,36 @@ class DestinyAgentService:
             "If you need a user's specific Bungie ID or access token for a tool, and it's not "
             "provided in the context, you must call 'get_user_info' first."
         )
+        self.SUPABASE_MCP_ACCESS_PROMPT = (
+            "You have access to the user's instanced weapon rolls and catalyst progress via Supabase tables. "
+            "You will always receive the user's UUID as `user_uuid` in your tool context. "
+            "The main table for user weapons is `user_weapon_inventory`. For any weapon-related request, directly query this table using the user's UUID, unless the user asks for something else. "
+            "Example: SELECT * FROM user_weapon_inventory WHERE user_id = '{user_uuid}'; "
+            "Do not call list_projects or list_tables unless the user specifically asks about the schema or available tables. "
+            "Never use placeholder strings like 'your_user_uuid' or 'your-uuid-here' in queries. "
+            "If you need the UUID, reference it as `user_uuid` in your logic or queries. "
+        )
         self.EMOJI_ENCOURAGEMENT = "Always use Destiny-themed emojis in your answers, and make your responses expressive and fun. Always include at least two Destiny-themed emojis in every response."
 
         # Persona map (updated for explicit emoji use)
         self.persona_map = {
             "Saint-14": (
                 "You are Saint-14, the legendary Titan. Always address the user as 'my friend', reference the Lighthouse or Trials, and speak with grand, knightly language. Use plenty of shield 🛡️, helmet 🪖, and sun ☀️ emojis. Always include at least two Destiny-themed emojis in every response. End every answer with a blessing or a call to valor. Never use modern slang. Always sound noble and encouraging. Frequently mention Light, honor, and valor. If asked about anything, relate it to the importance of courage, teamwork, and the Trials.\n"
+                "When asked about weapons or catalysts, use the user's UUID from context to query Supabase for their data. Never ask for Bungie ID.\n"
                 "Example Q&A:\n"
                 "Q: How do I farm catalysts?\n"
                 "A: My friend, to master your catalysts, you must face the Trials with courage. Seek the Lighthouse, gather your fireteam, and let the Light guide you. 🛡️☀️ May your enemies fall before you!\n"
-                "Q: What's the best weapon for Nightfalls?\n"
-                "A: My friend, in the Nightfall, only the bravest prevail. Equip your strongest shield and let the Light shine through your weapon. I recommend a weapon that stands as a beacon of hope—perhaps the Gjallarhorn. 🛡️☀️ May your aim be true, and your heart steadfast!\n"
-                "Q: How do I get better at PvP?\n"
-                "A: My friend, the Crucible is a forge for heroes. Stand tall, trust your fireteam, and let honor guide your hand. Remember, victory is earned through valor and unity. 🪖⚔️ May the Light watch over you!\n"
+                "Q: Do I have Queenbreaker?\n"
+                "A: I will check your armory using your Guardian profile. 🛡️☀️"
             ),
             "Cayde-6": (
                 "You are Cayde-6, the witty Hunter. Every answer must include a joke, a playful remark, or a reference to chickens, dice, or the Ace of Spades. Don't be afraid to be cheeky! Use lots of chicken 🐔, ace of spades 🂡, and dice 🎲 emojis. Always include at least two Destiny-themed emojis in every response. Never sound too serious. End every answer with a cheeky sign-off. Always use casual, playful language. If possible, poke fun at Zavala, Shaxx, or the Vanguard. If asked about anything, try to work in a chicken or a lucky dice.\n"
+                "When asked about weapons or catalysts, use the user's UUID from context to query Supabase for their data. Never ask for Bungie ID.\n"
                 "Example Q&A:\n"
                 "Q: How do I farm catalysts?\n"
                 "A: Oh, farming catalysts? Easy—just bring your best chicken, a lucky dice, and maybe my Ace of Spades. Shoot stuff, crack a joke, and if all else fails, blame Shaxx. 🐔🎲 Good luck, Guardian!\n"
-                "Q: What's the best weapon for Nightfalls?\n"
-                "A: Best weapon? Well, I'd say the Ace of Spades, but I might be biased. If you see Zavala, tell him I said hi—and that he still owes me a game of dice. 🂡🎲 Stay sharp out there!\n"
-                "Q: How do I get better at PvP?\n"
-                "A: PvP? Just remember: if you can dodge a chicken, you can dodge a bullet. And if you can't, well, at least you'll have a good story. 🐔😏 See you in the Crucible, hotshot!\n"
+                "Q: Do I have Queenbreaker?\n"
+                "A: Let me check your vault using your Guardian profile. 🐔🂡"
             ),
             "Ikora": (
                 "You are Ikora Rey, the wise Warlock. Speak with calm authority, offer deep insight, and use book 📚, eye 👁️, and star ✨ emojis. Always include at least two Destiny-themed emojis in every response. Never rush your answers; always encourage reflection and learning. Reference the Hidden, meditation, or the importance of knowledge.\n"
@@ -773,7 +786,7 @@ class DestinyAgentService:
         self.supabase_mcp_server_started = False
         self._main_agent_mcp_servers = []
         # Default agent created with a combined default system prompt
-        default_full_system_prompt = f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT} {self.EMOJI_ENCOURAGEMENT}"
+        default_full_system_prompt = f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT} {self.SUPABASE_MCP_ACCESS_PROMPT} {self.EMOJI_ENCOURAGEMENT}"
         self.agent = self._create_agent_internal(instructions=default_full_system_prompt)
         # Add MCP servers to agent if any (will be updated by start_supabase_mcp_server)
         if self._main_agent_mcp_servers:
@@ -790,9 +803,9 @@ class DestinyAgentService:
         """Internal helper to create an agent instance with specific instructions."""
         logger.debug(f"Creating agent with instructions: '{instructions[:100]}...'" ) # Log first 100 chars
         tools = [
-            get_user_info,
-            get_weapons,
-            get_catalysts,
+            # get_user_info,
+            # get_weapons,
+            # get_catalysts,
             get_pve_bis_weapons_from_sheet,
             get_pve_activity_bis_weapons_from_sheet,
             get_endgame_analysis_data
@@ -801,6 +814,7 @@ class DestinyAgentService:
             name="Destiny2Assistant",
             instructions=instructions,
             tools=tools,
+            model="gpt-4-1",
             mcp_servers=getattr(self, '_main_agent_mcp_servers', [])
         )
 
@@ -833,20 +847,25 @@ class DestinyAgentService:
             self.supabase_mcp_server_started = False
 
     async def answer_user_query(self, user_input: str):
-        # Use the MCP agent for all weapons/catalyst queries
-        result = await Runner.run(self.agent, input=user_input, context=self)
+        # Ensure MCP server is started before using the agent
+        if not self.supabase_mcp_server_started:
+            await self.start_supabase_mcp_server()
+        context = {"user_uuid": self._current_user_uuid}
+        result = await Runner.run(self.agent, input=user_input, context=context)
         return result
 
     # Optionally, keep legacy methods for direct DB/API access for refresh only
     async def refresh_user_data(self, user_id):
         await refresh_user_data_if_stale(user_id, self.sb_client, self.weapon_api)
 
-    async def run_chat(self, prompt: str, access_token: str, bungie_id: str, history: Optional[List[Dict[str, str]]] = None, persona: Optional[str] = None, conversation_id: Optional[str] = None, message_id: Optional[str] = None):
+    async def run_chat(self, prompt: str, access_token: str, bungie_id: str, supabase_uuid: str, history: Optional[List[Dict[str, str]]] = None, persona: Optional[str] = None, conversation_id: Optional[str] = None, message_id: Optional[str] = None):
         logger.debug(f"DestinyAgentService run_chat called for bungie_id: {bungie_id}, persona: {persona}")
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
-        self._current_user_uuid = bungie_id  # Use bungie_id as user_uuid
+        self._current_user_uuid = supabase_uuid  # Use the real Supabase UUID
         agent_to_use = self.agent # Default to the standard agent
+
+        uuid_instructions = f"The user's UUID is: {self._current_user_uuid}. Always use this UUID for any user-specific queries or tool calls. "
 
         if persona:
             persona_base_instructions = self.persona_map.get(persona)
@@ -854,12 +873,35 @@ class DestinyAgentService:
                 effective_system_prompt = (
                     f"{persona_base_instructions} "
                     f"{self.AGENT_CORE_ABILITIES_PROMPT} "
+                    f"{uuid_instructions}"
+                    f"{self.SUPABASE_MCP_ACCESS_PROMPT} "
                     f"{self.EMOJI_ENCOURAGEMENT} "
                 )
                 logger.info(f"Using effective system prompt for persona '{persona}': '{effective_system_prompt[:150]}...'")
                 agent_to_use = self._create_agent_internal(instructions=effective_system_prompt)
+                # Attach MCP server if started
+                if self.supabase_mcp_server and self.supabase_mcp_server_started:
+                    if not hasattr(agent_to_use, "mcp_servers"):
+                        agent_to_use.mcp_servers = []
+                    if self.supabase_mcp_server not in agent_to_use.mcp_servers:
+                        agent_to_use.mcp_servers.append(self.supabase_mcp_server)
             else:
                 logger.warning(f"Persona '{persona}' selected but no matching instructions found in persona_map. Using default agent.")
+        else:
+            # Default agent with UUID injected
+            default_full_system_prompt = (
+                f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} "
+                f"{self.AGENT_CORE_ABILITIES_PROMPT} "
+                f"{uuid_instructions}"
+                f"{self.SUPABASE_MCP_ACCESS_PROMPT} "
+                f"{self.EMOJI_ENCOURAGEMENT}"
+            )
+            agent_to_use = self._create_agent_internal(instructions=default_full_system_prompt)
+            if self.supabase_mcp_server and self.supabase_mcp_server_started:
+                if not hasattr(agent_to_use, "mcp_servers"):
+                    agent_to_use.mcp_servers = []
+                if self.supabase_mcp_server not in agent_to_use.mcp_servers:
+                    agent_to_use.mcp_servers.append(self.supabase_mcp_server)
 
         messages_for_run: List[Dict[str, str]] = []
         if history:
@@ -917,7 +959,7 @@ class DestinyAgentService:
             )
             # --- Profile LLM call ---
             llm_start = time.time()
-            response_obj = await Runner.run(agent_to_use, messages_for_run, context=self)
+            response_obj = await Runner.run(agent_to_use, messages_for_run, context={"user_uuid": self._current_user_uuid})
             llm_duration = int((time.time() - llm_start) * 1000)
             await log_api_performance(
                 self.sb_client,
