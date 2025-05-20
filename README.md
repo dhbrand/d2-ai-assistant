@@ -288,4 +288,41 @@ Once you have confirmed that all user/token data has been migrated and the appli
 - If you encounter issues with authentication or token refresh, ensure that the Supabase environment variables are set correctly and that user metadata is being updated as expected.
 - All user management, authentication, and token refresh logic is now handled via Supabase Auth and user metadata.
 
---- 
+---
+
+## Prompt Management (YAML-based)
+
+All agent and persona prompt strings are now managed in a single YAML file:
+
+```
+web_app/backend/prompts.yaml
+```
+
+### How it works
+- **System prompts, persona instructions, and agent guidance** are defined in this YAML file.
+- The backend loads all prompts from YAML at startup (see `agent_service.py`).
+- To **add or edit a persona or system prompt**, simply update `prompts.yaml`.
+- No code changes are required for prompt tweaks—just edit the YAML and restart the backend if needed.
+
+### Example structure
+```yaml
+default:
+  identity: "..."
+  core_abilities: "..."
+  supabase_access: "..."
+  emoji_encouragement: "..."
+personas:
+  Saint-14: "..."
+  Cayde-6: "..."
+  Ikora: "..."
+```
+
+### Adding a new persona
+1. Add a new entry under `personas:` in `prompts.yaml`.
+2. Use the persona name as the key and provide the prompt string as the value.
+3. Restart the backend to pick up the new persona.
+
+### Why YAML?
+- Centralizes all prompt text for easy editing and versioning.
+- Enables non-developers to update prompts without touching code.
+- Prepares the project for future integration with prompt management tools like LangSmith. 
