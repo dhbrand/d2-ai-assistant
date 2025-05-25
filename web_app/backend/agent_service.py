@@ -28,6 +28,8 @@ from web_app.backend.utils import normalize_catalyst_data  # Import the normaliz
 from agents.mcp import MCPServerStdio
 from dataclasses import dataclass
 import yaml
+from langsmith import Client  # Add at the top with other imports
+import hashlib  # For prompt versioning
 
 logger = logging.getLogger(__name__)
 
@@ -674,6 +676,7 @@ async def refresh_user_data_if_stale(user_id, sb_client, bungie_api):
 
 # --- DestinyAgentService Refactor ---
 class DestinyAgentService:
+    SUPABASE_PROJECT_ID = "grwqemflswabswphkute"
     def __init__(self, openai_client, catalyst_api, weapon_api, sb_client, manifest_service):
         logger.info("Initializing DestinyAgentService with pre-configured API clients and Supabase client.")
         self.openai_client = openai_client
@@ -703,9 +706,11 @@ class DestinyAgentService:
         self._current_access_token: Optional[str] = None
         self._current_bungie_id: Optional[str] = None
         self._current_user_uuid: Optional[str] = None
+        self._current_project_id = self.SUPABASE_PROJECT_ID
         
         self._user_info_cache: Dict[str, tuple[datetime, dict]] = {}
         self._sheet_cache: Dict[str, tuple[datetime, list[dict]]] = {}
+        self.langsmith_client = Client()
 
     def _create_agent_internal(self, instructions: str) -> Agent:
         """Internal helper to create an agent instance with specific instructions."""
@@ -722,13 +727,13 @@ class DestinyAgentService:
             name="Destiny2Assistant",
             instructions=instructions,
             tools=tools,
-            model="gpt-4.1",
+            model="gpt-4o",
             mcp_servers=getattr(self, '_main_agent_mcp_servers', [])
         )
 
     async def start_supabase_mcp_server(self):
-        """Start the Supabase MCP server and add it to the main agent's mcp_servers list if not already present."""
         if self.supabase_mcp_server_started:
+            logger.info("Supabase MCP server already started.")
             return  # Already started
         self.supabase_mcp_server = MCPServerStdio(
             params={
@@ -748,6 +753,14 @@ class DestinyAgentService:
         if self.supabase_mcp_server not in self.agent.mcp_servers:
             self.agent.mcp_servers.append(self.supabase_mcp_server)
         self.supabase_mcp_server_started = True
+        logger.info("Supabase MCP server started and attached to agent.")
+
+        # List and log available tools
+        try:
+            tools = await self.supabase_mcp_server.list_tools()
+            logger.info(f"Available tools from Supabase MCP: {[tool.name for tool in tools]}")
+        except Exception as e:
+            logger.error(f"Failed to list tools from Supabase MCP: {e}")
 
     async def close_supabase_mcp_server(self):
         if self.supabase_mcp_server and self.supabase_mcp_server_started:
@@ -758,7 +771,7 @@ class DestinyAgentService:
         # Ensure MCP server is started before using the agent
         if not self.supabase_mcp_server_started:
             await self.start_supabase_mcp_server()
-        context = {"user_uuid": self._current_user_uuid}
+        context = {"user_uuid": self._current_user_uuid, "project_id": self._current_project_id}
         result = await Runner.run(self.agent, input=user_input, context=context)
         return result
 
@@ -771,6 +784,7 @@ class DestinyAgentService:
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
         self._current_user_uuid = supabase_uuid  # Use the real Supabase UUID
+        self._current_project_id = self.SUPABASE_PROJECT_ID
         agent_to_use = self.agent # Default to the standard agent
 
         uuid_instructions = f"The user's UUID is: {self._current_user_uuid}. Always use this UUID for any user-specific queries or tool calls. "
@@ -867,7 +881,7 @@ class DestinyAgentService:
             )
             # --- Profile LLM call ---
             llm_start = time.time()
-            response_obj = await Runner.run(agent_to_use, messages_for_run, context={"user_uuid": self._current_user_uuid})
+            response_obj = await Runner.run(agent_to_use, messages_for_run, context={"user_uuid": self._current_user_uuid, "project_id": self._current_project_id})
             llm_duration = int((time.time() - llm_start) * 1000)
             await log_api_performance(
                 self.sb_client,
@@ -879,6 +893,30 @@ class DestinyAgentService:
                 message_id=message_id
             )
             response_text = response_obj.final_output if hasattr(response_obj, 'final_output') else "Error: Could not get final output from agent."
+
+            # --- LangSmith Logging ---
+            # Compute prompt version as a hash of the system prompt (including persona if used)
+            system_prompt = agent_to_use.instructions
+            prompt_version = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:8]  # Short hash
+            try:
+                self.langsmith_client.create_run(
+                    name="agent_chat",
+                    run_type="llm",
+                    inputs={
+                        "user_uuid": self._current_user_uuid,
+                        "persona": persona,
+                        "prompt_version": prompt_version,
+                        "system_prompt": system_prompt,
+                        "user_input": prompt,
+                        "history": history,
+                    },
+                    outputs={"response": response_text},
+                    tags=["agent_chat", prompt_version, persona or "default"]
+                )
+            except Exception as e:
+                logger.warning(f"LangSmith logging failed: {e}")
+            # --- End LangSmith Logging ---
+
             return response_text
         except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err:
             logger.warning(f"Authentication error during agent chat execution: {auth_err}")
