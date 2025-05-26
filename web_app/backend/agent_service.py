@@ -40,8 +40,10 @@ SUPABASE_ACCESS_TOKEN = os.getenv("SUPABASE_ACCESS_TOKEN")
 REFRESH_INTERVAL = timedelta(hours=24)
 
 PROMPTS_PATH = os.path.join(os.path.dirname(__file__), "prompts.yaml")
+PERSONAS_PATH = os.path.join(os.path.dirname(__file__), "personas.yaml")
 
 _prompts_cache = None
+_personas_cache = None
 
 def load_prompts():
     global _prompts_cache
@@ -49,6 +51,26 @@ def load_prompts():
         with open(PROMPTS_PATH, "r") as f:
             _prompts_cache = yaml.safe_load(f)
     return _prompts_cache
+
+def load_personas():
+    global _personas_cache
+    if _personas_cache is None:
+        with open(PERSONAS_PATH, "r") as f:
+            _personas_cache = yaml.safe_load(f)
+    return _personas_cache
+
+def load_system_prompt():
+    prompts = load_prompts()["default"]
+    sections = [
+        prompts.get("role", ""),
+        prompts.get("objective", ""),
+        prompts.get("context", ""),
+        prompts.get("tools", ""),
+        prompts.get("tasks", ""),
+        prompts.get("operating_guidelines", ""),
+        prompts.get("constraints", "")
+    ]
+    return "\n\n".join(section.strip() for section in sections if section.strip())
 
 @dataclass
 class AgentContext:
@@ -687,17 +709,17 @@ class DestinyAgentService:
         self.manifest_service = manifest_service
 
         prompts = load_prompts()
-        self.DEFAULT_AGENT_IDENTITY_PROMPT = prompts["default"]["identity"]
+        self.DEFAULT_AGENT_SYSTEM_PROMPT = load_system_prompt()
         self.AGENT_CORE_ABILITIES_PROMPT = prompts["default"]["core_abilities"]
         self.SUPABASE_MCP_ACCESS_PROMPT = prompts["default"]["supabase_access"]
         self.EMOJI_ENCOURAGEMENT = prompts["default"]["emoji_encouragement"]
-        self.persona_map = prompts["personas"]
+        self.persona_map = load_personas()
         
         self.supabase_mcp_server = None
         self.supabase_mcp_server_started = False
         self._main_agent_mcp_servers = []
         # Default agent created with a combined default system prompt
-        default_full_system_prompt = f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT} {self.SUPABASE_MCP_ACCESS_PROMPT} {self.EMOJI_ENCOURAGEMENT}"
+        default_full_system_prompt = f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT} {self.SUPABASE_MCP_ACCESS_PROMPT} {self.EMOJI_ENCOURAGEMENT}"
         self.agent = self._create_agent_internal(instructions=default_full_system_prompt)
         # Add MCP servers to agent if any (will be updated by start_supabase_mcp_server)
         if self._main_agent_mcp_servers:
@@ -719,9 +741,9 @@ class DestinyAgentService:
             # get_user_info,
             # get_weapons,
             # get_catalysts,
-            get_pve_bis_weapons_from_sheet,
-            get_pve_activity_bis_weapons_from_sheet,
-            get_endgame_analysis_data
+            # get_pve_bis_weapons_from_sheet,
+            # get_pve_activity_bis_weapons_from_sheet,
+            # get_endgame_analysis_data
         ]
         return Agent(
             name="Destiny2Assistant",
@@ -743,15 +765,15 @@ class DestinyAgentService:
                     "@supabase/mcp-server-supabase@latest",
                     "--access-token",
                     SUPABASE_ACCESS_TOKEN,
+                    "--project-ref",
+                    "grwqemflswabswphkute",
                 ],
             }
         )
         await self.supabase_mcp_server.__aenter__()
-        # Add to agent's mcp_servers if not already present
-        if not hasattr(self.agent, "mcp_servers"):
-            self.agent.mcp_servers = []
-        if self.supabase_mcp_server not in self.agent.mcp_servers:
-            self.agent.mcp_servers.append(self.supabase_mcp_server)
+        # Ensure all future agents inherit the MCP server
+        if self.supabase_mcp_server not in self._main_agent_mcp_servers:
+            self._main_agent_mcp_servers.append(self.supabase_mcp_server)
         self.supabase_mcp_server_started = True
         logger.info("Supabase MCP server started and attached to agent.")
 
@@ -771,8 +793,8 @@ class DestinyAgentService:
         # Ensure MCP server is started before using the agent
         if not self.supabase_mcp_server_started:
             await self.start_supabase_mcp_server()
-        context = {"user_uuid": self._current_user_uuid, "project_id": self._current_project_id}
-        result = await Runner.run(self.agent, input=user_input, context=context)
+        context = {"user_uuid": self._current_user_uuid}
+        result = await Runner.run(self.agent, input=user_input, context=context, max_turns=25)
         return result
 
     # Optionally, keep legacy methods for direct DB/API access for refresh only
@@ -784,7 +806,6 @@ class DestinyAgentService:
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
         self._current_user_uuid = supabase_uuid  # Use the real Supabase UUID
-        self._current_project_id = self.SUPABASE_PROJECT_ID
         agent_to_use = self.agent # Default to the standard agent
 
         uuid_instructions = f"The user's UUID is: {self._current_user_uuid}. Always use this UUID for any user-specific queries or tool calls. "
@@ -812,11 +833,8 @@ class DestinyAgentService:
         else:
             # Default agent with UUID injected
             default_full_system_prompt = (
-                f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} "
-                f"{self.AGENT_CORE_ABILITIES_PROMPT} "
+                f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} "
                 f"{uuid_instructions}"
-                f"{self.SUPABASE_MCP_ACCESS_PROMPT} "
-                f"{self.EMOJI_ENCOURAGEMENT}"
             )
             agent_to_use = self._create_agent_internal(instructions=default_full_system_prompt)
             if self.supabase_mcp_server and self.supabase_mcp_server_started:
@@ -881,7 +899,7 @@ class DestinyAgentService:
             )
             # --- Profile LLM call ---
             llm_start = time.time()
-            response_obj = await Runner.run(agent_to_use, messages_for_run, context={"user_uuid": self._current_user_uuid, "project_id": self._current_project_id})
+            response_obj = await Runner.run(agent_to_use, messages_for_run, context={"user_uuid": self._current_user_uuid}, max_turns=25)
             llm_duration = int((time.time() - llm_start) * 1000)
             await log_api_performance(
                 self.sb_client,
@@ -967,7 +985,7 @@ class DestinyAgentService:
         # as persona instructions are now directly used from persona_map
         # and combined with core abilities in run_chat.
         # For now, let it return the base persona instruction from the map.
-        return self.persona_map.get(persona_name, f"{self.DEFAULT_AGENT_IDENTITY_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT}")
+        return self.persona_map.get(persona_name, f"{self.DEFAULT_AGENT_SYSTEM_PROMPT}")
 
 # --- Agent tool functions for OpenAI Agents SDK ---
 @function_tool
