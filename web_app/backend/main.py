@@ -222,6 +222,12 @@ async def startup_event():
                 sb_client=supabase_client,
                 manifest_service=supabase_manifest_service
             )
+            # Start the Supabase MCP server automatically
+            try:
+                await agent_service.start_supabase_mcp_server()
+                logger.info("Supabase MCP server started automatically at startup.")
+            except Exception as mcp_e:
+                logger.error(f"Failed to start Supabase MCP server at startup: {mcp_e}")
             app.state.agent_service_instance = agent_service
             logger.info("DestinyAgentService initialized and stored in app.state.")
         except Exception as e:

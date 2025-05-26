@@ -288,7 +288,7 @@ Once you have confirmed that all user/token data has been migrated and the appli
 - If you encounter issues with authentication or token refresh, ensure that the Supabase environment variables are set correctly and that user metadata is being updated as expected.
 - All user management, authentication, and token refresh logic is now handled via Supabase Auth and user metadata.
 
----
+--- 
 
 ## Prompt Management (YAML-based)
 
