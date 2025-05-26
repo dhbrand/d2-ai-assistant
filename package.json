@@ -2,7 +2,7 @@
   "name": "destiny2-catalysts-root",
   "private": true,
   "scripts": {
-    "dev": "concurrently \"uvicorn web_app.backend.main:app --host 0.0.0.0 --port 8000 --ssl-certfile web_app/cert.pem --ssl-keyfile web_app/key.pem\" \"cd web_app/frontend && npm start\" \"sleep 2 && open -a 'Google Chrome' http://localhost:3000\"",
+    "dev": "concurrently \"uvicorn web_app.backend.main:app --reload --host 0.0.0.0 --port 8000 --ssl-certfile web_app/cert.pem --ssl-keyfile web_app/key.pem\" \"cd web_app/frontend && npm start\" \"sleep 2 && open -a 'Google Chrome' http://localhost:3000\"",
     "start": "BROWSER=\"Google Chrome\" npm start"
   },
   "devDependencies": {
