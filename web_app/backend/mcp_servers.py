@@ -3,13 +3,17 @@ import asyncio
 import json
 from agents.mcp import MCPServerStdio
 from agents import Agent, Runner
+import logging
 
 # --- Debug patch for invoke_mcp_tool ---
 from agents.mcp.util import MCPUtil
 
 original_invoke = MCPUtil.invoke_mcp_tool
 
+logger = logging.getLogger("web_app.backend.agent_service")
+
 def debug_invoke_mcp_tool(server, tool, context, input_json):
+    logger.info(f"[MCP TOOL CALL] Tool: {tool.name}, Input: {input_json}, Context: {getattr(context, 'context', None)}")
     print("\n[DEBUG] MCP Tool Call:")
     print("  Tool name:", tool.name)
     print("  Server endpoint:", getattr(server, 'endpoint_url', 'stdio'))
