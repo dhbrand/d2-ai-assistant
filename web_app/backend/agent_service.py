@@ -761,8 +761,10 @@ class DestinyAgentService:
             memory=memory,
             verbose=True,
             handle_parsing_errors=True,
-            system_message=instructions,
+            agent_kwargs={"system_message": instructions},
         )
+        # Store the system prompt for later logging
+        agent._system_message = instructions
         return agent
 
     async def start_supabase_mcp_server(self):
@@ -874,7 +876,7 @@ class DestinyAgentService:
             response_text = response_obj.get("output", "Error: Could not get output from LangChain agent.")
 
             # --- LangSmith Logging ---
-            system_prompt = agent_to_use.agent_kwargs.get("system_message", "")
+            system_prompt = getattr(agent_to_use, "_system_message", "")
             prompt_version = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:8]  # Short hash
             try:
                 self.langsmith_client.create_run(
