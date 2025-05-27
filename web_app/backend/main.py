@@ -746,7 +746,9 @@ async def assistants_chat_endpoint(
             bungie_id=bungie_id,
             supabase_uuid=current_user.uuid,  # Pass the real Supabase UUID
             history=conversation_history,
-            persona=chat_request.persona  # <-- Pass persona to agent
+            persona=chat_request.persona,  # <-- Pass persona to agent
+            conversation_id=current_conversation_id_str,
+            message_id=user_message_id,
         )
         agent_duration_ms = int((time.time() - agent_start) * 1000)
         await log_api_performance(

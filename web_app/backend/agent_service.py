@@ -741,19 +741,18 @@ class DestinyAgentService:
         self._sheet_cache: Dict[str, tuple[datetime, list[dict]]] = {}
         self.langsmith_client = Client()
 
-    def _create_agent_internal(self, instructions: str):
-        """Internal helper to create a LangChain agent instance with specific instructions."""
+    def _create_agent_internal(self, instructions: str, persona=None, prompt_version=None, history=None, conversation_id=None, message_id=None):
+        """Internal helper to create a LangChain agent instance with specific instructions and custom metadata for tracing."""
         logger.debug(f"Creating LangChain agent with instructions: '{instructions[:100]}...'")
         # LangChain OpenAI LLM
         llm = ChatOpenAI(
             openai_api_key=os.environ.get("OPENAI_API_KEY"),
             model="gpt-3.5-turbo",  # or your preferred model
             streaming=True,
-            temperature=0.7,
         )
-        # Placeholder: tools will be migrated in a later step
         tools = self._get_langchain_tools()
         memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        # Add custom tags and metadata for tracing
         agent = initialize_agent(
             tools=tools,
             llm=llm,
@@ -762,8 +761,17 @@ class DestinyAgentService:
             verbose=True,
             handle_parsing_errors=True,
             agent_kwargs={"system_message": instructions},
+            tags=[prompt_version or "default", persona or "default"],
+            metadata={
+                "user_uuid": getattr(self, "_current_user_uuid", None),
+                "persona": persona,
+                "prompt_version": prompt_version,
+                "system_prompt": instructions,
+                "history": history,
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+            },
         )
-        # Store the system prompt for later logging
         agent._system_message = instructions
         return agent
 
@@ -834,17 +842,42 @@ class DestinyAgentService:
                     f"{self.EMOJI_ENCOURAGEMENT} "
                 )
                 logger.info(f"Using effective system prompt for persona '{persona}': '{effective_system_prompt[:150]}...'")
-                agent_to_use = self._create_agent_internal(instructions=effective_system_prompt)
+                prompt_version = hashlib.sha256(effective_system_prompt.encode("utf-8")).hexdigest()[:8]
+                agent_to_use = self._create_agent_internal(
+                    instructions=effective_system_prompt,
+                    persona=persona,
+                    prompt_version=prompt_version,
+                    history=history,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                )
             else:
                 logger.warning(f"Persona '{persona}' selected but no matching instructions found in persona_map. Using default agent.")
-                agent_to_use = self._create_agent_internal(instructions=f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} {uuid_instructions}")
+                fallback_system_prompt = f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} {uuid_instructions}"
+                prompt_version = hashlib.sha256(fallback_system_prompt.encode("utf-8")).hexdigest()[:8]
+                agent_to_use = self._create_agent_internal(
+                    instructions=fallback_system_prompt,
+                    persona=None,
+                    prompt_version=prompt_version,
+                    history=history,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                )
         else:
             # Default agent with UUID injected
             default_full_system_prompt = (
                 f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} "
                 f"{uuid_instructions}"
             )
-            agent_to_use = self._create_agent_internal(instructions=default_full_system_prompt)
+            prompt_version = hashlib.sha256(default_full_system_prompt.encode("utf-8")).hexdigest()[:8]
+            agent_to_use = self._create_agent_internal(
+                instructions=default_full_system_prompt,
+                persona=None,
+                prompt_version=prompt_version,
+                history=history,
+                conversation_id=conversation_id,
+                message_id=message_id,
+            )
 
         # Prepare chat history for LangChain memory if provided
         if history:
@@ -874,28 +907,6 @@ class DestinyAgentService:
             )
             # LangChain agent returns a dict with 'output' key
             response_text = response_obj.get("output", "Error: Could not get output from LangChain agent.")
-
-            # --- LangSmith Logging ---
-            system_prompt = getattr(agent_to_use, "_system_message", "")
-            prompt_version = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:8]  # Short hash
-            try:
-                self.langsmith_client.create_run(
-                    name="agent_chat",
-                    run_type="llm",
-                    inputs={
-                        "user_uuid": self._current_user_uuid,
-                        "persona": persona,
-                        "prompt_version": prompt_version,
-                        "system_prompt": system_prompt,
-                        "user_input": prompt,
-                        "history": history,
-                    },
-                    outputs={"response": response_text},
-                    tags=["agent_chat", prompt_version, persona or "default"]
-                )
-            except Exception as e:
-                logger.warning(f"LangSmith logging failed: {e}")
-            # --- End LangSmith Logging ---
 
             return response_text
         except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err:
