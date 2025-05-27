@@ -1,7 +1,8 @@
 # Placeholder for DestinyAgentService class
 
 import os
-from agents import Agent, Runner, function_tool, WebSearchTool, set_default_openai_client, RunContextWrapper
+# Remove OpenAI Agents SDK imports
+# from agents import Agent, Runner, function_tool, WebSearchTool, set_default_openai_client, RunContextWrapper
 from .weapon_api import WeaponAPI # Use relative import
 from .catalyst_api import CatalystAPI # Use relative import
 from .manifest import ManifestManager # Use relative import
@@ -18,7 +19,11 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import difflib
 import re
-from openai import OpenAI # Ensure OpenAI is imported for type hinting
+# Add LangChain imports
+from langchain.agents import initialize_agent, AgentExecutor, Tool
+from langchain.chains import LLMChain
+from langchain.memory import ConversationBufferMemory
+import hashlib  # For prompt versioning
 from supabase import Client, AsyncClient
 import json
 from .models import CatalystData, CatalystObjective, Weapon # <--- ensure Weapon is imported
@@ -29,7 +34,9 @@ from agents.mcp import MCPServerStdio
 from dataclasses import dataclass
 import yaml
 from langsmith import Client  # Add at the top with other imports
-import hashlib  # For prompt versioning
+from langchain.tools import Tool as LangChainTool
+# Add import for LangChain OpenAI wrapper
+from langchain_openai import ChatOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -702,7 +709,7 @@ class DestinyAgentService:
     def __init__(self, openai_client, catalyst_api, weapon_api, sb_client, manifest_service):
         logger.info("Initializing DestinyAgentService with pre-configured API clients and Supabase client.")
         self.openai_client = openai_client
-        set_default_openai_client(self.openai_client) # Set for the agents library
+        # set_default_openai_client(self.openai_client) # Set for the agents library
         self.catalyst_api = catalyst_api
         self.weapon_api = weapon_api
         self.sb_client = sb_client 
@@ -734,24 +741,29 @@ class DestinyAgentService:
         self._sheet_cache: Dict[str, tuple[datetime, list[dict]]] = {}
         self.langsmith_client = Client()
 
-    def _create_agent_internal(self, instructions: str) -> Agent:
-        """Internal helper to create an agent instance with specific instructions."""
-        logger.debug(f"Creating agent with instructions: '{instructions[:100]}...'" ) # Log first 100 chars
-        tools = [
-            # get_user_info,
-            # get_weapons,
-            # get_catalysts,
-            # get_pve_bis_weapons_from_sheet,
-            # get_pve_activity_bis_weapons_from_sheet,
-            # get_endgame_analysis_data
-        ]
-        return Agent(
-            name="Destiny2Assistant",
-            instructions=instructions,
-            tools=tools,
-            model="gpt-4o",
-            mcp_servers=getattr(self, '_main_agent_mcp_servers', [])
+    def _create_agent_internal(self, instructions: str):
+        """Internal helper to create a LangChain agent instance with specific instructions."""
+        logger.debug(f"Creating LangChain agent with instructions: '{instructions[:100]}...'")
+        # LangChain OpenAI LLM
+        llm = ChatOpenAI(
+            openai_api_key=os.environ.get("OPENAI_API_KEY"),
+            model="gpt-3.5-turbo",  # or your preferred model
+            streaming=True,
+            temperature=0.7,
         )
+        # Placeholder: tools will be migrated in a later step
+        tools = self._get_langchain_tools()
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        agent = initialize_agent(
+            tools=tools,
+            llm=llm,
+            agent="conversational-react-description",
+            memory=memory,
+            verbose=True,
+            handle_parsing_errors=True,
+            system_message=instructions,
+        )
+        return agent
 
     async def start_supabase_mcp_server(self):
         if self.supabase_mcp_server_started:
@@ -806,7 +818,6 @@ class DestinyAgentService:
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
         self._current_user_uuid = supabase_uuid  # Use the real Supabase UUID
-        agent_to_use = self.agent # Default to the standard agent
 
         uuid_instructions = f"The user's UUID is: {self._current_user_uuid}. Always use this UUID for any user-specific queries or tool calls. "
 
@@ -822,14 +833,9 @@ class DestinyAgentService:
                 )
                 logger.info(f"Using effective system prompt for persona '{persona}': '{effective_system_prompt[:150]}...'")
                 agent_to_use = self._create_agent_internal(instructions=effective_system_prompt)
-                # Attach MCP server if started
-                if self.supabase_mcp_server and self.supabase_mcp_server_started:
-                    if not hasattr(agent_to_use, "mcp_servers"):
-                        agent_to_use.mcp_servers = []
-                    if self.supabase_mcp_server not in agent_to_use.mcp_servers:
-                        agent_to_use.mcp_servers.append(self.supabase_mcp_server)
             else:
                 logger.warning(f"Persona '{persona}' selected but no matching instructions found in persona_map. Using default agent.")
+                agent_to_use = self._create_agent_internal(instructions=f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} {uuid_instructions}")
         else:
             # Default agent with UUID injected
             default_full_system_prompt = (
@@ -837,16 +843,11 @@ class DestinyAgentService:
                 f"{uuid_instructions}"
             )
             agent_to_use = self._create_agent_internal(instructions=default_full_system_prompt)
-            if self.supabase_mcp_server and self.supabase_mcp_server_started:
-                if not hasattr(agent_to_use, "mcp_servers"):
-                    agent_to_use.mcp_servers = []
-                if self.supabase_mcp_server not in agent_to_use.mcp_servers:
-                    agent_to_use.mcp_servers.append(self.supabase_mcp_server)
 
-        messages_for_run: List[Dict[str, str]] = []
+        # Prepare chat history for LangChain memory if provided
         if history:
-            messages_for_run.extend(history)
-        messages_for_run.append({"role": "user", "content": prompt})
+            # LangChain's ConversationBufferMemory expects a list of dicts with 'role' and 'content'
+            agent_to_use.memory.chat_memory.messages = history
 
         import time
         total_start = time.time()
@@ -855,51 +856,10 @@ class DestinyAgentService:
         manifest_lookup_duration = None
         llm_duration = None
         try:
-            # --- Profile weapon fetch ---
-            weapon_start = time.time()
-            # Simulate or call weapon fetch if part of the flow
-            # weapons = await self.get_weapons(...)
-            weapon_fetch_duration = int((time.time() - weapon_start) * 1000)
-            await log_api_performance(
-                self.sb_client,
-                endpoint="agent_service.run_chat",
-                operation="weapon_fetch",
-                duration_ms=weapon_fetch_duration,
-                user_id=bungie_id,
-                conversation_id=conversation_id,
-                message_id=message_id
-            )
-            # --- Profile catalyst fetch ---
-            catalyst_start = time.time()
-            # Simulate or call catalyst fetch if part of the flow
-            # catalysts = await self.get_catalysts(...)
-            catalyst_fetch_duration = int((time.time() - catalyst_start) * 1000)
-            await log_api_performance(
-                self.sb_client,
-                endpoint="agent_service.run_chat",
-                operation="catalyst_fetch",
-                duration_ms=catalyst_fetch_duration,
-                user_id=bungie_id,
-                conversation_id=conversation_id,
-                message_id=message_id
-            )
-            # --- Profile manifest lookups ---
-            manifest_start = time.time()
-            # Simulate or call manifest lookups if part of the flow
-            # ...
-            manifest_lookup_duration = int((time.time() - manifest_start) * 1000)
-            await log_api_performance(
-                self.sb_client,
-                endpoint="agent_service.run_chat",
-                operation="manifest_lookup",
-                duration_ms=manifest_lookup_duration,
-                user_id=bungie_id,
-                conversation_id=conversation_id,
-                message_id=message_id
-            )
             # --- Profile LLM call ---
             llm_start = time.time()
-            response_obj = await Runner.run(agent_to_use, messages_for_run, context={"user_uuid": self._current_user_uuid}, max_turns=25)
+            # LangChain agent expects input as a dict with 'input' key
+            response_obj = await agent_to_use.acall({"input": prompt})
             llm_duration = int((time.time() - llm_start) * 1000)
             await log_api_performance(
                 self.sb_client,
@@ -910,11 +870,11 @@ class DestinyAgentService:
                 conversation_id=conversation_id,
                 message_id=message_id
             )
-            response_text = response_obj.final_output if hasattr(response_obj, 'final_output') else "Error: Could not get final output from agent."
+            # LangChain agent returns a dict with 'output' key
+            response_text = response_obj.get("output", "Error: Could not get output from LangChain agent.")
 
             # --- LangSmith Logging ---
-            # Compute prompt version as a hash of the system prompt (including persona if used)
-            system_prompt = agent_to_use.instructions
+            system_prompt = agent_to_use.agent_kwargs.get("system_message", "")
             prompt_version = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:8]  # Short hash
             try:
                 self.langsmith_client.create_run(
@@ -953,29 +913,6 @@ class DestinyAgentService:
                 conversation_id=conversation_id,
                 message_id=message_id
             )
-            # Alert if any sub-operation or total duration exceeds 10 seconds
-            threshold = 10000
-            if (weapon_fetch_duration and weapon_fetch_duration > threshold) or \
-               (catalyst_fetch_duration and catalyst_fetch_duration > threshold) or \
-               (manifest_lookup_duration and manifest_lookup_duration > threshold) or \
-               (llm_duration and llm_duration > threshold) or \
-               (total_duration_ms > threshold):
-                await log_api_performance(
-                    self.sb_client,
-                    endpoint="agent_service.run_chat",
-                    operation="slow_request_alert",
-                    duration_ms=total_duration_ms,
-                    user_id=bungie_id,
-                    conversation_id=conversation_id,
-                    message_id=message_id,
-                    extra_data={
-                        "weapon_fetch_duration": weapon_fetch_duration,
-                        "catalyst_fetch_duration": catalyst_fetch_duration,
-                        "manifest_lookup_duration": manifest_lookup_duration,
-                        "llm_duration": llm_duration,
-                        "total_duration_ms": total_duration_ms
-                    }
-                )
             self._current_access_token = None
             self._current_bungie_id = None
             self._current_user_uuid = None
@@ -987,48 +924,74 @@ class DestinyAgentService:
         # For now, let it return the base persona instruction from the map.
         return self.persona_map.get(persona_name, f"{self.DEFAULT_AGENT_SYSTEM_PROMPT}")
 
-# --- Agent tool functions for OpenAI Agents SDK ---
-@function_tool
-async def get_user_info(ctx: RunContextWrapper['DestinyAgentService']) -> dict:
-    """
-    Fetch the user's D2 membership type and ID. Use this tool to retrieve the user's Bungie membership information when needed for other operations.
-    """
-    return await _get_user_info_impl(ctx.context)
+    def _get_langchain_tools(self):
+        # Return a list of LangChain Tool objects
+        return [
+            make_async_tool(
+                name="get_user_info",
+                description="Fetch the user's D2 membership type and ID. Use this tool to retrieve the user's Bungie membership information when needed for other operations.",
+                func=lambda membership_type=None, membership_id=None: lc_get_user_info(membership_type, membership_id, service=self)
+            ),
+            make_async_tool(
+                name="get_weapons",
+                description="Fetch all weapons for a user, using Supabase as cache.",
+                func=lambda membership_type, membership_id: lc_get_weapons(membership_type, membership_id, service=self)
+            ),
+            make_async_tool(
+                name="get_catalysts",
+                description="Fetch all catalyst progress for a user, using Supabase as cache.",
+                func=lambda user_uuid: lc_get_catalysts(user_uuid, service=self)
+            ),
+            make_async_tool(
+                name="get_pve_bis_weapons_from_sheet",
+                description="Fetches PvE BiS weapons from the public Google Sheet.",
+                func=lambda: lc_get_pve_bis_weapons_from_sheet(service=self)
+            ),
+            make_async_tool(
+                name="get_pve_activity_bis_weapons_from_sheet",
+                description="Fetches PvE BiS weapons BY ACTIVITY from the public Google Sheet.",
+                func=lambda: lc_get_pve_activity_bis_weapons_from_sheet(service=self)
+            ),
+            make_async_tool(
+                name="get_endgame_analysis_data",
+                description="Fetches data from a specific sheet in the Endgame Analysis spreadsheet using the Google Sheets API and a service account.",
+                func=lambda sheet_name=None: lc_get_endgame_analysis_data(sheet_name, service=self)
+            ),
+        ]
 
-@function_tool
-async def get_weapons(ctx: RunContextWrapper['DestinyAgentService'], membership_type: int, membership_id: str) -> list:
-    """
-    Fetch all weapons for a user, using Supabase as cache.
-    """
-    return await _get_weapons_impl(ctx.context, membership_type, membership_id)
+# --- LangChain Tool Wrappers ---
+def make_async_tool(name, description, func):
+    # Helper to wrap async functions for LangChain Tool
+    return LangChainTool(
+        name=name,
+        description=description,
+        func=func,
+        coroutine=func,
+    )
 
-@function_tool
-async def get_catalysts(ctx: RunContextWrapper['DestinyAgentService'], user_uuid: str) -> list:
-    """
-    Fetch all catalyst progress for a user, using Supabase as cache.
-    """
-    return await _get_catalysts_impl(ctx.context, user_uuid)
+# Tool: get_user_info
+async def lc_get_user_info(membership_type: int = None, membership_id: str = None, service=None):
+    return await _get_user_info_impl(service)
 
-@function_tool
-async def get_pve_bis_weapons_from_sheet(ctx: RunContextWrapper['DestinyAgentService']) -> list:
-    """
-    Fetches PvE BiS weapons from the public Google Sheet.
-    """
-    return _get_pve_bis_weapons_impl(ctx.context)
+# Tool: get_weapons
+async def lc_get_weapons(membership_type: int, membership_id: str, service=None):
+    return await _get_weapons_impl(service, membership_type, membership_id)
 
-@function_tool
-async def get_pve_activity_bis_weapons_from_sheet(ctx: RunContextWrapper['DestinyAgentService']) -> list:
-    """
-    Fetches PvE BiS weapons BY ACTIVITY from the public Google Sheet.
-    """
-    return _get_pve_activity_bis_weapons_impl(ctx.context)
+# Tool: get_catalysts
+async def lc_get_catalysts(user_uuid: str, service=None):
+    return await _get_catalysts_impl(service, user_uuid)
 
-@function_tool
-async def get_endgame_analysis_data(ctx: RunContextWrapper['DestinyAgentService'], sheet_name: str = None) -> list | str:
-    """
-    Fetches data from a specific sheet in the Endgame Analysis spreadsheet using the Google Sheets API and a service account.
-    """
-    return _get_endgame_analysis_impl(ctx.context, sheet_name)
+# Tool: get_pve_bis_weapons_from_sheet
+async def lc_get_pve_bis_weapons_from_sheet(service=None):
+    return _get_pve_bis_weapons_impl(service)
+
+# Tool: get_pve_activity_bis_weapons_from_sheet
+async def lc_get_pve_activity_bis_weapons_from_sheet(service=None):
+    return _get_pve_activity_bis_weapons_impl(service)
+
+# Tool: get_endgame_analysis_data
+async def lc_get_endgame_analysis_data(sheet_name: str = None, service=None):
+    return _get_endgame_analysis_impl(service, sheet_name)
 
 # Function to get AgentService (dependency for FastAPI)
 # This needs to be updated if AgentService __init__ changes significantly,
