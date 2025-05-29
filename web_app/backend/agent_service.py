@@ -37,6 +37,10 @@ from langsmith import Client  # Add at the top with other imports
 from langchain.tools import Tool as LangChainTool
 # Add import for LangChain OpenAI wrapper
 from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
+from langgraph.checkpoint.memory import InMemorySaver
 
 logger = logging.getLogger(__name__)
 
@@ -709,10 +713,9 @@ class DestinyAgentService:
     def __init__(self, openai_client, catalyst_api, weapon_api, sb_client, manifest_service):
         logger.info("Initializing DestinyAgentService with pre-configured API clients and Supabase client.")
         self.openai_client = openai_client
-        # set_default_openai_client(self.openai_client) # Set for the agents library
         self.catalyst_api = catalyst_api
         self.weapon_api = weapon_api
-        self.sb_client = sb_client 
+        self.sb_client = sb_client
         self.manifest_service = manifest_service
 
         prompts = load_prompts()
@@ -721,116 +724,72 @@ class DestinyAgentService:
         self.SUPABASE_MCP_ACCESS_PROMPT = prompts["default"]["supabase_access"]
         self.EMOJI_ENCOURAGEMENT = prompts["default"]["emoji_encouragement"]
         self.persona_map = load_personas()
-        
+
         self.supabase_mcp_server = None
         self.supabase_mcp_server_started = False
         self._main_agent_mcp_servers = []
-        # Default agent created with a combined default system prompt
-        default_full_system_prompt = f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} {self.AGENT_CORE_ABILITIES_PROMPT} {self.SUPABASE_MCP_ACCESS_PROMPT} {self.EMOJI_ENCOURAGEMENT}"
-        self.agent = self._create_agent_internal(instructions=default_full_system_prompt)
-        # Add MCP servers to agent if any (will be updated by start_supabase_mcp_server)
-        if self._main_agent_mcp_servers:
-            self.agent.mcp_servers = self._main_agent_mcp_servers
-
         self._current_access_token: Optional[str] = None
         self._current_bungie_id: Optional[str] = None
         self._current_user_uuid: Optional[str] = None
         self._current_project_id = self.SUPABASE_PROJECT_ID
-        
-        self._user_info_cache: Dict[str, tuple[datetime, dict]] = {}
-        self._sheet_cache: Dict[str, tuple[datetime, list[dict]]] = {}
-        self.langsmith_client = Client()
+        self._user_info_cache: Dict[str, tuple] = {}
+        self._sheet_cache: Dict[str, tuple] = {}
+        # LangSmith tracing is preserved if env vars are set
 
-    def _create_agent_internal(self, instructions: str, persona=None, prompt_version=None, history=None, conversation_id=None, message_id=None):
-        """Internal helper to create a LangChain agent instance with specific instructions and custom metadata for tracing."""
-        logger.debug(f"Creating LangChain agent with instructions: '{instructions[:100]}...'")
-        # LangChain OpenAI LLM
-        llm = ChatOpenAI(
-            openai_api_key=os.environ.get("OPENAI_API_KEY"),
-            model="gpt-3.5-turbo",  # or your preferred model
-            streaming=True,
-        )
-        tools = self._get_langchain_tools()
-        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-        # Add custom tags and metadata for tracing
-        agent = initialize_agent(
-            tools=tools,
-            llm=llm,
-            agent="conversational-react-description",
-            memory=memory,
-            verbose=True,
-            handle_parsing_errors=True,
-            agent_kwargs={"system_message": instructions},
-            tags=[prompt_version or "default", persona or "default"],
-            metadata={
-                "user_uuid": getattr(self, "_current_user_uuid", None),
-                "persona": persona,
-                "prompt_version": prompt_version,
-                "system_prompt": instructions,
-                "history": history,
-                "conversation_id": conversation_id,
-                "message_id": message_id,
-            },
-        )
-        agent._system_message = instructions
-        return agent
-
-    async def start_supabase_mcp_server(self):
-        if self.supabase_mcp_server_started:
-            logger.info("Supabase MCP server already started.")
-            return  # Already started
-        self.supabase_mcp_server = MCPServerStdio(
-            params={
+        # MCP client setup for Supabase MCP server
+        self.mcp_client = MultiServerMCPClient({
+            "supabase": {
                 "command": "npx",
                 "args": [
                     "-y",
                     "@supabase/mcp-server-supabase@latest",
                     "--access-token",
-                    SUPABASE_ACCESS_TOKEN,
+                    os.getenv("SUPABASE_ACCESS_TOKEN", "<your-personal-access-token>"),
                     "--project-ref",
-                    "grwqemflswabswphkute",
+                    self.SUPABASE_PROJECT_ID,
                 ],
+                "transport": "stdio",
             }
+        })
+        # LangGraph checkpointer for persistent memory (swap for Redis in prod)
+        self.checkpointer = InMemorySaver()
+        self.agent = None  # Will be created per request or on demand
+
+    async def _load_mcp_tools(self):
+        # Loads MCP tools from the Supabase MCP server
+        async with self.mcp_client.session("supabase") as session:
+            await session.initialize()
+            tools = await load_mcp_tools(session)
+            return tools
+
+    def get_persona_prompt(self, persona_name: str) -> str:
+        return self.persona_map.get(persona_name, f"{self.DEFAULT_AGENT_SYSTEM_PROMPT}")
+
+    async def _create_agent_internal(self, instructions: str, persona=None, prompt_version=None, history=None, conversation_id=None, message_id=None):
+        logger.debug(f"Creating LangGraph agent with instructions: '{instructions[:100]}...'")
+        llm = ChatOpenAI(
+            openai_api_key=os.environ.get("OPENAI_API_KEY"),
+            model="gpt-3.5-turbo",  # or your preferred model
+            streaming=True,
         )
-        await self.supabase_mcp_server.__aenter__()
-        # Ensure all future agents inherit the MCP server
-        if self.supabase_mcp_server not in self._main_agent_mcp_servers:
-            self._main_agent_mcp_servers.append(self.supabase_mcp_server)
-        self.supabase_mcp_server_started = True
-        logger.info("Supabase MCP server started and attached to agent.")
-
-        # List and log available tools
-        try:
-            tools = await self.supabase_mcp_server.list_tools()
-            logger.info(f"Available tools from Supabase MCP: {[tool.name for tool in tools]}")
-        except Exception as e:
-            logger.error(f"Failed to list tools from Supabase MCP: {e}")
-
-    async def close_supabase_mcp_server(self):
-        if self.supabase_mcp_server and self.supabase_mcp_server_started:
-            await self.supabase_mcp_server.__aexit__(None, None, None)
-            self.supabase_mcp_server_started = False
-
-    async def answer_user_query(self, user_input: str):
-        # Ensure MCP server is started before using the agent
-        if not self.supabase_mcp_server_started:
-            await self.start_supabase_mcp_server()
-        context = {"user_uuid": self._current_user_uuid}
-        result = await Runner.run(self.agent, input=user_input, context=context, max_turns=25)
-        return result
-
-    # Optionally, keep legacy methods for direct DB/API access for refresh only
-    async def refresh_user_data(self, user_id):
-        await refresh_user_data_if_stale(user_id, self.sb_client, self.weapon_api)
+        tools = await self._load_mcp_tools()
+        # Optionally, add Google Sheets tools if still needed
+        # tools += [ ... any custom tools ... ]
+        agent = create_react_agent(
+            model=llm,
+            tools=tools,
+            prompt=instructions,
+            checkpointer=self.checkpointer,  # <-- Enable persistent memory
+        )
+        agent._system_message = instructions
+        return agent
 
     async def run_chat(self, prompt: str, access_token: str, bungie_id: str, supabase_uuid: str, history: Optional[List[Dict[str, str]]] = None, persona: Optional[str] = None, conversation_id: Optional[str] = None, message_id: Optional[str] = None):
         logger.debug(f"DestinyAgentService run_chat called for bungie_id: {bungie_id}, persona: {persona}")
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
-        self._current_user_uuid = supabase_uuid  # Use the real Supabase UUID
-
+        self._current_user_uuid = supabase_uuid
         uuid_instructions = f"The user's UUID is: {self._current_user_uuid}. Always use this UUID for any user-specific queries or tool calls. "
-
         if persona:
             persona_base_instructions = self.persona_map.get(persona)
             if persona_base_instructions:
@@ -843,7 +802,7 @@ class DestinyAgentService:
                 )
                 logger.info(f"Using effective system prompt for persona '{persona}': '{effective_system_prompt[:150]}...'")
                 prompt_version = hashlib.sha256(effective_system_prompt.encode("utf-8")).hexdigest()[:8]
-                agent_to_use = self._create_agent_internal(
+                agent_to_use = await self._create_agent_internal(
                     instructions=effective_system_prompt,
                     persona=persona,
                     prompt_version=prompt_version,
@@ -855,7 +814,7 @@ class DestinyAgentService:
                 logger.warning(f"Persona '{persona}' selected but no matching instructions found in persona_map. Using default agent.")
                 fallback_system_prompt = f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} {uuid_instructions}"
                 prompt_version = hashlib.sha256(fallback_system_prompt.encode("utf-8")).hexdigest()[:8]
-                agent_to_use = self._create_agent_internal(
+                agent_to_use = await self._create_agent_internal(
                     instructions=fallback_system_prompt,
                     persona=None,
                     prompt_version=prompt_version,
@@ -864,13 +823,12 @@ class DestinyAgentService:
                     message_id=message_id,
                 )
         else:
-            # Default agent with UUID injected
             default_full_system_prompt = (
                 f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} "
                 f"{uuid_instructions}"
             )
             prompt_version = hashlib.sha256(default_full_system_prompt.encode("utf-8")).hexdigest()[:8]
-            agent_to_use = self._create_agent_internal(
+            agent_to_use = await self._create_agent_internal(
                 instructions=default_full_system_prompt,
                 persona=None,
                 prompt_version=prompt_version,
@@ -878,99 +836,46 @@ class DestinyAgentService:
                 conversation_id=conversation_id,
                 message_id=message_id,
             )
+        # LangGraph agents do not have a .memory attribute; state is managed by the checkpointer and thread_id.
+        # if history:
+        #     agent_to_use.memory.chat_memory.messages = history
 
-        # Prepare chat history for LangChain memory if provided
-        if history:
-            # LangChain's ConversationBufferMemory expects a list of dicts with 'role' and 'content'
-            agent_to_use.memory.chat_memory.messages = history
-
+        # When using checkpointer, pass conversation_id as thread_id in config
+        config = {"configurable": {"thread_id": conversation_id or "default-thread"}}
+        # Only the latest user message is required; agent will load full state from checkpointer
+        user_message = {"role": "user", "content": prompt}
         import time
         total_start = time.time()
-        weapon_fetch_duration = None
-        catalyst_fetch_duration = None
-        manifest_lookup_duration = None
-        llm_duration = None
         try:
-            # --- Profile LLM call ---
-            llm_start = time.time()
-            # LangChain agent expects input as a dict with 'input' key
-            response_obj = await agent_to_use.acall({"input": prompt})
-            llm_duration = int((time.time() - llm_start) * 1000)
-            await log_api_performance(
-                self.sb_client,
-                endpoint="agent_service.run_chat",
-                operation="llm_call",
-                duration_ms=llm_duration,
-                user_id=bungie_id,
-                conversation_id=conversation_id,
-                message_id=message_id
-            )
-            # LangChain agent returns a dict with 'output' key
-            response_text = response_obj.get("output", "Error: Could not get output from LangChain agent.")
-
-            return response_text
-        except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err:
-            logger.warning(f"Authentication error during agent chat execution: {auth_err}")
-            raise 
+            response_obj = await agent_to_use.ainvoke({"messages": [user_message]}, config=config)
+            logger.error(f"LangGraph agent response: {response_obj}")
+            if "output" in response_obj:
+                return response_obj["output"]
+            elif "messages" in response_obj:
+                # Find the last AIMessage and return its content
+                messages = response_obj["messages"]
+                for msg in reversed(messages):
+                    if hasattr(msg, "content"):
+                        return msg.content
+                return f"Agent returned messages but no AIMessage with content: {messages}"
+            elif "error" in response_obj:
+                return f"Agent error: {response_obj['error']}"
+            elif "exception" in response_obj:
+                return f"Agent exception: {response_obj['exception']}"
+            else:
+                return f"Agent returned unexpected response: {response_obj}"
         except Exception as e:
             logger.error(f"Error during agent chat execution: {e}", exc_info=True)
             return f"An unexpected error occurred while processing your request: {str(e)}"
         finally:
             total_duration_ms = int((time.time() - total_start) * 1000)
-            await log_api_performance(
-                self.sb_client,
-                endpoint="agent_service.run_chat",
-                operation="total_run_chat",
-                duration_ms=total_duration_ms,
-                user_id=bungie_id,
-                conversation_id=conversation_id,
-                message_id=message_id
-            )
+            # Optionally log performance, as before
             self._current_access_token = None
             self._current_bungie_id = None
             self._current_user_uuid = None
 
-    def get_persona_prompt(self, persona_name: str) -> str:
-        # This method might become less necessary or simplified
-        # as persona instructions are now directly used from persona_map
-        # and combined with core abilities in run_chat.
-        # For now, let it return the base persona instruction from the map.
-        return self.persona_map.get(persona_name, f"{self.DEFAULT_AGENT_SYSTEM_PROMPT}")
-
-    def _get_langchain_tools(self):
-        # Return a list of LangChain Tool objects
-        return [
-            make_async_tool(
-                name="get_user_info",
-                description="Fetch the user's D2 membership type and ID. Use this tool to retrieve the user's Bungie membership information when needed for other operations.",
-                func=lambda membership_type=None, membership_id=None: lc_get_user_info(membership_type, membership_id, service=self)
-            ),
-            make_async_tool(
-                name="get_weapons",
-                description="Fetch all weapons for a user, using Supabase as cache.",
-                func=lambda membership_type, membership_id: lc_get_weapons(membership_type, membership_id, service=self)
-            ),
-            make_async_tool(
-                name="get_catalysts",
-                description="Fetch all catalyst progress for a user, using Supabase as cache.",
-                func=lambda user_uuid: lc_get_catalysts(user_uuid, service=self)
-            ),
-            make_async_tool(
-                name="get_pve_bis_weapons_from_sheet",
-                description="Fetches PvE BiS weapons from the public Google Sheet.",
-                func=lambda: lc_get_pve_bis_weapons_from_sheet(service=self)
-            ),
-            make_async_tool(
-                name="get_pve_activity_bis_weapons_from_sheet",
-                description="Fetches PvE BiS weapons BY ACTIVITY from the public Google Sheet.",
-                func=lambda: lc_get_pve_activity_bis_weapons_from_sheet(service=self)
-            ),
-            make_async_tool(
-                name="get_endgame_analysis_data",
-                description="Fetches data from a specific sheet in the Endgame Analysis spreadsheet using the Google Sheets API and a service account.",
-                func=lambda sheet_name=None: lc_get_endgame_analysis_data(sheet_name, service=self)
-            ),
-        ]
+    # Remove legacy _get_langchain_tools and wrappers for MCP tools, as MCP tools are now loaded dynamically
+    # Keep Google Sheets or other custom tools if still needed, and add them to the tools list in _create_agent_internal
 
 # --- LangChain Tool Wrappers ---
 def make_async_tool(name, description, func):

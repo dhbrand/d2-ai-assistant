@@ -2,8 +2,7 @@
   "name": "destiny2-catalysts-root",
   "private": true,
   "scripts": {
-    "dev": "concurrently \"uvicorn web_app.backend.main:app --reload --host 0.0.0.0 --port 8000 --ssl-certfile web_app/cert.pem --ssl-keyfile web_app/key.pem\" \"cd web_app/frontend && npm start\" \"sleep 2 && open -a 'Google Chrome' https://localhost:3000\"",
-    "start": "BROWSER=\"Google Chrome\" npm start"
+    "dev": "concurrently \"uvicorn web_app.backend.main:app --reload --host 0.0.0.0 --port 8000 --ssl-certfile web_app/cert.pem --ssl-keyfile web_app/key.pem\" \"cd web_app/frontend && npm start\" \"sleep 2 && osascript -e 'tell application \\\"Google Chrome\\\" to set theUrl to \\\"https://localhost:3000\\\" \\\\nset isOpen to false \\\\nrepeat with w in windows \\\\nrepeat with t in tabs of w \\\\nif (URL of t as string) starts with theUrl then \\\\nset isOpen to true \\\\nset index of w to 1 \\\\nset active tab index of w to (index of t) \\\\nexit repeat \\\\nend if \\\\nend repeat \\\\nif isOpen then exit repeat \\\\nend repeat \\\\nif not isOpen then open location theUrl \\\\nend if \\\\nend tell'\""
   },
   "devDependencies": {
     "concurrently": "^8.2.2"
