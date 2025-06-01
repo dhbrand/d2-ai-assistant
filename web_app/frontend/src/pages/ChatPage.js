@@ -11,6 +11,8 @@ import {
   TextField,
   CircularProgress,
   Paper,
+  Alert,
+  Chip,
 } from '@mui/material';
 import { useAuth } from '../contexts/AuthContext';
 import AdvancedMarkdownRenderer from '../components/AdvancedMarkdownRenderer';
@@ -27,6 +29,8 @@ import Menu from '@mui/material/Menu';
 import MenuItem from '@mui/material/MenuItem';
 import Tooltip from '@mui/material/Tooltip';
 import Select from '@mui/material/Select';
+import { createParser } from 'eventsource-parser';
+import { v4 as uuidv4 } from 'uuid';
 
 // --- NEW Type Definitions for Chat History (using JSDoc for .js file) ---
 /**
@@ -66,7 +70,12 @@ function ChatPage() {
   const [showArchived, setShowArchived] = useState(false);
   const [contextMenu, setContextMenu] = useState(null); // { mouseX, mouseY, convId }
   const [contextConvId, setContextConvId] = useState(null);
-  const [selectedPersona, setSelectedPersona] = useState('Saint-14');
+  const [selectedPersona, setSelectedPersona] = useState('default');
+  const [dataRefreshed, setDataRefreshed] = useState(null); // null | true | false
+  const [lastUpdated, setLastUpdated] = useState(null); // null | string (ISO)
+  const [agentSteps, setAgentSteps] = useState([]); // For agentic step/status
+  const [agentState, setAgentState] = useState({}); // For state snapshot/delta
+  const [error, setError] = useState(null);
 
   // --- NEW Functions for Chat History API Calls ---
 
@@ -215,90 +224,182 @@ function ChatPage() {
 
   const handleSendMessage = async () => {
     if (!newMessage.trim() || isLoading) return;
-
-    const userMessage = { role: 'user', content: newMessage.trim() };
-    setMessages((prev) => [...prev, userMessage]);
-    setNewMessage('');
     setIsLoading(true);
-    handleScrollToBottom();
+    setError(null);
 
-    const isNewConversation = !currentConversationId; // Check if it's a new chat BEFORE sending
+    // Generate or reuse threadId and runId
+    let threadId = localStorage.getItem('agui_thread_id');
+    if (!threadId) {
+      threadId = uuidv4();
+      localStorage.setItem('agui_thread_id', threadId);
+    }
+    const runId = uuidv4();
+
+    // Build messages array (align with ag_ui.core.types.BaseMessage: use 'name' for user ID, 'id' for message ID)
+    const userId = localStorage.getItem('agui_user_id') || uuidv4();
+    localStorage.setItem('agui_user_id', userId);
+    const messageId = uuidv4(); // Unique ID for this specific message
+
+    const messages = [
+      {
+        id: messageId,       // ID for the message itself (BaseMessage.id)
+        role: 'user',
+        content: newMessage,
+        name: userId,         // User identifier goes into the 'name' field (BaseMessage.name)
+      },
+    ];
+
+    // Add the new user message to the local state immediately
+    setMessages(prevMessages => [
+      ...prevMessages,
+      { role: 'user', content: newMessage },
+    ]);
+    setNewMessage(''); // Clear input field
+    setAgentSteps([]); // Clear previous agent steps
+    setAgentState({}); // Clear previous agent state
+
+    console.log("Attempting to connect to agent stream with payload:", {
+      thread_id: threadId,
+      run_id: runId,
+      messages: messages, // These are the AG-UI formatted messages
+      context: [], // As per backend expectation
+      forwarded_props: { persona: selectedPersona },
+    });
 
     try {
-      const requestBody = {
-        messages: [...messages, userMessage].slice(-20), // Send recent history + new message
-        conversation_id: currentConversationId, // Will be null for new chats
-        persona: selectedPersona, // <-- Include persona in request
-      };
-
-      const response = await fetch('https://localhost:8000/api/assistants/chat', {
+      console.log("Fetch promise created for /agent/stream");
+      const responsePromise = fetch('/agent/stream', { // Using relative path for proxy
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
+          'Authorization': `Bearer ${token}`, // Assuming token is needed
         },
-        body: JSON.stringify(requestBody),
+        body: JSON.stringify({
+          thread_id: threadId,
+          run_id: runId,
+          messages: messages, // Send the AG-UI formatted messages
+          state: null, 
+          tools: [], // CHANGED: Was null, now an empty array
+          context: [], 
+          forwarded_props: { persona: selectedPersona },
+        }),
       });
 
-      const responseText = await response.text(); // Get raw text first
+      // Log when the promise resolves, regardless of status
+      const response = await responsePromise;
+      console.log("Fetch response received for /agent/stream, status:", response.status);
 
       if (!response.ok) {
-        let errorDisplayMessage = "An API error occurred."; // Default error message
-        try {
-          const jsonError = JSON.parse(responseText); // Try to parse as JSON
-          
-          if (response.status === 401) {
-            if (jsonError.error === "auth_required") {
-              console.error("Authentication required by API. Frontend should trigger login flow.", jsonError.message);
-              errorDisplayMessage = jsonError.message || "Authentication is required. Please log in.";
-              // TODO: Implement actual login trigger/redirect here.
-              // Example: authContext.requestLogin(); 
-            } else if (jsonError.error === "invalid_refresh_token") {
-              console.error("Invalid refresh token. Frontend should trigger full re-login.", jsonError.message);
-              errorDisplayMessage = jsonError.message || "Your session has expired. Please log in again.";
-              // TODO: Implement actual login trigger/redirect here, possibly clearing old token.
-              // Example: authContext.logoutAndRequestLogin();
-            } else {
-              // Other 401 errors
-              errorDisplayMessage = jsonError.detail || jsonError.message || responseText;
-            }
-          } else {
-            // Non-401 errors
-            errorDisplayMessage = jsonError.detail || jsonError.message || responseText;
-          }
-        } catch (_) {
-          // If responseText wasn't valid JSON, use responseText as the error detail
-          errorDisplayMessage = responseText;
-        }
-        console.error('API Error:', response.status, errorDisplayMessage);
-        setMessages((prev) => [...prev, { role: 'assistant', content: `Error: ${errorDisplayMessage}` }]);
-        setIsLoading(false); // Ensure loading is stopped
-        return; // Important: stop processing on error
+        const errorText = await response.text();
+        console.error('Failed to connect to agent stream:', response.status, errorText);
+        setError(`Error: ${response.status} ${errorText || response.statusText}`);
+        setIsLoading(false);
+        // Add the error message to the chat
+        setMessages(prevMessages => [
+          ...prevMessages,
+          { role: 'assistant', content: `Error connecting to agent: ${response.status} ${errorText || response.statusText}` },
+        ]);
+        return;
       }
 
-      // If response.ok, then try to parse the successful JSON response
-      const data = JSON.parse(responseText);
-      const assistantMessage = { role: 'assistant', content: data.message.content };
-      setMessages(prev => [...prev, assistantMessage]);
-      
-      if (isNewConversation && data.conversation_id) {
-        setCurrentConversationId(data.conversation_id);
-        fetchConversations();
-        // Start polling for title update
-        pollForTitleUpdate(data.conversation_id);
-      } 
+      // Handle SSE stream
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let incomingText = '';
+      let currentAssistantMessageId = null;
 
-    } catch (error) {
-      console.error(error);
-      setMessages(prev => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: `Error: ${error.message}`,
-        },
+      const parser = createParser({
+        onEvent: (event) => {
+          if (event.type === 'event') {
+            try {
+              const data = JSON.parse(event.data);
+              // console.log('Received SSE event:', data); // Optional: log every event
+
+              if (data.type === 'TEXT_MESSAGE_START') {
+                currentAssistantMessageId = data.message_id;
+                console.log('[ChatPage] TEXT_MESSAGE_START received, message_id:', currentAssistantMessageId);
+                setMessages(prev => {
+                  console.log('[ChatPage] Updater for TEXT_MESSAGE_START - prevMessages:', prev);
+                  const newAssistantMessage = {
+                    id: currentAssistantMessageId, 
+                    role: 'assistant', 
+                    content: '' 
+                  };
+                  console.log('[ChatPage] Updater for TEXT_MESSAGE_START - adding new message:', newAssistantMessage);
+                  return [...prev, newAssistantMessage];
+                });
+              } else if (data.type === 'TEXT_MESSAGE_CONTENT') {
+                console.log('[ChatPage] TEXT_MESSAGE_CONTENT received, delta:', data.delta, 'for message_id:', data.message_id, 'currentAssistantMessageId:', currentAssistantMessageId);
+                if (data.delta) {
+                  setMessages(prev => {
+                    console.log('[ChatPage] Updater for TEXT_MESSAGE_CONTENT - prevMessages:', prev);
+                    console.log('[ChatPage] Updater for TEXT_MESSAGE_CONTENT - targetMessageId:', data.message_id);
+                    return prev.map(m => {
+                      if (m.id === data.message_id) {
+                        console.log('[ChatPage] Updater for TEXT_MESSAGE_CONTENT - message to update:', m, 'appending delta:', data.delta);
+                        return { ...m, content: m.content + data.delta }; // Correctly append to existing content
+                      } else {
+                        return m; // Return other messages unchanged
+                      }
+                    });
+                  });
+                }
+              } else if (data.type === 'TEXT_MESSAGE_END') {
+                // Finalize the message if needed, incomingText should already be complete
+                currentAssistantMessageId = null; // Reset for next message
+              } else if (data.type === 'STEP_STARTED') {
+                setAgentSteps(prev => [...prev, { id: data.step_id, name: data.name, status: 'running' }]);
+              } else if (data.type === 'STEP_FINISHED') {
+                setAgentSteps(prev => prev.map(s => s.id === data.step_id ? { ...s, status: 'finished' } : s));
+              } else if (data.type === 'STATE_SNAPSHOT' || data.type === 'STATE_DELTA') {
+                // For simplicity, merging delta into a snapshot view.
+                // A more complex UI might differentiate.
+                setAgentState(prevState => ({ ...prevState, ...data.state }));
+              } else if (data.type === 'RUN_ERROR') {
+                  console.error("Agent Run Error:", data.message, data.details);
+                  setError(`Agent Error: ${data.message}`);
+                  setMessages(prevMessages => [
+                      ...prevMessages,
+                      { role: 'assistant', content: `Agent Error: ${data.message}` },
+                  ]);
+              }
+
+            } catch (e) {
+              console.error('Error parsing SSE event data inside createParser callback:', e);
+              console.error('Offending event.type:', event.type);
+              console.error('Offending event.data raw:', event.data);
+              setError(`Error processing event: ${e.message}. Check console for details on event data.`);
+            }
+          } else if (event.type === 'reconnect-interval') {
+            console.log('SSE reconnect interval requested:', event.value);
+          }
+        }
+      });
+      
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          console.log("SSE stream finished.");
+          break;
+        }
+        const chunk = decoder.decode(value, { stream: true });
+        console.log("SSE chunk received:", chunk); // Log each chunk
+        parser.feed(chunk);
+      }
+
+    } catch (err) {
+      console.error('Error sending message or processing stream:', err);
+      setError(`Network or processing error: ${err.message}`);
+      // Add the error message to the chat
+      setMessages(prevMessages => [
+        ...prevMessages,
+        { role: 'assistant', content: `Error: ${err.message}` },
       ]);
     } finally {
       setIsLoading(false);
+      // Ensure scroll to bottom after message processing is done
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   };
 
@@ -460,6 +561,26 @@ function ChatPage() {
         component="main" 
         sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}
       >
+        {/* AGENT THOUGHTS/STEP STATUS */}
+        {agentSteps.length > 0 && (
+          <Paper elevation={2} sx={{ p: 2, mb: 1, background: '#222', color: '#fff' }}>
+            <strong>Agent Thoughts:</strong>
+            <ul style={{ margin: 0, paddingLeft: 20 }}>
+              {agentSteps.map((s, i) => (
+                <li key={s.name + i} style={{ color: s.status === 'finished' ? 'lightgreen' : '#fff' }}>
+                  {s.name} {s.status === 'finished' ? '✅' : '⏳'}
+                </li>
+              ))}
+            </ul>
+          </Paper>
+        )}
+        {/* AGENT STATE SNAPSHOT */}
+        {agentState && Object.keys(agentState).length > 0 && (
+          <Paper elevation={1} sx={{ p: 2, mb: 1, background: '#333', color: '#fff', fontSize: 13 }}>
+            <strong>Agent State:</strong>
+            <pre style={{ margin: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{JSON.stringify(agentState, null, 2)}</pre>
+          </Paper>
+        )}
         <Box
           ref={messageListRef}
           sx={{
@@ -538,6 +659,7 @@ function ChatPage() {
               size="small"
               sx={{ minWidth: 180 }}
             >
+              <MenuItem value="default">Default</MenuItem>
               <MenuItem value="Saint-14">Saint-14</MenuItem>
               <MenuItem value="Cayde-6">Cayde-6</MenuItem>
               <MenuItem value="Ikora">Ikora</MenuItem>
@@ -549,6 +671,18 @@ function ChatPage() {
               <MenuItem value="Mara Sov">Mara Sov</MenuItem>
             </Select>
           </Box>
+          {/* Data refresh badge/note */}
+          {dataRefreshed === true && (
+            <Alert severity="success" sx={{ mb: 1, width: '100%' }}>Your Destiny 2 data was just refreshed!</Alert>
+          )}
+          {dataRefreshed === false && lastUpdated && (
+            <Chip
+              label={`Data last updated: ${new Date(lastUpdated).toLocaleString()}`}
+              color="info"
+              variant="outlined"
+              sx={{ mb: 1, width: '100%' }}
+            />
+          )}
           <Box sx={{ width: '100%', display: 'flex', alignItems: 'center' }}>
             <TextField
               fullWidth

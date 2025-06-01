@@ -28,7 +28,7 @@ async def migrate_users():
                 "bungie_token_expires": access_token_expires or None
             }
             try:
-                resp = await sb_client.table("users").update({"raw_user_meta_data": metadata_update}).eq("id", supabase_uuid).execute()
+                resp = await sb_client.table("profiles").update({"raw_user_meta_data": metadata_update}).eq("id", supabase_uuid).execute()
                 if resp.error:
                     print(f"Failed to update user {supabase_uuid}: {resp.error}")
                     failures += 1

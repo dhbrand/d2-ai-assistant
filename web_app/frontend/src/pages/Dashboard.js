@@ -120,7 +120,14 @@ const Dashboard = () => {
     .sort((a, b) => {
       if (sortBy === 'name') return a.name.localeCompare(b.name);
       if (sortBy === 'progress') return b.progress - a.progress;
-      if (sortBy === 'weapon_type') return a.weaponType.localeCompare(b.weaponType);
+      if (sortBy === 'weapon_type') {
+        const aType = a.weaponType ?? 'Unknown';
+        const bType = b.weaponType ?? 'Unknown';
+        if (!a.weaponType || !b.weaponType) {
+          console.warn('Catalyst missing weaponType during sort:', a, b);
+        }
+        return aType.localeCompare(bType);
+      }
       return 0;
     });
 
@@ -141,10 +148,11 @@ const Dashboard = () => {
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
           <Typography variant="h6">{catalyst.name}</Typography>
           <Chip
-            label={catalyst.weaponType}
+            label={catalyst.weaponType ?? 'Unknown'}
             color="secondary"
             size="small"
             sx={{ ml: 1 }}
+            onClick={() => { if (!catalyst.weaponType) console.warn('Catalyst missing weaponType:', catalyst); }}
           />
         </Box>
 

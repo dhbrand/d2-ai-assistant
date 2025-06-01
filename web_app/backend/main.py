@@ -14,7 +14,7 @@ import requests
 import httpx # Import httpx
 import json
 import time
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 import threading
 from collections import defaultdict
@@ -24,15 +24,17 @@ from openai import AsyncOpenAI # <-- Import OpenAI client
 from jose.exceptions import ExpiredSignatureError
 from supabase import create_client, Client, ClientOptions # <-- Add Supabase imports
 from supabase import create_async_client, AsyncClient # <-- Add async Supabase imports
+from sse_starlette.sse import EventSourceResponse
 
 # Use absolute imports
 from web_app.backend.bungie_oauth import OAuthManager, InvalidRefreshTokenError, TokenData, AuthenticationRequiredError # Import TokenData here
 from web_app.backend.catalyst_api import CatalystAPI
 from web_app.backend.weapon_api import WeaponAPI
-from web_app.backend.agent_service import DestinyAgentService
+from web_app.backend.agent_service import DestinyAgentService, get_agent_service, set_global_agent_service
 from .manifest import SupabaseManifestService # Import the new service
 from web_app.backend.performance_logging import log_api_performance  # Import the profiling helper
 from web_app.backend.models import CallbackData, UserResponse, ConversationSchema, ChatMessageSchema
+from ag_ui.core import RunAgentInput
 
 # Configure logging to file and console
 log_dir = os.path.join(os.path.dirname(__file__), "logs")
@@ -44,7 +46,7 @@ for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s %(levelname)s:%(name)s:%(message)s',
     handlers=[
         logging.FileHandler(log_file_path, mode='w'),  # Overwrite on each start
@@ -70,6 +72,8 @@ class ChatResponse(BaseModel):
     message: ChatMessage
     response_id: Optional[str] = None
     conversation_id: uuid.UUID # Always return conversation ID
+    data_refreshed: Optional[bool] = None
+    last_updated: Optional[datetime] = None
 
 # --- Pydantic model for listing models ---
 class ModelInfo(BaseModel):
@@ -212,7 +216,7 @@ async def startup_event():
         logger.error("OAuthManager or SupabaseManifestService not available. Cannot initialize CatalystAPI or WeaponAPI.")
 
     # Initialize AgentService with the API instances
-    if openai_client and catalyst_api_instance and weapon_api_instance and supabase_client:
+    if openai_client and catalyst_api_instance and weapon_api_instance and supabase_client and supabase_manifest_service:
         try:
             logger.info("Attempting to initialize DestinyAgentService...")
             agent_service = DestinyAgentService(
@@ -222,15 +226,9 @@ async def startup_event():
                 sb_client=supabase_client,
                 manifest_service=supabase_manifest_service
             )
-            # Start the Supabase MCP server automatically
-            # TODO: This is now handled dynamically by DestinyAgentService with LangGraph/MCP refactor.
-            # try:
-            #     await agent_service.start_supabase_mcp_server()
-            #     logger.info("Supabase MCP server started automatically at startup.")
-            # except Exception as mcp_e:
-            #     logger.error(f"Failed to start Supabase MCP server at startup: {mcp_e}")
             app.state.agent_service_instance = agent_service
-            logger.info("DestinyAgentService initialized and stored in app.state.")
+            set_global_agent_service(agent_service)
+            logger.info("DestinyAgentService initialized, stored in app.state, and set globally via setter.")
         except Exception as e:
             logger.exception(f"Error initializing DestinyAgentService: {e}")
             app.state.agent_service_instance = None
@@ -240,6 +238,7 @@ async def startup_event():
         if not catalyst_api_instance: missing_deps.append("CatalystAPI (global)")
         if not weapon_api_instance: missing_deps.append("WeaponAPI (global)")
         if not supabase_client: missing_deps.append("Supabase Client (global)")
+        if not supabase_manifest_service: missing_deps.append("Supabase Manifest Service (global)")
         logger.error(f"DestinyAgentService could not be initialized. Missing: {', '.join(missing_deps)}")
         app.state.agent_service_instance = None
 
@@ -374,7 +373,7 @@ async def handle_auth_callback(callback_data: CallbackData, request: Request, sb
                 "bungie_refresh_token": refresh_token,
                 "bungie_token_expires": expires_at_utc.isoformat()
             }
-            update_resp = await sb_client.table("users").update({"raw_user_meta_data": metadata_update}).eq("id", supabase_uuid).execute()
+            update_resp = await sb_client.table("profiles").update({"raw_user_meta_data": metadata_update}).eq("id", supabase_uuid).execute()
             if update_resp.error:
                 logger.error(f"Failed to update Supabase user metadata: {update_resp.error}")
                 raise HTTPException(status_code=500, detail="Failed to update Supabase user metadata.")
@@ -659,7 +658,7 @@ async def assistants_chat_endpoint(
     # Fetch Bungie access token from Supabase user metadata (optional)
     access_token = None
     try:
-        user_resp = await sb_client.table("users").select("raw_user_meta_data").eq("id", bungie_id).maybe_single().execute()
+        user_resp = await sb_client.table("profiles").select("raw_user_meta_data").eq("id", bungie_id).maybe_single().execute()
         if user_resp.data and user_resp.data.get("raw_user_meta_data"):
             meta = user_resp.data["raw_user_meta_data"]
             access_token = meta.get("bungie_access_token")
@@ -739,8 +738,7 @@ async def assistants_chat_endpoint(
             next_order_index += 1
 
         # --- Prepare for Agent Call ---
-        logger.info(f"Passing chat request to agent service for user {bungie_id}, conversation {current_conversation_id_str}")
-        
+        logger.info(f"[CHAT_API] About to call agent_service_instance.run_chat for user {bungie_id}, conversation {current_conversation_id_str}")
         run_result = await agent_service_instance.run_chat(
             prompt=user_message_content,
             access_token=access_token,
@@ -751,6 +749,7 @@ async def assistants_chat_endpoint(
             conversation_id=current_conversation_id_str,
             message_id=user_message_id,
         )
+        logger.info(f"[CHAT_API] agent_service_instance.run_chat returned: {run_result!r} (type: {type(run_result)})")
         agent_duration_ms = int((time.time() - agent_start) * 1000)
         await log_api_performance(
             sb_client,
@@ -823,9 +822,15 @@ async def assistants_chat_endpoint(
             message_id=user_message_id,
             extra_data={"status": "success"}
         )
-        return ChatResponse(message=response_message, conversation_id=final_conversation_id_uuid)
+        return ChatResponse(
+            message=response_message,
+            conversation_id=final_conversation_id_uuid,
+            data_refreshed=True,
+            last_updated=datetime.now(timezone.utc),
+        )
 
     except HTTPException as http_exc:
+        logger.error(f"[CHAT_API] HTTPException: {http_exc.detail}")
         total_duration_ms = int((time.time() - total_start) * 1000)
         await log_api_performance(
             sb_client,
@@ -839,9 +844,10 @@ async def assistants_chat_endpoint(
         )
         raise http_exc
     except (AuthenticationRequiredError, InvalidRefreshTokenError) as auth_err:
-        logger.warning(f"Authentication error in assistants_chat_endpoint for user {bungie_id}, conv {requested_conversation_id_str}: {auth_err}")
+        logger.error(f"[CHAT_API] Auth error: {auth_err}")
         raise auth_err
     except Exception as e:
+        logger.error(f"[CHAT_API] General Exception: {e}", exc_info=True)
         total_duration_ms = int((time.time() - total_start) * 1000)
         await log_api_performance(
             sb_client,
@@ -1036,7 +1042,7 @@ async def refresh_jwt_token(Authorization: str = Header(None), sb_client: AsyncC
             logger.error("JWT missing 'sub' or 'bng' claim.")
             raise credentials_exception
         # Fetch refresh token from Supabase user metadata
-        user_resp = await sb_client.table("users").select("raw_user_meta_data").eq("id", user_sub).maybe_single().execute()
+        user_resp = await sb_client.table("profiles").select("raw_user_meta_data").eq("id", user_sub).maybe_single().execute()
         refresh_token = None
         if user_resp.data and user_resp.data.get("raw_user_meta_data"):
             meta = user_resp.data["raw_user_meta_data"]
@@ -1059,7 +1065,7 @@ async def refresh_jwt_token(Authorization: str = Header(None), sb_client: AsyncC
                 "bungie_refresh_token": refresh_token,
                 "bungie_token_expires": expires_at_utc.isoformat()
             }
-            update_resp = await sb_client.table("users").update({"raw_user_meta_data": metadata_update}).eq("id", user_sub).execute()
+            update_resp = await sb_client.table("profiles").update({"raw_user_meta_data": metadata_update}).eq("id", user_sub).execute()
             if update_resp.error:
                 logger.error(f"Failed to update Supabase user metadata: {update_resp.error}")
                 raise credentials_exception
@@ -1265,6 +1271,16 @@ async def get_user_profile(current_user: SupabaseUser = Depends(get_supabase_use
     except Exception as e:
         logger.error(f"Error fetching profile for user {getattr(current_user, 'uuid', None)}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch user profile.")
+
+@app.post("/agent/stream")
+async def agent_stream_endpoint(request: Request):
+    data = await request.json()
+    run_input = RunAgentInput(**data)
+    agent_service = get_agent_service()
+    return StreamingResponse(
+        agent_service.stream_agent_events(run_input),
+        media_type="text/event-stream"
+    )
 
 if __name__ == "__main__":
     import uvicorn

@@ -44,6 +44,28 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langchain.prompts import PromptTemplate
 from web_app.backend.weapons_agent_tools import WEAPONS_AGENT_TOOLS
 from web_app.backend.common_agent_tools import COMMON_AGENT_TOOLS  # Shared tools (e.g., web search)
+from ag_ui.core import (
+    EventType,
+    RunStartedEvent,
+    RunFinishedEvent,
+    StepStartedEvent,
+    StepFinishedEvent,
+    TextMessageStartEvent,
+    TextMessageContentEvent,
+    TextMessageEndEvent,
+    RunErrorEvent,
+    StateSnapshotEvent,
+    StateDeltaEvent,
+    ToolCallStartEvent,
+    ToolCallArgsEvent,
+    ToolCallEndEvent,
+    RunAgentInput,
+)
+from ag_ui.encoder import EventEncoder
+import uuid
+
+# Import LangChain message types
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage, AIMessageChunk
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +174,6 @@ async def _get_weapons_impl(service: 'DestinyAgentService', membership_type: int
     user_uuid = service._current_user_uuid  # Must be a valid UUID string
 
     # TODO: Ensure _current_user_uuid is set at authentication/session start
-    import uuid
     if not user_uuid or not isinstance(user_uuid, str):
         logger.error(f"Supabase user_uuid is not set or not a string: {user_uuid}")
         raise Exception("Supabase user_uuid must be set to a valid UUID string before querying weapons.")
@@ -732,6 +753,15 @@ class DestinyAgentService:
         )
         self.checkpointer = InMemorySaver()
         self.agent = None  # Will be created per request or on demand
+        # --- AG-UI Event Stream Management ---
+        self.agui_streams = {}  # stream_id -> AGUIEventStream instance
+
+        # --- Initialize current user context attributes ---
+        self._current_user_uuid: Optional[str] = None
+        self._current_access_token: Optional[str] = None
+        self._current_bungie_id: Optional[str] = None
+        self._sheet_cache: Dict[str, Any] = {} # Initialize sheet cache
+        self._user_info_cache: Dict[str, Any] = {} # Initialize user info cache
 
     async def _load_agent_tools(self):
         # Wrap only user-specific tools to inject user_uuid
@@ -784,63 +814,104 @@ class DestinyAgentService:
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
         self._current_user_uuid = supabase_uuid
-        if persona:
-            effective_system_prompt = self.get_effective_system_prompt(persona, self._current_user_uuid)
-            logger.info(f"Using effective system prompt for persona '{persona}': '{effective_system_prompt[:150]}...'")
-            prompt_version = hashlib.sha256(effective_system_prompt.encode("utf-8")).hexdigest()[:8]
-            agent_to_use = await self._create_agent_internal(
-                instructions=effective_system_prompt,
-                persona=persona,
-                prompt_version=prompt_version,
-                history=history,
-                conversation_id=conversation_id,
-                message_id=message_id,
-            )
-        else:
-            effective_system_prompt = self.get_effective_system_prompt(None, self._current_user_uuid)
-            prompt_version = hashlib.sha256(effective_system_prompt.encode("utf-8")).hexdigest()[:8]
-            agent_to_use = await self._create_agent_internal(
-                instructions=effective_system_prompt,
-                persona=None,
-                prompt_version=prompt_version,
-                history=history,
-                conversation_id=conversation_id,
-                message_id=message_id,
-            )
-        # LangGraph agents do not have a .memory attribute; state is managed by the checkpointer and thread_id.
-        # if history:
-        #     agent_to_use.memory.chat_memory.messages = history
-        # When using checkpointer, pass conversation_id as thread_id in config
-        config = {
-            "configurable": {"thread_id": conversation_id or "default-thread"},
-            "metadata": {
-                "persona": persona,
-                "prompt_version": prompt_version if 'prompt_version' in locals() else None,
-                "conversation_id": conversation_id,
-                "user_id": self._current_user_uuid,
-                "message_id": message_id,
-            }
-        }
-        # Only the latest user message is required; agent will load full state from checkpointer
-        user_message = {"role": "user", "content": prompt}
+        # --- AG-UI: Start a new event stream for this run ---
         import time
-        total_start = time.time()
+        stream_id = conversation_id or f"{supabase_uuid}-{int(time.time())}"
+        agui_stream = AGUIEventStream()
+        self.agui_streams[stream_id] = agui_stream
         try:
+            if persona:
+                effective_system_prompt = self.get_effective_system_prompt(persona, self._current_user_uuid)
+                logger.info(f"Using effective system prompt for persona '{persona}': '{effective_system_prompt[:150]}...'")
+                prompt_version = hashlib.sha256(effective_system_prompt.encode("utf-8")).hexdigest()[:8]
+                agent_to_use = await self._create_agent_internal(
+                    instructions=effective_system_prompt,
+                    persona=persona,
+                    prompt_version=prompt_version,
+                    history=history,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                )
+            else:
+                effective_system_prompt = self.get_effective_system_prompt(None, self._current_user_uuid)
+                prompt_version = hashlib.sha256(effective_system_prompt.encode("utf-8")).hexdigest()[:8]
+                agent_to_use = await self._create_agent_internal(
+                    instructions=effective_system_prompt,
+                    persona=None,
+                    prompt_version=prompt_version,
+                    history=history,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                )
+            # LangGraph agents do not have a .memory attribute; state is managed by the checkpointer and thread_id.
+            # if history:
+            #     agent_to_use.memory.chat_memory.messages = history
+            # When using checkpointer, pass conversation_id as thread_id in config
+            config = {
+                "configurable": {"thread_id": conversation_id or "default-thread"},
+                "metadata": {
+                    "persona": persona,
+                    "prompt_version": prompt_version if 'prompt_version' in locals() else None,
+                    "conversation_id": conversation_id,
+                    "user_id": self._current_user_uuid,
+                    "message_id": message_id,
+                }
+            }
+            # Only the latest user message is required; agent will load full state from checkpointer
+            user_message = {"role": "user", "content": prompt}
+            total_start = time.time()
             logger.info(f"AGENT_SERVICE_RUN_CHAT: incoming request: user_uuid={self._current_user_uuid}, message={prompt!r}, persona={persona!r}")
+            # Example: Emit an initial lifecycle event (agent started)
+            event = AGUIEvent(
+                type=AGUIEventType.LIFECYCLE,
+                content="Agent run started",
+                metadata={"stream_id": stream_id, "persona": persona}
+            )
+            await agui_stream.send(event)
+            # --- AG-UI: Emit events during agent reasoning ---
+            # TODO: Integrate with agent's step/callbacks to emit 'text-delta', 'tool-call', etc.
+            # For now, emit a placeholder 'thinking' event
+            thinking_event = AGUIEvent(
+                type=AGUIEventType.TEXT_DELTA,
+                content="Agent is thinking...",
+                metadata={"stream_id": stream_id}
+            )
+            await agui_stream.send(thinking_event)
             response_obj = await agent_to_use.ainvoke({"messages": [user_message]}, config=config)
             logger.info(f"AGENT_SERVICE_RAW_RESPONSE_OBJ: {response_obj!r}")
 
             # Only return the assistant's message content as a string
             if "output" in response_obj and isinstance(response_obj["output"], str):
+                # Example: Emit a final lifecycle event (agent finished)
+                finish_event = AGUIEvent(
+                    type=AGUIEventType.LIFECYCLE,
+                    content="Agent run finished",
+                    metadata={"stream_id": stream_id, "persona": persona}
+                )
+                await agui_stream.send(finish_event)
                 return response_obj["output"].strip()
             elif "messages" in response_obj:
                 messages = response_obj["messages"]
                 # Find the last AIMessage (assistant message) and return its content
                 for msg in reversed(messages):
                     if hasattr(msg, "content") and getattr(msg, "type", None) == "ai":
+                        # Example: Emit a final lifecycle event (agent finished)
+                        finish_event = AGUIEvent(
+                            type=AGUIEventType.LIFECYCLE,
+                            content="Agent run finished",
+                            metadata={"stream_id": stream_id, "persona": persona}
+                        )
+                        await agui_stream.send(finish_event)
                         return msg.content.strip()
                     # For LangChain, AIMessage type may be 'AIMessage'
                     if msg.__class__.__name__ == "AIMessage" and hasattr(msg, "content"):
+                        # Example: Emit a final lifecycle event (agent finished)
+                        finish_event = AGUIEvent(
+                            type=AGUIEventType.LIFECYCLE,
+                            content="Agent run finished",
+                            metadata={"stream_id": stream_id, "persona": persona}
+                        )
+                        await agui_stream.send(finish_event)
                         return msg.content.strip()
                 # If no assistant message found, return error string
                 return "[Agent Error] No assistant message returned."
@@ -863,6 +934,206 @@ class DestinyAgentService:
             self._current_access_token = None
             self._current_bungie_id = None
             self._current_user_uuid = None
+            # --- AG-UI: Clean up the event stream ---
+            if stream_id in self.agui_streams:
+                del self.agui_streams[stream_id]
+
+    async def stream_agent_events(self, run_input: RunAgentInput):
+        """
+        Run the LangGraph agent and yield AG-UI events for SSE.
+        """
+        encoder = EventEncoder()
+        thread_id = run_input.thread_id or str(uuid.uuid4())
+        run_id = run_input.run_id or str(uuid.uuid4())
+        messages = run_input.messages or []
+        persona_config = run_input.forwarded_props.get('persona') if isinstance(run_input.forwarded_props, dict) else None
+        persona = persona_config if isinstance(persona_config, str) else None
+
+        user_uuid_for_prompt = self._current_user_uuid # Will be None if not set by prior auth
+
+        # Try to get user_uuid from context or forwarded_props if not already set
+        if not user_uuid_for_prompt:
+            if hasattr(run_input, 'context') and isinstance(run_input.context, dict):
+                user_uuid_for_prompt = run_input.context.get('user_uuid')
+            if not user_uuid_for_prompt and hasattr(run_input, 'forwarded_props') and isinstance(run_input.forwarded_props, dict):
+                user_uuid_for_prompt = run_input.forwarded_props.get('user_uuid')
+            if not user_uuid_for_prompt:
+                user_uuid_for_prompt = "default-streaming-user-uuid" # Fallback
+                logger.warning(f"Using fallback user_uuid for prompt: {user_uuid_for_prompt}")
+            else:
+                logger.info(f"Using user_uuid for prompt from input: {user_uuid_for_prompt}")
+
+        logger.info(f"stream_agent_events: thread_id={thread_id}, run_id={run_id}, persona='{persona}', user_uuid_for_prompt='{user_uuid_for_prompt}'")
+
+        # 1. Emit RUN_STARTED
+        logger.info(f"Yielding RUN_STARTED event for run_id: {run_id}")
+        yield encoder.encode(RunStartedEvent(type=EventType.RUN_STARTED, thread_id=thread_id, run_id=run_id))
+
+        # Convert AG-UI messages to LangChain messages
+        lc_messages: List[BaseMessage] = []
+        if run_input.messages:
+            for ag_ui_msg in run_input.messages:
+                if ag_ui_msg.role == "user":
+                    # Ensure name is passed if available, LangChain HumanMessage accepts it
+                    lc_messages.append(HumanMessage(
+                        content=ag_ui_msg.content,
+                        id=ag_ui_msg.id, # Pass ID
+                        name=getattr(ag_ui_msg, 'name', None) # Pass name if it exists
+                    ))
+                elif ag_ui_msg.role == "assistant":
+                    lc_messages.append(AIMessage(
+                        content=ag_ui_msg.content,
+                        id=ag_ui_msg.id
+                    ))
+                # Add other roles if necessary (e.g., system)
+
+        logger.info(f"Converted {len(run_input.messages or [])} AG-UI messages to {len(lc_messages)} LangChain messages for agent input.")
+
+        try:
+            # 2. Create agent and config
+            # Ensure _current_user_uuid is correctly set for agent creation tools if needed,
+            # or adjust _create_agent_internal and _load_agent_tools to accept it or derive it.
+            # For now, _create_agent_internal uses self._current_user_uuid which might be None here.
+            # This is a potential issue.
+            effective_prompt = self.get_effective_system_prompt(persona, user_uuid_for_prompt)
+            logger.info(f"stream_agent_events: Using effective prompt: {effective_prompt[:100]}...")
+
+            # Temporarily set self._current_user_uuid FOR THIS STREAM if not set and found in input
+            # This is for tools that might rely on the instance attribute.
+            original_instance_user_uuid = self._current_user_uuid
+            if not self._current_user_uuid and user_uuid_for_prompt != "default-streaming-user-uuid":
+                self._current_user_uuid = user_uuid_for_prompt
+                logger.warning(f"Temporarily set self._current_user_uuid to {self._current_user_uuid} for stream duration.")
+            
+            agent = await self._create_agent_internal(
+                instructions=effective_prompt,
+                persona=persona,
+                # prompt_version=None, # Not strictly needed for streaming like this
+                # history=messages, # LangGraph handles history via checkpointer/thread_id
+                # conversation_id=thread_id, # Passed in config
+                # message_id=None,
+            )
+            config = {
+                "configurable": {"thread_id": thread_id}, # LangGraph uses this for state
+                "metadata": {"persona": persona, "run_id": run_id, "user_id": user_uuid_for_prompt},
+            }
+
+            # 3. Run agent with streaming
+            message_id = str(uuid.uuid4()) # For assistant's message
+            current_tool_call_id: Optional[str] = None
+            current_tool_call_name: Optional[str] = None
+            accumulated_content = "" 
+            final_ai_message_content = None 
+            last_yielded_content_chunk = None # Stores the last non-empty chunk yielded
+
+            agent_input = {"messages": lc_messages}
+
+            logger.info(f"Starting agent.astream_log for run_id: {run_id}, thread_id: {thread_id}")
+
+            # Emit TEXT_MESSAGE_START once, assuming the agent will produce text.
+            # This might need to be more dynamic if the first event isn't text.
+            logger.info(f"Yielding TEXT_MESSAGE_START event (message_id: {message_id}) for run_id: {run_id}")
+            yield encoder.encode(TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, message_id=message_id, role="assistant"))
+            
+            text_stream_started = True # Assume for now, adjust if needed
+
+            async for log_entry in agent.astream_log(agent_input, config=config, include_types=['llm', 'tool', 'chat_model', 'agent'], include_names=None, include_tags=None):
+                logger.debug(f"ASTREAM_LOG_ENTRY for run_id {run_id}: raw log_entry.ops: {log_entry.ops}") 
+                
+                # To prevent duplicate content from AIMessageChunk and its string version in the same log_entry
+                # This variable is reset for each new log_entry
+                processed_content_for_this_log_entry = None 
+
+                for op in log_entry.ops:
+                    path = op.get("path", "")
+                    value = op.get("value")
+                    logger.debug(f"  Processing op: path='{path}', value_type='{type(value).__name__}', value_preview='{str(value)[:100]}'") 
+
+                    if path.endswith(('/streamed_output/-', '/streamed_output_str/-')):
+                        content_chunk = None
+                        is_aimessage_chunk_content = False
+                        is_string_content = False
+
+                        if isinstance(value, AIMessageChunk):
+                            content_chunk = value.content
+                            is_aimessage_chunk_content = True
+                        elif isinstance(value, str):
+                            content_chunk = value
+                            is_string_content = True
+                        
+                        # Ensure content_chunk is a string for comparison, even if None initially
+                        current_content_str = content_chunk if content_chunk is not None else ""
+
+                        # Only yield if the chunk is non-empty AND different from the last yielded chunk
+                        if current_content_str and current_content_str != last_yielded_content_chunk:
+                            # Check if we've already processed effectively identical content in this log_entry
+                            # (e.g. from AIMessageChunk vs its string version)
+                            if processed_content_for_this_log_entry is not None and \
+                               current_content_str == processed_content_for_this_log_entry:
+                                logger.debug(f"  Skipping redundant content_chunk (already processed in this log_entry): '{current_content_str}'")
+                                continue        
+
+                            logger.info(f"Yielding TEXT_MESSAGE_CONTENT with delta: '{current_content_str}' for run_id: {run_id}")
+                            yield encoder.encode(TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, message_id=message_id, delta=current_content_str))
+                            accumulated_content += current_content_str
+                            last_yielded_content_chunk = current_content_str # Update last yielded chunk
+                            
+                            # Mark this content as processed for the current log_entry to avoid immediate duplication
+                            # from a paired AIMessageChunk/string op within the same log_entry.ops
+                            if is_aimessage_chunk_content or is_string_content:
+                                processed_content_for_this_log_entry = current_content_str
+
+                        elif not current_content_str:
+                            logger.debug(f"  Skipping empty content_chunk for path {path}. Value: {str(value)[:100]}")
+                        elif current_content_str == last_yielded_content_chunk:
+                            logger.debug(f"  Skipping identical consecutive content_chunk: '{current_content_str}'")
+                    
+                    elif path.endswith("/final_output") and isinstance(value, dict):
+                        generations = value.get('generations')
+                        if generations and isinstance(generations, list) and generations[0] and isinstance(generations[0], list) and generations[0][0]:
+                            msg_obj = generations[0][0].get('message')
+                            if msg_obj and isinstance(msg_obj, AIMessage):
+                                final_ai_message_content = msg_obj.content
+                                logger.info(f"Captured final_ai_message_content: '{final_ai_message_content}' from final_output for run_id: {run_id}")
+
+                    # ... (experimental logic for tool calls, steps etc. can remain here)
+                    # Ensure it doesn't prematurely yield TEXT_MESSAGE_END
+
+            # After the loop, if no content was streamed but we captured a final AI message, send it now.
+            if not accumulated_content and final_ai_message_content:
+                logger.info(f"Yielding TEXT_MESSAGE_CONTENT with captured final AI message: '{final_ai_message_content}' for run_id: {run_id}")
+                yield encoder.encode(TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, message_id=message_id, delta=final_ai_message_content))
+                accumulated_content = final_ai_message_content # Ensure it's marked as sent
+            elif not accumulated_content and not final_ai_message_content:
+                # If still no content, DO NOT yield an empty content event as it causes validation errors.
+                # The TEXT_MESSAGE_START and TEXT_MESSAGE_END events will signify an empty message attempt.
+                logger.warning(f"No content streamed or captured for message_id {message_id}. SKIPPING empty TEXT_MESSAGE_CONTENT event.")
+
+
+            logger.info(f"Yielding TEXT_MESSAGE_END event (message_id: {message_id}) for run_id: {run_id}")
+            yield encoder.encode(TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=message_id))
+            
+            if current_tool_call_id: # If a tool call was started but not explicitly ended by node status
+                logger.warning(f"Tool call {current_tool_call_id} was active but not explicitly ended by step finish. Ending it now.")
+                yield encoder.encode(ToolCallEndEvent(type=EventType.TOOL_CALL_END, tool_call_id=current_tool_call_id))
+
+
+            logger.info(f"Yielding RUN_FINISHED event for run_id: {run_id}")
+            yield encoder.encode(RunFinishedEvent(type=EventType.RUN_FINISHED, thread_id=thread_id, run_id=run_id))
+
+        except Exception as e:
+            logger.error(f"Error during agent streaming for run_id {run_id}: {e}", exc_info=True)
+            logger.info(f"Yielding RUN_ERROR event for run_id: {run_id}")
+            # Corrected RunErrorEvent instantiation
+            yield encoder.encode(RunErrorEvent(type=EventType.RUN_ERROR, message=str(e)))
+            # Always finish the run, even on error
+            logger.info(f"Yielding RUN_FINISHED event (after error) for run_id: {run_id}")
+            yield encoder.encode(RunFinishedEvent(type=EventType.RUN_FINISHED, thread_id=thread_id, run_id=run_id))
+        finally:
+            # Clean up _current_user_uuid if it was temporarily set for this stream
+            if self._current_user_uuid != original_instance_user_uuid: # Checks if it was changed
+                self._current_user_uuid = original_instance_user_uuid # Revert to original state
+                logger.info(f"Reverted self._current_user_uuid to its original state: {original_instance_user_uuid or 'None'}")
 
 # --- LangChain Tool Wrappers ---
 def make_async_tool(name, description, func):
@@ -886,20 +1157,20 @@ async def lc_get_weapons(membership_type: int, membership_id: str, service=None)
 async def lc_get_catalysts(user_uuid: str, service=None):
     return await _get_catalysts_impl(service, user_uuid)
 
+_agent_service: Optional[DestinyAgentService] = None
 
-# Function to get AgentService (dependency for FastAPI)
-# This needs to be updated if AgentService __init__ changes significantly,
-# but since __init__ now takes pre-configured services passed from main.py's startup,
-# this function might just return the global agent_service_instance initialized in main.py.
-# For now, we assume agent_service_instance is correctly populated in main.py's startup.
+def set_global_agent_service(service_instance: DestinyAgentService):
+    """Sets the global agent service instance."""
+    global _agent_service
+    _agent_service = service_instance
+    logger.info("Global _agent_service has been set.")
 
-def get_agent_service() -> DestinyAgentService:
-    from web_app.backend.main import agent_service_instance # Access the global instance from main
-    if agent_service_instance is None:
-        # This should not happen if main.py startup_event completed successfully.
+def get_agent_service():
+    global _agent_service
+    if _agent_service is None:
         logger.error("AgentService not initialized. Check main.py startup_event.")
         raise Exception("AgentService not available. Initialization failed.")
-    return agent_service_instance 
+    return _agent_service
 
 def inject_user_uuid_tool(tool, user_uuid, sb_client):
     async def wrapper(*args, **kwargs):

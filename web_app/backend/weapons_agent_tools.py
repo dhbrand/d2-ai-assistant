@@ -1,4 +1,4 @@
-from langchain.tools import Tool
+from langchain.tools import Tool, StructuredTool
 from typing import List, Dict, Optional, Any, Union
 import pandas as pd
 import difflib
@@ -7,24 +7,94 @@ import os
 import asyncio
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from pydantic import BaseModel, ValidationError, Field
 
-# Async tool to fetch all weapons for a user from Supabase
-async def get_user_weapons_backend(user_uuid: str, sb_client) -> List[Dict]:
+# Table schema for user_weapon_inventory (for tool description)
+USER_WEAPON_INVENTORY_SCHEMA = [
+    "item_instance_id", "item_hash", "weapon_name", "weapon_type", "intrinsic_perk",
+    "col1_plugs", "col2_plugs", "col3_trait1", "col4_trait2", "origin_trait",
+    "masterwork", "weapon_mods", "shaders", "location", "is_equipped", "last_updated", "is_adept", "user_id"
+]
+
+# Async tool to fetch all weapons for a user from Supabase, with flexible query support
+async def get_user_weapons_backend(user_uuid: str, sb_client, filters: dict = None, fuzzy_filters: dict = None, aggregate: str = None, group_by: str = None) -> Any:
     """
-    Fetch all weapons for a user from the user_weapon_inventory table using their user_uuid.
+    Fetches weapons for a user from the user_weapon_inventory table, with optional filtering, fuzzy filtering, aggregation, and grouping.
+    Args:
+        user_uuid: The user's UUID (injected by backend).
+        filters: Optional dict of column-value pairs for exact match (e.g., {"weapon_type": "Pulse Rifle"}).
+        fuzzy_filters: Optional dict of column-value pairs for partial/case-insensitive match (e.g., {"weapon_name": "rifle"}).
+        aggregate: Optional aggregate function ("count").
+        group_by: Optional column to group by (e.g., "weapon_type").
+    Returns:
+        - If aggregate is set, returns the aggregate result (e.g., count).
+        - If filters/group_by are set, returns filtered/grouped results.
+        - Otherwise, returns the full weapon list.
     """
-    result = await sb_client.table("user_weapon_inventory").select("*").eq("user_id", user_uuid).execute()
-    return result.data or []
+    # For count, use count="exact" and do NOT fetch all rows
+    if aggregate == "count":
+        query = sb_client.table("user_weapon_inventory").select("*", count="exact").eq("user_id", user_uuid)
+        if filters:
+            for col, val in filters.items():
+                query = query.eq(col, val)
+        if fuzzy_filters:
+            for col, val in fuzzy_filters.items():
+                query = query.ilike(col, f"%{val}%")
+        result = await query.execute()
+        count = result.count if hasattr(result, "count") and result.count is not None else (len(result.data) if result.data else 0)
+        if group_by:
+            from collections import Counter
+            group_counts = Counter(item.get(group_by) for item in (result.data or []))
+            return dict(group_counts)
+        return {"count": count}
+    # For all other queries, always fetch up to 10,000 rows (disables pagination for most use cases)
+    query = sb_client.table("user_weapon_inventory").select("*").eq("user_id", user_uuid).range(0, 9999)
+    if filters:
+        for col, val in filters.items():
+            query = query.eq(col, val)
+    if fuzzy_filters:
+        for col, val in fuzzy_filters.items():
+            query = query.ilike(col, f"%{val}%")
+    if group_by:
+        result = await query.execute()
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for item in (result.data or []):
+            if "weapon_type" not in item:
+                item["weapon_type"] = "Unknown"
+            grouped[item.get(group_by)].append(item)
+        return dict(grouped)
+    result = await query.execute()
+    weapons = result.data or []
+    for w in weapons:
+        if "weapon_type" not in w:
+            w["weapon_type"] = "Unknown"
+    return weapons
 
 # Wrapper for agent: user_uuid is injected by backend, not by agent
-async def get_user_weapons_agent(*, sb_client, user_uuid=None, **kwargs):
+async def get_user_weapons_agent(*, sb_client, user_uuid=None, filters=None, fuzzy_filters=None, aggregate=None, group_by=None, **kwargs):
     if not user_uuid:
         raise Exception("user_uuid must be injected by the backend.")
-    return await get_user_weapons_backend(user_uuid, sb_client)
+    return await get_user_weapons_backend(user_uuid, sb_client, filters=filters, fuzzy_filters=fuzzy_filters, aggregate=aggregate, group_by=group_by)
 
 user_weapons_tool = Tool(
     name="get_user_weapons",
-    description="Fetches all weapons for the current user. No arguments required.",
+    description=(
+        "Fetches weapons for the current user from the user_weapon_inventory table. "
+        "Supports optional exact filtering (filters), fuzzy filtering (fuzzy_filters), aggregation, and grouping.\n"
+        "Available columns for filtering/grouping: " + ", ".join(USER_WEAPON_INVENTORY_SCHEMA) + ".\n"
+        "Parameters:\n"
+        "- filters: dict of column-value pairs for exact match (e.g., {'weapon_type': 'Pulse Rifle'}).\n"
+        "- fuzzy_filters: dict of column-value pairs for partial/case-insensitive match (e.g., {'weapon_name': 'rifle'}).\n"
+        "- aggregate: 'count' to get the number of matching weapons.\n"
+        "- group_by: column name to group results (e.g., 'weapon_type').\n"
+        "Examples:\n"
+        "- get_user_weapons(aggregate='count')  # Count all weapons\n"
+        "- get_user_weapons(filters={'weapon_type': 'Pulse Rifle'}, aggregate='count')  # Count pulse rifles (exact match)\n"
+        "- get_user_weapons(fuzzy_filters={'weapon_name': 'rifle'})  # List weapons with 'rifle' in the name (fuzzy match)\n"
+        "- get_user_weapons(group_by='weapon_type', aggregate='count')  # Count by weapon type\n"
+        "Returns either a list of weapons, a count, or a grouped summary."
+    ),
     func=get_user_weapons_agent,
     coroutine=get_user_weapons_agent,
 )
@@ -40,7 +110,11 @@ async def get_pve_bis_weapons() -> List[Dict]:
         csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={sheet_gid}"
         df = pd.read_csv(csv_url)
         df.dropna(how='all', inplace=True)
-        return df.to_dict(orient='records')
+        data = df.to_dict(orient='records')
+        for w in data:
+            if "weapon_type" not in w:
+                w["weapon_type"] = "Unknown"
+        return data
     return await asyncio.to_thread(_read)
 
 pve_bis_weapons_tool = Tool(
@@ -61,7 +135,11 @@ async def get_pve_activity_bis_weapons() -> List[Dict]:
         csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={sheet_gid}"
         df = pd.read_csv(csv_url)
         df.dropna(how='all', inplace=True)
-        return df.to_dict(orient='records')
+        data = df.to_dict(orient='records')
+        for w in data:
+            if "weapon_type" not in w:
+                w["weapon_type"] = "Unknown"
+        return data
     return await asyncio.to_thread(_read)
 
 pve_activity_bis_weapons_tool = Tool(
@@ -107,6 +185,9 @@ async def get_endgame_analysis_data(sheet_name: Optional[str] = None) -> Any:
         df = pd.read_csv(csv_url)
         df.dropna(how='all', inplace=True)
         data = df.to_dict(orient='records')
+        for w in data:
+            if "weapon_type" not in w:
+                w["weapon_type"] = "Unknown"
         if len(data) > 200:
             return f"Sheet '{selected_sheet}' contains {len(data)} rows, which is too large to return directly. Please ask a more specific query about this sheet."
         return data
@@ -120,7 +201,16 @@ endgame_analysis_tool = Tool(
 )
 
 # --- Weapon Roll Evaluation Tool ---
-from typing import Union
+
+class WeaponRoll(BaseModel):
+    archetype: str
+    column3: str
+    column4: str
+    # Add more fields as needed
+
+class WeaponRollList(BaseModel):
+    weapons: List[WeaponRoll] = Field(..., description="List of weapon rolls to evaluate.")
+    context: str = Field("pve_group", description="Context for evaluation: 'pve_solo', 'pve_group', or 'pvp'.")
 
 # Example synergy matrix and archetype weights (expand as needed)
 PERK_SYNERGY_MATRIX = {
@@ -138,43 +228,29 @@ ARCHETYPE_WEIGHTS = {
 TIER_THRESHOLDS = [(9, "S"), (7, "A"), (5, "B"), (0, "C")]
 
 async def evaluate_weapon_rolls(
-    weapons: Union[dict, list],
+    weapons: Union[List[WeaponRoll], WeaponRoll],
     context: str = "pve_group"
 ) -> Union[dict, list]:
     """
     Evaluates one or more Destiny 2 weapon rolls for a given context (e.g., PvE solo, PvE group, PvP).
     Returns a score, tier, and explanation for each weapon.
-    Args:
-        weapons: A single weapon dict or a list of weapon dicts. Each dict should have at least:
-            - 'archetype' (str)
-            - 'column3' (str): Perk in column 3
-            - 'column4' (str): Perk in column 4
-        context: One of 'pve_solo', 'pve_group', 'pvp'.
-    Returns:
-        For single weapon: dict with 'score', 'tier', 'explanation'.
-        For list: list of such dicts (one per weapon).
+    Input must be a WeaponRoll or list of WeaponRolls, plus context.
     """
-    def score_weapon(weapon):
-        archetype = weapon.get("archetype", "").lower()
-        c3 = weapon.get("column3", "").lower()
-        c4 = weapon.get("column4", "").lower()
+    def score_weapon(weapon: WeaponRoll):
+        archetype = weapon.archetype.lower()
+        c3 = weapon.column3.lower()
+        c4 = weapon.column4.lower()
         perks = (c3, c4)
-        # Synergy score
         synergy_score = PERK_SYNERGY_MATRIX.get(perks, 0)
-        # Archetype weighting
         arch_weights = ARCHETYPE_WEIGHTS.get(archetype, {})
         arch_score = arch_weights.get(c3, 0) + arch_weights.get(c4, 0)
-        # Context bonus (expand as needed)
         context_bonus = 0
         if context == "pve_solo" and c3 in ["wellspring", "heal clip"]:
             context_bonus += 1
         if context == "pvp" and c3 in ["rangefinder", "opening shot"]:
             context_bonus += 1
-        # Total score
         total = synergy_score + arch_score + context_bonus
-        # Tier
         tier = next(t for thresh, t in TIER_THRESHOLDS if total >= thresh)
-        # Explanation
         explanation = f"{c3.title()} + {c4.title()} on a {archetype.title()} scores {total}/10 for {context.replace('_', ' ').upper()}. "
         if synergy_score:
             explanation += f"This combo is highly synergistic. "
@@ -188,19 +264,26 @@ async def evaluate_weapon_rolls(
             "score": total,
             "tier": tier,
             "explanation": explanation.strip(),
-            "weapon": weapon,
+            "weapon": weapon.dict(),
         }
-    # Handle batch or single
+    # Accept both single and batch
     if isinstance(weapons, list):
         return [score_weapon(w) for w in weapons]
-    else:
+    elif isinstance(weapons, WeaponRoll):
         return score_weapon(weapons)
+    else:
+        return {"error": f"Input must be a WeaponRoll or list of WeaponRolls. Got: {type(weapons).__name__}"}
 
-evaluate_weapon_rolls_tool = Tool(
+evaluate_weapon_rolls_tool = StructuredTool.from_function(
+    func=lambda weapons, context="pve_group": evaluate_weapon_rolls(weapons=weapons, context=context),
     name="evaluate_weapon_rolls",
-    description="Evaluates one or more Destiny 2 weapon rolls for a given context (e.g., PvE solo, PvE group, PvP). Returns a score, tier, and explanation for each weapon. Pass a single weapon dict or a list of weapon dicts, plus a context string.",
-    func=evaluate_weapon_rolls,
-    coroutine=evaluate_weapon_rolls,
+    description=(
+        "Evaluates one or more Destiny 2 weapon rolls for a given context (PvE solo, PvE group, PvP). "
+        "Input must be a WeaponRoll or a list of WeaponRolls, plus context. "
+        "Example (single): {'weapons': [{'archetype': 'fusion rifle', 'column3': 'demolitionist', 'column4': 'chill clip'}], 'context': 'pve_group'}. "
+        "Returns a score, tier, and explanation for each weapon."
+    ),
+    args_schema=WeaponRollList,
 )
 
 # Export all tools

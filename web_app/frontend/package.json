@@ -9,6 +9,7 @@
     "@mui/material": "^5.14.18",
     "@supabase/supabase-js": "^2.49.4",
     "axios": "^1.6.2",
+    "eventsource-parser": "^3.0.2",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-markdown": "^10.1.0",
@@ -16,7 +17,8 @@
     "react-scripts": "5.0.1",
     "recharts": "^2.9.3",
     "rehype-raw": "^7.0.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "uuid": "^11.1.0"
   },
   "scripts": {
     "start": "HTTPS=true SSL_CRT_FILE=$(pwd)/../cert.pem SSL_KEY_FILE=$(pwd)/../key.pem react-scripts start",
@@ -49,5 +51,6 @@
     "@testing-library/react": "^16.3.0",
     "babel-jest": "^29.7.0",
     "identity-obj-proxy": "^3.0.0"
-  }
+  },
+  "proxy": "https://localhost:8000"
 }
