@@ -41,6 +41,9 @@ from langgraph.prebuilt import create_react_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.checkpoint.memory import InMemorySaver
+from langchain.prompts import PromptTemplate
+from web_app.backend.weapons_agent_tools import WEAPONS_AGENT_TOOLS
+from web_app.backend.common_agent_tools import COMMON_AGENT_TOOLS  # Shared tools (e.g., web search)
 
 logger = logging.getLogger(__name__)
 
@@ -717,64 +720,40 @@ class DestinyAgentService:
         self.weapon_api = weapon_api
         self.sb_client = sb_client
         self.manifest_service = manifest_service
-
         prompts = load_prompts()
         self.DEFAULT_AGENT_SYSTEM_PROMPT = load_system_prompt()
-        self.AGENT_CORE_ABILITIES_PROMPT = prompts["default"]["core_abilities"]
-        self.SUPABASE_MCP_ACCESS_PROMPT = prompts["default"]["supabase_access"]
-        self.EMOJI_ENCOURAGEMENT = prompts["default"]["emoji_encouragement"]
         self.persona_map = load_personas()
-
-        self.supabase_mcp_server = None
-        self.supabase_mcp_server_started = False
-        self._main_agent_mcp_servers = []
-        self._current_access_token: Optional[str] = None
-        self._current_bungie_id: Optional[str] = None
-        self._current_user_uuid: Optional[str] = None
-        self._current_project_id = self.SUPABASE_PROJECT_ID
-        self._user_info_cache: Dict[str, tuple] = {}
-        self._sheet_cache: Dict[str, tuple] = {}
-        # LangSmith tracing is preserved if env vars are set
-
-        # MCP client setup for Supabase MCP server
-        self.mcp_client = MultiServerMCPClient({
-            "supabase": {
-                "command": "npx",
-                "args": [
-                    "-y",
-                    "@supabase/mcp-server-supabase@latest",
-                    "--access-token",
-                    os.getenv("SUPABASE_ACCESS_TOKEN", "<your-personal-access-token>"),
-                    "--project-ref",
-                    self.SUPABASE_PROJECT_ID,
-                ],
-                "transport": "stdio",
-            }
-        })
-        # LangGraph checkpointer for persistent memory (swap for Redis in prod)
+        self.system_prompt_template = PromptTemplate(
+            input_variables=[
+                "role", "objective", "context", "tools", "tasks",
+                "operating_guidelines", "constraints", "persona_instructions", "user_uuid"
+            ],
+            template=load_system_prompt()
+        )
         self.checkpointer = InMemorySaver()
         self.agent = None  # Will be created per request or on demand
 
-    async def _load_mcp_tools(self):
-        # Loads MCP tools from the Supabase MCP server
-        async with self.mcp_client.session("supabase") as session:
-            await session.initialize()
-            tools = await load_mcp_tools(session)
-            return tools
-
-    def get_persona_prompt(self, persona_name: str) -> str:
-        return self.persona_map.get(persona_name, f"{self.DEFAULT_AGENT_SYSTEM_PROMPT}")
+    async def _load_agent_tools(self):
+        # Wrap only user-specific tools to inject user_uuid
+        injected_tools = []
+        for tool in WEAPONS_AGENT_TOOLS:
+            # Only wrap tools that require user_uuid (e.g., get_user_weapons)
+            if tool.name == "get_user_weapons":
+                injected_tools.append(inject_user_uuid_tool(tool, self._current_user_uuid, self.sb_client))
+            else:
+                injected_tools.append(tool)
+        # Add shared/common tools (e.g., Tavily web search)
+        all_tools = injected_tools + COMMON_AGENT_TOOLS
+        return all_tools
 
     async def _create_agent_internal(self, instructions: str, persona=None, prompt_version=None, history=None, conversation_id=None, message_id=None):
         logger.debug(f"Creating LangGraph agent with instructions: '{instructions[:100]}...'")
         llm = ChatOpenAI(
             openai_api_key=os.environ.get("OPENAI_API_KEY"),
-            model="gpt-3.5-turbo",  # or your preferred model
+            model="gpt-4.1",  # or your preferred model
             streaming=True,
         )
-        tools = await self._load_mcp_tools()
-        # Optionally, add Google Sheets tools if still needed
-        # tools += [ ... any custom tools ... ]
+        tools = await self._load_agent_tools()
         agent = create_react_agent(
             model=llm,
             tools=tools,
@@ -784,52 +763,44 @@ class DestinyAgentService:
         agent._system_message = instructions
         return agent
 
+    def get_effective_system_prompt(self, persona_name, user_uuid):
+        prompts = load_prompts()
+        persona = self.persona_map.get(persona_name, {})
+        persona_instructions = persona.get("instructions", self.DEFAULT_AGENT_SYSTEM_PROMPT)
+        return self.system_prompt_template.format(
+            role=prompts["default"]["role"],
+            objective=prompts["default"]["objective"],
+            context=prompts["default"]["context"],
+            tools=prompts["default"]["tools"],
+            tasks=prompts["default"]["tasks"],
+            operating_guidelines=prompts["default"]["operating_guidelines"],
+            constraints=prompts["default"]["constraints"],
+            persona_instructions=persona_instructions,
+            user_uuid=user_uuid
+        )
+
     async def run_chat(self, prompt: str, access_token: str, bungie_id: str, supabase_uuid: str, history: Optional[List[Dict[str, str]]] = None, persona: Optional[str] = None, conversation_id: Optional[str] = None, message_id: Optional[str] = None):
         logger.debug(f"DestinyAgentService run_chat called for bungie_id: {bungie_id}, persona: {persona}")
         self._current_access_token = access_token
         self._current_bungie_id = bungie_id
         self._current_user_uuid = supabase_uuid
-        uuid_instructions = f"The user's UUID is: {self._current_user_uuid}. Always use this UUID for any user-specific queries or tool calls. "
         if persona:
-            persona_base_instructions = self.persona_map.get(persona)
-            if persona_base_instructions:
-                effective_system_prompt = (
-                    f"{persona_base_instructions} "
-                    f"{self.AGENT_CORE_ABILITIES_PROMPT} "
-                    f"{uuid_instructions}"
-                    f"{self.SUPABASE_MCP_ACCESS_PROMPT} "
-                    f"{self.EMOJI_ENCOURAGEMENT} "
-                )
-                logger.info(f"Using effective system prompt for persona '{persona}': '{effective_system_prompt[:150]}...'")
-                prompt_version = hashlib.sha256(effective_system_prompt.encode("utf-8")).hexdigest()[:8]
-                agent_to_use = await self._create_agent_internal(
-                    instructions=effective_system_prompt,
-                    persona=persona,
-                    prompt_version=prompt_version,
-                    history=history,
-                    conversation_id=conversation_id,
-                    message_id=message_id,
-                )
-            else:
-                logger.warning(f"Persona '{persona}' selected but no matching instructions found in persona_map. Using default agent.")
-                fallback_system_prompt = f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} {uuid_instructions}"
-                prompt_version = hashlib.sha256(fallback_system_prompt.encode("utf-8")).hexdigest()[:8]
-                agent_to_use = await self._create_agent_internal(
-                    instructions=fallback_system_prompt,
-                    persona=None,
-                    prompt_version=prompt_version,
-                    history=history,
-                    conversation_id=conversation_id,
-                    message_id=message_id,
-                )
-        else:
-            default_full_system_prompt = (
-                f"{self.DEFAULT_AGENT_SYSTEM_PROMPT} "
-                f"{uuid_instructions}"
-            )
-            prompt_version = hashlib.sha256(default_full_system_prompt.encode("utf-8")).hexdigest()[:8]
+            effective_system_prompt = self.get_effective_system_prompt(persona, self._current_user_uuid)
+            logger.info(f"Using effective system prompt for persona '{persona}': '{effective_system_prompt[:150]}...'")
+            prompt_version = hashlib.sha256(effective_system_prompt.encode("utf-8")).hexdigest()[:8]
             agent_to_use = await self._create_agent_internal(
-                instructions=default_full_system_prompt,
+                instructions=effective_system_prompt,
+                persona=persona,
+                prompt_version=prompt_version,
+                history=history,
+                conversation_id=conversation_id,
+                message_id=message_id,
+            )
+        else:
+            effective_system_prompt = self.get_effective_system_prompt(None, self._current_user_uuid)
+            prompt_version = hashlib.sha256(effective_system_prompt.encode("utf-8")).hexdigest()[:8]
+            agent_to_use = await self._create_agent_internal(
+                instructions=effective_system_prompt,
                 persona=None,
                 prompt_version=prompt_version,
                 history=history,
@@ -839,43 +810,59 @@ class DestinyAgentService:
         # LangGraph agents do not have a .memory attribute; state is managed by the checkpointer and thread_id.
         # if history:
         #     agent_to_use.memory.chat_memory.messages = history
-
         # When using checkpointer, pass conversation_id as thread_id in config
-        config = {"configurable": {"thread_id": conversation_id or "default-thread"}}
+        config = {
+            "configurable": {"thread_id": conversation_id or "default-thread"},
+            "metadata": {
+                "persona": persona,
+                "prompt_version": prompt_version if 'prompt_version' in locals() else None,
+                "conversation_id": conversation_id,
+                "user_id": self._current_user_uuid,
+                "message_id": message_id,
+            }
+        }
         # Only the latest user message is required; agent will load full state from checkpointer
         user_message = {"role": "user", "content": prompt}
         import time
         total_start = time.time()
         try:
+            logger.info(f"AGENT_SERVICE_RUN_CHAT: incoming request: user_uuid={self._current_user_uuid}, message={prompt!r}, persona={persona!r}")
             response_obj = await agent_to_use.ainvoke({"messages": [user_message]}, config=config)
-            logger.error(f"LangGraph agent response: {response_obj}")
-            if "output" in response_obj:
-                return response_obj["output"]
+            logger.info(f"AGENT_SERVICE_RAW_RESPONSE_OBJ: {response_obj!r}")
+
+            # Only return the assistant's message content as a string
+            if "output" in response_obj and isinstance(response_obj["output"], str):
+                return response_obj["output"].strip()
             elif "messages" in response_obj:
-                # Find the last AIMessage and return its content
                 messages = response_obj["messages"]
+                # Find the last AIMessage (assistant message) and return its content
                 for msg in reversed(messages):
-                    if hasattr(msg, "content"):
-                        return msg.content
-                return f"Agent returned messages but no AIMessage with content: {messages}"
-            elif "error" in response_obj:
-                return f"Agent error: {response_obj['error']}"
-            elif "exception" in response_obj:
-                return f"Agent exception: {response_obj['exception']}"
+                    if hasattr(msg, "content") and getattr(msg, "type", None) == "ai":
+                        return msg.content.strip()
+                    # For LangChain, AIMessage type may be 'AIMessage'
+                    if msg.__class__.__name__ == "AIMessage" and hasattr(msg, "content"):
+                        return msg.content.strip()
+                # If no assistant message found, return error string
+                return "[Agent Error] No assistant message returned."
             else:
-                return f"Agent returned unexpected response: {response_obj}"
+                return "[Agent Error] Unexpected agent response format."
+
+        except AuthenticationRequiredError as auth_err: # Specific catch for auth errors
+            logger.warning(f"Authentication required during agent chat: {auth_err}")
+            raise # Re-raise to be handled by FastAPI
+        except InvalidRefreshTokenError as refresh_err: # Specific catch for refresh token errors
+            logger.warning(f"Invalid refresh token during agent chat: {refresh_err}")
+            raise # Re-raise to be handled by FastAPI
         except Exception as e:
-            logger.error(f"Error during agent chat execution: {e}", exc_info=True)
-            return f"An unexpected error occurred while processing your request: {str(e)}"
+            logger.exception("An unexpected error occurred in DestinyAgentService.run_chat")
+            # Ensure a JSON serializable error is returned
+            return {"error": "An unexpected critical error occurred with the agent.", "details": str(e)}
         finally:
             total_duration_ms = int((time.time() - total_start) * 1000)
             # Optionally log performance, as before
             self._current_access_token = None
             self._current_bungie_id = None
             self._current_user_uuid = None
-
-    # Remove legacy _get_langchain_tools and wrappers for MCP tools, as MCP tools are now loaded dynamically
-    # Keep Google Sheets or other custom tools if still needed, and add them to the tools list in _create_agent_internal
 
 # --- LangChain Tool Wrappers ---
 def make_async_tool(name, description, func):
@@ -899,17 +886,6 @@ async def lc_get_weapons(membership_type: int, membership_id: str, service=None)
 async def lc_get_catalysts(user_uuid: str, service=None):
     return await _get_catalysts_impl(service, user_uuid)
 
-# Tool: get_pve_bis_weapons_from_sheet
-async def lc_get_pve_bis_weapons_from_sheet(service=None):
-    return _get_pve_bis_weapons_impl(service)
-
-# Tool: get_pve_activity_bis_weapons_from_sheet
-async def lc_get_pve_activity_bis_weapons_from_sheet(service=None):
-    return _get_pve_activity_bis_weapons_impl(service)
-
-# Tool: get_endgame_analysis_data
-async def lc_get_endgame_analysis_data(sheet_name: str = None, service=None):
-    return _get_endgame_analysis_impl(service, sheet_name)
 
 # Function to get AgentService (dependency for FastAPI)
 # This needs to be updated if AgentService __init__ changes significantly,
@@ -924,3 +900,14 @@ def get_agent_service() -> DestinyAgentService:
         logger.error("AgentService not initialized. Check main.py startup_event.")
         raise Exception("AgentService not available. Initialization failed.")
     return agent_service_instance 
+
+def inject_user_uuid_tool(tool, user_uuid, sb_client):
+    async def wrapper(*args, **kwargs):
+        # Always use backend's user_uuid and sb_client
+        return await tool.coroutine(user_uuid=user_uuid, sb_client=sb_client)
+    return Tool(
+        name=tool.name,
+        description=tool.description,
+        func=wrapper,
+        coroutine=wrapper,
+    ) 
