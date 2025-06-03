@@ -55,6 +55,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Reduce log verbosity for httpx, httpcore, and hpack to WARNING at the top of the file, before app startup.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("hpack").setLevel(logging.WARNING)
+
 # --- Pydantic Models for Chat (Moved Up) ---
 class ChatMessage(BaseModel):
     role: str
@@ -778,11 +783,13 @@ async def assistants_chat_endpoint(
             raise HTTPException(status_code=500, detail="Agent service generated a response, but its format was unexpected.")
 
         # --- Save Assistant Message to Supabase ---
+        assistant_message_id = str(uuid.uuid4())
         assistant_message_to_save = {
             "conversation_id": current_conversation_id_str,
             "sender": "assistant", # Use 'sender'
             "content": agent_response_content,
-            "order_index": next_order_index
+            "order_index": next_order_index,
+            "message_id": assistant_message_id
         }
         insert_asst_msg_response = await sb_client.table("messages").insert(assistant_message_to_save).execute()
         if not insert_asst_msg_response.data:
@@ -893,19 +900,6 @@ async def get_available_models():
     except Exception as e:
         logger.error(f"Error fetching models from OpenAI: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to fetch models from AI provider: {e}")
-
-# Serve Static Files (React Build)
-# Make sure this path is correct relative to where you run uvicorn
-# If running uvicorn from destiny2_catalysts/, the path should be web-app/frontend/build
-static_files_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "build")
-logger.info(f"Attempting to serve static files from: {os.path.abspath(static_files_path)}")
-
-if os.path.exists(static_files_path) and os.path.isdir(os.path.join(static_files_path, "static")):
-    app.mount("/", StaticFiles(directory=static_files_path, html=True), name="static")
-    logger.info("Serving static files from frontend build directory.")
-else:
-    logger.warning(f"Static files directory not found or invalid: {static_files_path}")
-    logger.warning("Frontend will not be served by FastAPI.")
 
 # Optional: Add shutdown event to close manifest DB connection
 @app.on_event("shutdown")
@@ -1272,15 +1266,97 @@ async def get_user_profile(current_user: SupabaseUser = Depends(get_supabase_use
         logger.error(f"Error fetching profile for user {getattr(current_user, 'uuid', None)}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch user profile.")
 
+from fastapi.responses import JSONResponse
+from fastapi import status
+
 @app.post("/agent/stream")
-async def agent_stream_endpoint(request: Request):
-    data = await request.json()
-    run_input = RunAgentInput(**data)
-    agent_service = get_agent_service()
-    return StreamingResponse(
-        agent_service.stream_agent_events(run_input),
-        media_type="text/event-stream"
+async def agent_stream(request: Request):
+    try:
+        body = await request.json()
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"=== /agent/stream received body ===\n{json.dumps(body, indent=2)}")
+        persona = body.get("persona")
+        conversation_id = body.get("conversation_id")
+
+        # --- New handling for thread_id and messages ---
+        thread_id = str(conversation_id) if conversation_id else ""
+        messages_in = body.get("messages", [])
+        if messages_in and hasattr(messages_in[0], "dict"):
+            messages_in = [msg.dict() for msg in messages_in]
+        elif messages_in and isinstance(messages_in[0], dict):
+            pass  # Already dicts
+        else:
+            messages_in = []
+        # Always pass context=[]
+
+        from ag_ui.core import RunAgentInput
+        run_input = RunAgentInput(
+            threadId=thread_id or "",  # Ensure string, not None
+            runId=body.get("run_id", ""),
+            state=body.get("state", None),
+            messages=messages_in,
+            tools=body.get("tools", []),
+            context=body.get("context", []),
+            forwardedProps=body.get("forwarded_props", {}),
+        )
+        # Log the constructed RunAgentInput as camelCase for debugging
+        try:
+            logger.info(f"=== /agent/stream constructed RunAgentInput ===\n{run_input.model_dump_json(indent=2)}")
+        except AttributeError:
+            # For older Pydantic versions (<2.0)
+            logger.info(f"=== /agent/stream constructed RunAgentInput ===\n{run_input.json(indent=2)}")
+        # Previous version (removed):
+        # run_input = RunAgentInput(
+        #     messages=messages,
+        #     thread_id=conversation_id,
+        #     forwarded_props={"persona": persona} if persona else {},
+        # )
+
+        agent_service = request.app.state.agent_service_instance
+        if not agent_service:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=503, detail="Agent service not initialized.")
+
+        event_stream = agent_service.stream_agent_events(run_input)
+
+        return StreamingResponse(
+            event_stream,
+            media_type="text/event-stream",
+            headers={"Access-Control-Allow-Origin": "http://localhost:3000"}
+        )
+    except Exception as e:
+        import traceback
+        print("ERROR in /agent/stream:", e)
+        traceback.print_exc()
+        response = JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": str(e), "detail": "Internal server error in /agent/stream"}
+        )
+        response.headers["Access-Control-Allow-Origin"] = "http://localhost:3000"
+        return response
+# --- Agent Ask Endpoint ---
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    from fastapi.responses import JSONResponse
+    response = JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)}
     )
+    response.headers["Access-Control-Allow-Origin"] = "http://localhost:3000"
+    return response
+
+# IMPORTANT: Mount static files AFTER all API routes are defined
+# This ensures API routes take precedence over static file serving
+static_files_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "build")
+logger.info(f"Attempting to serve static files from: {os.path.abspath(static_files_path)}")
+
+if os.path.exists(static_files_path) and os.path.isdir(os.path.join(static_files_path, "static")):
+    app.mount("/", StaticFiles(directory=static_files_path, html=True), name="static")
+    logger.info("Serving static files from frontend build directory.")
+else:
+    logger.warning(f"Static files directory not found or invalid: {static_files_path}")
+    logger.warning("Frontend will not be served by FastAPI.")
 
 if __name__ == "__main__":
     import uvicorn

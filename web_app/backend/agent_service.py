@@ -1182,3 +1182,18 @@ def inject_user_uuid_tool(tool, user_uuid, sb_client):
         func=wrapper,
         coroutine=wrapper,
     ) 
+
+async def agent_stream(body):
+    user_message = body.get("messages", [{}])[0].get("content", "")
+
+    async def fake_stream():
+        assistant_message_id = str(uuid.uuid4())  # Generate a new unique id for every reply
+        await asyncio.sleep(0.2)
+        yield f"data: {json.dumps({'type': 'TEXT_MESSAGE_START', 'message_id': assistant_message_id})}\n\n"
+        for chunk in ["You said: ", user_message, "\n"]:
+            await asyncio.sleep(0.3)
+            yield f"data: {json.dumps({'type': 'TEXT_MESSAGE_CONTENT', 'message_id': assistant_message_id, 'delta': chunk})}\n\n"
+        await asyncio.sleep(0.2)
+        yield f"data: {json.dumps({'type': 'TEXT_MESSAGE_END', 'message_id': assistant_message_id})}\n\n"
+
+    return fake_stream() 

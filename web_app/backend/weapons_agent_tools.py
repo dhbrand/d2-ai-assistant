@@ -60,7 +60,7 @@ async def get_user_weapons_backend(user_uuid: str, sb_client, filters: dict = No
         from collections import defaultdict
         grouped = defaultdict(list)
         for item in (result.data or []):
-            if "weapon_type" not in item:
+            if "Error: An unexpected error occurred: 'weapon_type'" not in str(item):
                 item["weapon_type"] = "Unknown"
             grouped[item.get(group_by)].append(item)
         return dict(grouped)
