@@ -58,9 +58,9 @@ const drawerWidth = 240; // Define sidebar width
 function ChatPage() {
   const { token } = useAuth();
   const [messages, setMessages] = useState([]);
-  useEffect(() => {
-    console.log('[MONITOR] useEffect - messages state:', messages);
-  }, [messages]);
+  // useEffect(() => {
+  //   console.log('[MONITOR] useEffect - messages state:', messages);
+  // }, [messages]);
   const [newMessage, setNewMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
@@ -88,6 +88,7 @@ function ChatPage() {
       const updatedMessages = prev
         .filter(m => !(m.id === id && m.role === 'assistant'))
         .concat([{ id, role: 'assistant', content }]);
+      console.log('[DEBUG] setMessages: updatePartialMessage', updatedMessages);
       return updatedMessages;
     });
   }, []);
@@ -122,6 +123,7 @@ function ChatPage() {
         return [];
       }
       const data = await response.json();
+      console.log('[DEBUG] setMessages: fetchConversations', data);
       return data;
     } catch (error) {
       console.error('Error fetching conversations:', error);
@@ -154,7 +156,12 @@ function ChatPage() {
       const data = await response.json();
       console.log(`Fetched messages data for ${conversationId}:`, data); // Log data
       // Use 'content' prop directly as assumed by original code's ChatMessage usage
-      const formattedMessages = data.map(msg => ({ role: msg.role, content: msg.content })); 
+      const formattedMessages = data.map(msg => ({ id: msg.id, role: msg.role, content: msg.content })); 
+      setMessages(prev => {
+        const newArr = Array.isArray(formattedMessages) ? [...formattedMessages] : [];
+        console.log('[DEBUG] setMessages: fetchMessagesForConversation', newArr);
+        return newArr;
+      });
       return formattedMessages;
     } catch (error) {
       console.error('Error fetching messages:', error);
@@ -206,9 +213,7 @@ function ChatPage() {
     setCurrentConversationId(null);
     setMessages(prev => {
       const newArr = [];
-      // PATCH-1: log before/after
-      console.log('[PATCH-1 BEFORE setMessages] handleNewChat', prev);
-      console.log('[PATCH-1 AFTER setMessages] handleNewChat', newArr);
+      console.log('[DEBUG] setMessages: handleNewChat', newArr);
       return newArr;
     }); // Clear messages for new chat
   };
@@ -218,8 +223,7 @@ function ChatPage() {
       setCurrentConversationId(id);
       setMessages(prev => {
         const newArr = [];
-        console.log('[PATCH-1 BEFORE setMessages] handleSelectConversation (clear)', prev);
-        console.log('[PATCH-1 AFTER setMessages] handleSelectConversation (clear)', newArr);
+        console.log('[DEBUG] setMessages: handleSelectConversation (clear)', prev);
         return newArr;
       });
       setNewMessage('');
@@ -229,16 +233,14 @@ function ChatPage() {
         setMessages(prev => {
           // PATCH-1: always use functional form
           const newArr = Array.isArray(fetchedMessages) ? [...fetchedMessages] : [];
-          console.log('[PATCH-1 BEFORE setMessages] handleSelectConversation (load)', prev);
-          console.log('[PATCH-1 AFTER setMessages] handleSelectConversation (load)', newArr);
+          console.log('[DEBUG] setMessages: handleSelectConversation (load)', prev);
           return newArr;
         });
       } catch (error) {
         console.error("Error loading selected conversation:", error);
         setMessages(prev => {
           const newArr = [{role: 'assistant', content: 'Error loading conversation history.'}];
-          console.log('[PATCH-1 BEFORE setMessages] handleSelectConversation (error)', prev);
-          console.log('[PATCH-1 AFTER setMessages] handleSelectConversation (error)', newArr);
+          console.log('[DEBUG] setMessages: handleSelectConversation (error)', prev);
           return newArr;
         });
       } finally {
@@ -299,8 +301,7 @@ function ChatPage() {
         ...prevMessages,
         { id: messageId, role: 'user', content: newMessage },
       ];
-      console.log('[PATCH-1 BEFORE setMessages] handleSendMessage (user msg)', prevMessages);
-      console.log('[PATCH-1 AFTER setMessages] handleSendMessage (user msg)', newArr);
+      console.log('[DEBUG] setMessages: handleSendMessage', newArr);
       return newArr;
     });
 
@@ -350,12 +351,10 @@ function ChatPage() {
         return;
       }
 
-      // ---- Begin robust streaming handler ----
-      let assistantMessageId = null;
-      let assistantMessageContent = '';
-
+      // ---- Begin robust streaming handler with partials ref ----
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -371,31 +370,42 @@ function ChatPage() {
             console.error('[SSE] JSON parse error:', e, dataStr);
             continue;
           }
+          // Fallback debug log to catch all event types
+          console.log('[DEBUG] Received event type:', data.type, data);
           if (data.type === 'TEXT_MESSAGE_START') {
-            // Start a new assistant message thread with this new ID
-            assistantMessageId = data.message_id;
-            assistantMessageContent = '';
+            partials.current[data.messageId] = '';
             setMessages(prev => [
               ...prev,
-              { id: assistantMessageId, role: 'assistant', content: '' }
+              { id: data.messageId, role: 'assistant', content: '' }
             ]);
           }
-          if (data.type === 'TEXT_MESSAGE_CONTENT' && data.message_id === assistantMessageId) {
-            assistantMessageContent += data.delta || '';
-            setMessages(prev =>
-              prev.map(m =>
-                m.id === assistantMessageId && m.role === 'assistant'
-                  ? { ...m, content: assistantMessageContent }
-                  : m
-              )
-            );
+          if (data.type === 'TEXT_MESSAGE_CONTENT') {
+            if (!data.delta) {
+              console.log('[DEBUG] TEXT_MESSAGE_CONTENT with empty delta:', data);
+            }
+            if (data.delta) {
+              partials.current[data.messageId] += data.delta;
+              setMessages(prev => {
+                // Always preserve all fields (especially id) when updating
+                const updated = prev.map(m =>
+                  m.id === data.messageId && m.role === 'assistant'
+                    ? { ...m, content: partials.current[data.messageId] }
+                    : m
+                );
+                console.log('[DEBUG] setMessages: streaming TEXT_MESSAGE_CONTENT', updated);
+                return updated;
+              });
+            }
           }
-          if (data.type === 'TEXT_MESSAGE_END' && data.message_id === assistantMessageId) {
-            // Do nothing for now; message is finalized.
+          if (data.type === 'TEXT_MESSAGE_END') {
+            // Finalize and clean up (optional)
+            delete partials.current[data.messageId];
+            // Targeted debug log for stream end
+            console.log('[DEBUG] TEXT_MESSAGE_END for messageId:', data.messageId, 'Current messages:', JSON.stringify(messages, null, 2));
           }
         }
       }
-      // ---- End robust streaming handler ----
+      // ---- End robust streaming handler with partials ref ----
 
     } catch (err) {
       console.error('Error sending message or processing stream:', err);
