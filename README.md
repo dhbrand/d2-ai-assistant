@@ -6,6 +6,8 @@ A modern web and desktop tool for tracking Destiny 2 catalysts, featuring an AI 
 
 ## Features
 - **AI Chat Assistant**: Ask questions about catalysts, weapons, and Destiny 2 using natural language.
+- **Real-time AG-UI Streaming**: Experience ChatGPT-like real-time streaming responses with the Agent-UI protocol.
+- **Thread Continuity**: Maintain conversation context across multiple messages in the same thread.
 - **Persona System**: Choose from Destiny characters (Saint-14, Cayde-6, Ikora, etc.) for unique, emoji-filled responses.
 - **Google Sheets Integration**: Pulls curated weapon and endgame data from public and private Google Sheets (service account support).
 - **Session Longevity**: JWT refresh endpoint keeps you logged in for 24h+ without repeated Bungie logins.
@@ -13,6 +15,39 @@ A modern web and desktop tool for tracking Destiny 2 catalysts, featuring an AI 
 - **Secure Token Handling**: Refresh tokens and sensitive credentials are never exposed to the frontend or committed to git.
 - **Dark/Light Theme**: Modern, responsive UI for desktop and mobile.
 - **Cross-Platform**: Web (React + FastAPI) and legacy desktop (Python CLI) versions.
+
+---
+
+## AG-UI Real-time Streaming
+
+The application now features **real-time streaming** using the Agent-UI (AG-UI) protocol, providing a ChatGPT-like experience where responses appear as they're being generated.
+
+### Streaming Features
+- **Real-time Response Streaming**: See the agent's response being generated word-by-word in real-time
+- **Thread Continuity**: Maintain conversation context across multiple messages in the same thread
+- **User Context Preservation**: Your Destiny 2 data (weapons, catalysts, character info) is preserved throughout the conversation
+- **Event-driven Architecture**: Uses AG-UI protocol events (RUN_STARTED, TEXT_MESSAGE_START, TEXT_MESSAGE_CONTENT, TEXT_MESSAGE_END, RUN_FINISHED)
+- **Error Recovery**: Graceful handling of network interruptions and backend processing delays
+
+### Technical Implementation
+- **Backend**: FastAPI with Server-Sent Events (SSE) for real-time streaming
+- **Frontend**: React with EventSource API for receiving streaming responses
+- **Protocol**: AG-UI protocol for standardized agent communication
+- **Authentication**: JWT-based user context extraction for personalized responses
+- **Thread Management**: Persistent conversation threads with unique thread IDs
+
+### User Experience
+- **Immediate Feedback**: Start seeing responses as soon as the agent begins processing
+- **Contextual Conversations**: Ask follow-up questions that reference previous messages
+- **Personalized Responses**: Agent accesses your actual Destiny 2 inventory and catalyst progress
+- **Smooth Interactions**: No waiting for complete responses before seeing content
+
+### Recent Improvements (August 2025)
+- **Fixed User Context Issue**: Resolved problem where agent couldn't access user's Destiny 2 data
+- **Thread Continuity Testing**: Verified that multiple messages in the same thread work correctly
+- **Backend Integration**: Updated `/agent/stream` endpoint to extract user context from JWT tokens
+- **Frontend Updates**: Modified ChatPage.js to use real user UUID instead of random localStorage values
+- **Error Handling**: Improved handling of empty responses and network issues
 
 ---
 
