@@ -1270,12 +1270,14 @@ from fastapi.responses import JSONResponse
 from fastapi import status
 
 @app.post("/agent/stream")
-async def agent_stream(request: Request):
+async def agent_stream(request: Request, current_user: SupabaseUser = Depends(get_supabase_user_from_token)):
     try:
         body = await request.json()
         import logging
         logger = logging.getLogger(__name__)
         logger.info(f"=== /agent/stream received body ===\n{json.dumps(body, indent=2)}")
+        logger.info(f"=== /agent/stream user context ===\nUser UUID: {current_user.uuid}, Bungie ID: {current_user.bungie_id}")
+        
         persona = body.get("persona")
         conversation_id = body.get("conversation_id")
 
@@ -1288,7 +1290,12 @@ async def agent_stream(request: Request):
             pass  # Already dicts
         else:
             messages_in = []
-        # Always pass context=[]
+        
+        # Extract user context from JWT token instead of request body
+        user_context = [
+            {"description": "user_uuid", "value": current_user.uuid},
+            {"description": "bungie_id", "value": current_user.bungie_id or ""}
+        ]
 
         from ag_ui.core import RunAgentInput
         run_input = RunAgentInput(
@@ -1297,8 +1304,12 @@ async def agent_stream(request: Request):
             state=body.get("state", None),
             messages=messages_in,
             tools=body.get("tools", []),
-            context=body.get("context", []),
-            forwardedProps=body.get("forwarded_props", {}),
+            context=user_context,  # Use user context from JWT token
+            forwardedProps={
+                **(body.get("forwarded_props", {})),
+                "user_uuid": current_user.uuid,
+                "bungie_id": current_user.bungie_id or ""
+            },
         )
         # Log the constructed RunAgentInput as camelCase for debugging
         try:

@@ -56,7 +56,7 @@ import { v4 as uuidv4 } from 'uuid';
 const drawerWidth = 240; // Define sidebar width
 
 function ChatPage() {
-  const { token } = useAuth();
+  const { token, userUuid } = useAuth();
   const [messages, setMessages] = useState([]);
   // useEffect(() => {
   //   console.log('[MONITOR] useEffect - messages state:', messages);
@@ -282,8 +282,6 @@ function ChatPage() {
     const runId = uuidv4();
 
     // Build messages array (align with ag_ui.core.types.BaseMessage: use 'name' for user ID, 'id' for message ID)
-    const userId = localStorage.getItem('agui_user_id') || uuidv4();
-    localStorage.setItem('agui_user_id', userId);
     const messageId = uuidv4(); // Unique ID for this specific message
 
     const aguiMessages = [
@@ -291,7 +289,7 @@ function ChatPage() {
         id: messageId,       // ID for the message itself (BaseMessage.id)
         role: 'user',
         content: newMessage,
-        name: userId,         // User identifier goes into the 'name' field (BaseMessage.name)
+        name: userUuid || 'unknown-user', // Use real user UUID from auth context
       },
     ];
 
@@ -313,7 +311,7 @@ function ChatPage() {
       thread_id: threadId,
       run_id: runId,
       messages: aguiMessages, // These are the AG-UI formatted messages
-      context: [{ description: "user_uuid", value: userId }],
+      context: [{ description: "user_uuid", value: userUuid || 'unknown-user' }],
       forwarded_props: { persona: selectedPersona },
     });
 
@@ -335,7 +333,7 @@ function ChatPage() {
           messages: aguiMessages,
           state: null,
           tools: [],
-          context: [{ description: "user_uuid", value: userId }],
+          context: [{ description: "user_uuid", value: userUuid || 'unknown-user' }],
           forwarded_props: { persona: selectedPersona },
         }),
       });
