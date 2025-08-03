@@ -1032,8 +1032,9 @@ class DestinyAgentService:
 
             # Emit TEXT_MESSAGE_START once, assuming the agent will produce text.
             # This might need to be more dynamic if the first event isn't text.
-            logger.info(f"Yielding TEXT_MESSAGE_START event (message_id: {message_id}) for run_id: {run_id}")
+            logger.info(f"[DEBUG] About to yield TEXT_MESSAGE_START event (message_id: {message_id}) for run_id: {run_id}")
             yield encoder.encode(TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, message_id=message_id, role="assistant"))
+            logger.info(f"[DEBUG] Just yielded TEXT_MESSAGE_START event (message_id: {message_id}) for run_id: {run_id}")
             
             text_stream_started = True # Assume for now, adjust if needed
 
@@ -1186,14 +1187,172 @@ def inject_user_uuid_tool(tool, user_uuid, sb_client):
 async def agent_stream(body):
     user_message = body.get("messages", [{}])[0].get("content", "")
 
-    async def fake_stream():
-        assistant_message_id = str(uuid.uuid4())  # Generate a new unique id for every reply
-        await asyncio.sleep(0.2)
-        yield f"data: {json.dumps({'type': 'TEXT_MESSAGE_START', 'message_id': assistant_message_id})}\n\n"
-        for chunk in ["You said: ", user_message, "\n"]:
-            await asyncio.sleep(0.3)
-            yield f"data: {json.dumps({'type': 'TEXT_MESSAGE_CONTENT', 'message_id': assistant_message_id, 'delta': chunk})}\n\n"
-        await asyncio.sleep(0.2)
-        yield f"data: {json.dumps({'type': 'TEXT_MESSAGE_END', 'message_id': assistant_message_id})}\n\n"
+    logger.info(f"Yielding RUN_STARTED event for run_id: {run_id}")
+    yield encoder.encode(RunStartedEvent(type=EventType.RUN_STARTED, thread_id=thread_id, run_id=run_id))
 
-    return fake_stream() 
+    # Convert AG-UI messages to LangChain messages
+    lc_messages: List[BaseMessage] = []
+    if run_input.messages:
+        for ag_ui_msg in run_input.messages:
+            if ag_ui_msg.role == "user":
+                # Ensure name is passed if available, LangChain HumanMessage accepts it
+                lc_messages.append(HumanMessage(
+                    content=ag_ui_msg.content,
+                    id=ag_ui_msg.id, # Pass ID
+                    name=getattr(ag_ui_msg, 'name', None) # Pass name if it exists
+                ))
+            elif ag_ui_msg.role == "assistant":
+                lc_messages.append(AIMessage(
+                    content=ag_ui_msg.content,
+                    id=ag_ui_msg.id
+                ))
+            # Add other roles if necessary (e.g., system)
+
+    logger.info(f"Converted {len(run_input.messages or [])} AG-UI messages to {len(lc_messages)} LangChain messages for agent input.")
+
+    try:
+        # 2. Create agent and config
+        # Ensure _current_user_uuid is correctly set for agent creation tools if needed,
+        # or adjust _create_agent_internal and _load_agent_tools to accept it or derive it.
+        # For now, _create_agent_internal uses self._current_user_uuid which might be None here.
+        # This is a potential issue.
+        effective_prompt = self.get_effective_system_prompt(persona, user_uuid_for_prompt)
+        logger.info(f"stream_agent_events: Using effective prompt: {effective_prompt[:100]}...")
+
+        # Temporarily set self._current_user_uuid FOR THIS STREAM if not set and found in input
+        # This is for tools that might rely on the instance attribute.
+        original_instance_user_uuid = self._current_user_uuid
+        if not self._current_user_uuid and user_uuid_for_prompt != "default-streaming-user-uuid":
+            self._current_user_uuid = user_uuid_for_prompt
+            logger.warning(f"Temporarily set self._current_user_uuid to {self._current_user_uuid} for stream duration.")
+        
+        agent = await self._create_agent_internal(
+            instructions=effective_prompt,
+            persona=persona,
+            # prompt_version=None, # Not strictly needed for streaming like this
+            # history=messages, # LangGraph handles history via checkpointer/thread_id
+            # conversation_id=thread_id, # Passed in config
+            # message_id=None,
+        )
+        config = {
+            "configurable": {"thread_id": thread_id}, # LangGraph uses this for state
+            "metadata": {"persona": persona, "run_id": run_id, "user_id": user_uuid_for_prompt},
+        }
+
+        # 3. Run agent with streaming
+        message_id = str(uuid.uuid4()) # For assistant's message
+        current_tool_call_id: Optional[str] = None
+        current_tool_call_name: Optional[str] = None
+        accumulated_content = "" 
+        final_ai_message_content = None 
+        last_yielded_content_chunk = None # Stores the last non-empty chunk yielded
+
+        agent_input = {"messages": lc_messages}
+
+        logger.info(f"Starting agent.astream_log for run_id: {run_id}, thread_id: {thread_id}")
+
+        # Emit TEXT_MESSAGE_START once, assuming the agent will produce text.
+        # This might need to be more dynamic if the first event isn't text.
+        logger.info(f"[DEBUG] About to yield TEXT_MESSAGE_START event (message_id: {message_id}) for run_id: {run_id}")
+        yield encoder.encode(TextMessageStartEvent(type=EventType.TEXT_MESSAGE_START, message_id=message_id, role="assistant"))
+        logger.info(f"[DEBUG] Just yielded TEXT_MESSAGE_START event (message_id: {message_id}) for run_id: {run_id}")
+        
+        text_stream_started = True # Assume for now, adjust if needed
+
+        async for log_entry in agent.astream_log(agent_input, config=config, include_types=['llm', 'tool', 'chat_model', 'agent'], include_names=None, include_tags=None):
+            logger.debug(f"ASTREAM_LOG_ENTRY for run_id {run_id}: raw log_entry.ops: {log_entry.ops}") 
+            
+            # To prevent duplicate content from AIMessageChunk and its string version in the same log_entry
+            # This variable is reset for each new log_entry
+            processed_content_for_this_log_entry = None 
+
+            for op in log_entry.ops:
+                path = op.get("path", "")
+                value = op.get("value")
+                logger.debug(f"  Processing op: path='{path}', value_type='{type(value).__name__}', value_preview='{str(value)[:100]}'") 
+
+                if path.endswith(('/streamed_output/-', '/streamed_output_str/-')):
+                    content_chunk = None
+                    is_aimessage_chunk_content = False
+                    is_string_content = False
+
+                    if isinstance(value, AIMessageChunk):
+                        content_chunk = value.content
+                        is_aimessage_chunk_content = True
+                    elif isinstance(value, str):
+                        content_chunk = value
+                        is_string_content = True
+                    
+                    # Ensure content_chunk is a string for comparison, even if None initially
+                    current_content_str = content_chunk if content_chunk is not None else ""
+
+                    # Only yield if the chunk is non-empty AND different from the last yielded chunk
+                    if current_content_str and current_content_str != last_yielded_content_chunk:
+                        # Check if we've already processed effectively identical content in this log_entry
+                        # (e.g. from AIMessageChunk vs its string version)
+                        if processed_content_for_this_log_entry is not None and \
+                           current_content_str == processed_content_for_this_log_entry:
+                            logger.debug(f"  Skipping redundant content_chunk (already processed in this log_entry): '{current_content_str}'")
+                            continue        
+
+                        logger.info(f"Yielding TEXT_MESSAGE_CONTENT with delta: '{current_content_str}' for run_id: {run_id}")
+                        yield encoder.encode(TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, message_id=message_id, delta=current_content_str))
+                        accumulated_content += current_content_str
+                        last_yielded_content_chunk = current_content_str # Update last yielded chunk
+                        
+                        # Mark this content as processed for the current log_entry to avoid immediate duplication
+                        # from a paired AIMessageChunk/string op within the same log_entry.ops
+                        if is_aimessage_chunk_content or is_string_content:
+                            processed_content_for_this_log_entry = current_content_str
+
+                    elif not current_content_str:
+                        logger.debug(f"  Skipping empty content_chunk for path {path}. Value: {str(value)[:100]}")
+                    elif current_content_str == last_yielded_content_chunk:
+                        logger.debug(f"  Skipping identical consecutive content_chunk: '{current_content_str}'")
+                
+                elif path.endswith("/final_output") and isinstance(value, dict):
+                    generations = value.get('generations')
+                    if generations and isinstance(generations, list) and generations[0] and isinstance(generations[0], list) and generations[0][0]:
+                        msg_obj = generations[0][0].get('message')
+                        if msg_obj and isinstance(msg_obj, AIMessage):
+                            final_ai_message_content = msg_obj.content
+                            logger.info(f"Captured final_ai_message_content: '{final_ai_message_content}' from final_output for run_id: {run_id}")
+
+                # ... (experimental logic for tool calls, steps etc. can remain here)
+                # Ensure it doesn't prematurely yield TEXT_MESSAGE_END
+
+        # After the loop, if no content was streamed but we captured a final AI message, send it now.
+        if not accumulated_content and final_ai_message_content:
+            logger.info(f"Yielding TEXT_MESSAGE_CONTENT with captured final AI message: '{final_ai_message_content}' for run_id: {run_id}")
+            yield encoder.encode(TextMessageContentEvent(type=EventType.TEXT_MESSAGE_CONTENT, message_id=message_id, delta=final_ai_message_content))
+            accumulated_content = final_ai_message_content # Ensure it's marked as sent
+        elif not accumulated_content and not final_ai_message_content:
+            # If still no content, DO NOT yield an empty content event as it causes validation errors.
+            # The TEXT_MESSAGE_START and TEXT_MESSAGE_END events will signify an empty message attempt.
+            logger.warning(f"No content streamed or captured for message_id {message_id}. SKIPPING empty TEXT_MESSAGE_CONTENT event.")
+
+
+        logger.info(f"Yielding TEXT_MESSAGE_END event (message_id: {message_id}) for run_id: {run_id}")
+        yield encoder.encode(TextMessageEndEvent(type=EventType.TEXT_MESSAGE_END, message_id=message_id))
+        
+        if current_tool_call_id: # If a tool call was started but not explicitly ended by node status
+            logger.warning(f"Tool call {current_tool_call_id} was active but not explicitly ended by step finish. Ending it now.")
+            yield encoder.encode(ToolCallEndEvent(type=EventType.TOOL_CALL_END, tool_call_id=current_tool_call_id))
+
+
+        logger.info(f"Yielding RUN_FINISHED event for run_id: {run_id}")
+        yield encoder.encode(RunFinishedEvent(type=EventType.RUN_FINISHED, thread_id=thread_id, run_id=run_id))
+
+    except Exception as e:
+        logger.error(f"Error during agent streaming for run_id {run_id}: {e}", exc_info=True)
+        logger.info(f"Yielding RUN_ERROR event for run_id: {run_id}")
+        # Corrected RunErrorEvent instantiation
+        yield encoder.encode(RunErrorEvent(type=EventType.RUN_ERROR, message=str(e)))
+        # Always finish the run, even on error
+        logger.info(f"Yielding RUN_FINISHED event (after error) for run_id: {run_id}")
+        yield encoder.encode(RunFinishedEvent(type=EventType.RUN_FINISHED, thread_id=thread_id, run_id=run_id))
+    finally:
+        # Clean up _current_user_uuid if it was temporarily set for this stream
+        if self._current_user_uuid != original_instance_user_uuid: # Checks if it was changed
+            self._current_user_uuid = original_instance_user_uuid # Revert to original state
+            logger.info(f"Reverted self._current_user_uuid to its original state: {original_instance_user_uuid or 'None'}") 

@@ -88,7 +88,7 @@ function ChatPage() {
       const updatedMessages = prev
         .filter(m => !(m.id === id && m.role === 'assistant'))
         .concat([{ id, role: 'assistant', content }]);
-      console.log('[DEBUG] setMessages: updatePartialMessage', updatedMessages);
+      console.log('[DEBUG] setMessages: updatePartialMessage', updatedMessages.map(m => ({ id: m.id, role: m.role, content: m.content })));
       return updatedMessages;
     });
   }, []);
@@ -123,7 +123,7 @@ function ChatPage() {
         return [];
       }
       const data = await response.json();
-      console.log('[DEBUG] setMessages: fetchConversations', data);
+      console.log('[DEBUG] setMessages: fetchConversations', data.map(c => ({ id: c.id, title: c.title, updated_at: c.updated_at })));
       return data;
     } catch (error) {
       console.error('Error fetching conversations:', error);
@@ -154,12 +154,12 @@ function ChatPage() {
       }
       /** @type {ChatApiMessage[]} */
       const data = await response.json();
-      console.log(`Fetched messages data for ${conversationId}:`, data); // Log data
+      console.log(`Fetched messages data for ${conversationId}:`, data.map(m => ({ id: m.id, role: m.role, content: m.content }))); // Log data
       // Use 'content' prop directly as assumed by original code's ChatMessage usage
       const formattedMessages = data.map(msg => ({ id: msg.id, role: msg.role, content: msg.content })); 
       setMessages(prev => {
         const newArr = Array.isArray(formattedMessages) ? [...formattedMessages] : [];
-        console.log('[DEBUG] setMessages: fetchMessagesForConversation', newArr);
+        console.log('[DEBUG] setMessages: fetchMessagesForConversation', newArr.map(m => ({ id: m.id, role: m.role, content: m.content })));
         return newArr;
       });
       return formattedMessages;
@@ -213,7 +213,7 @@ function ChatPage() {
     setCurrentConversationId(null);
     setMessages(prev => {
       const newArr = [];
-      console.log('[DEBUG] setMessages: handleNewChat', newArr);
+      console.log('[DEBUG] setMessages: handleNewChat', newArr.map(m => ({ id: m.id, role: m.role, content: m.content })));
       return newArr;
     }); // Clear messages for new chat
   };
@@ -223,7 +223,7 @@ function ChatPage() {
       setCurrentConversationId(id);
       setMessages(prev => {
         const newArr = [];
-        console.log('[DEBUG] setMessages: handleSelectConversation (clear)', prev);
+        console.log('[DEBUG] setMessages: handleSelectConversation (clear)', prev.map(m => ({ id: m.id, role: m.role, content: m.content })));
         return newArr;
       });
       setNewMessage('');
@@ -233,14 +233,14 @@ function ChatPage() {
         setMessages(prev => {
           // PATCH-1: always use functional form
           const newArr = Array.isArray(fetchedMessages) ? [...fetchedMessages] : [];
-          console.log('[DEBUG] setMessages: handleSelectConversation (load)', prev);
+          console.log('[DEBUG] setMessages: handleSelectConversation (load)', newArr.map(m => ({ id: m.id, role: m.role, content: m.content })));
           return newArr;
         });
       } catch (error) {
         console.error("Error loading selected conversation:", error);
         setMessages(prev => {
           const newArr = [{role: 'assistant', content: 'Error loading conversation history.'}];
-          console.log('[DEBUG] setMessages: handleSelectConversation (error)', prev);
+          console.log('[DEBUG] setMessages: handleSelectConversation (error)', newArr.map(m => ({ id: m.id, role: m.role, content: m.content })));
           return newArr;
         });
       } finally {
@@ -301,7 +301,7 @@ function ChatPage() {
         ...prevMessages,
         { id: messageId, role: 'user', content: newMessage },
       ];
-      console.log('[DEBUG] setMessages: handleSendMessage', newArr);
+      console.log('[DEBUG] setMessages: handleSendMessage', newArr.map(m => ({ id: m.id, role: m.role, content: m.content })));
       return newArr;
     });
 
@@ -347,7 +347,7 @@ function ChatPage() {
         setMessages(prevMessages => [
           ...prevMessages,
           { role: 'assistant', content: `Error connecting to agent: ${response.status} ${errorText || response.statusText}` },
-        ]);
+        ].map(m => ({ id: m.id, role: m.role, content: m.content })));
         return;
       }
 
@@ -374,10 +374,11 @@ function ChatPage() {
           console.log('[DEBUG] Received event type:', data.type, data);
           if (data.type === 'TEXT_MESSAGE_START') {
             partials.current[data.messageId] = '';
-            setMessages(prev => [
-              ...prev,
-              { id: data.messageId, role: 'assistant', content: '' }
-            ]);
+            setMessages(prev => {
+              const updated = [...prev, { id: data.messageId, role: 'assistant', content: '' }];
+              console.log('[DEBUG] setMessages: streaming TEXT_MESSAGE_CONTENT', updated.map(m => ({ id: m.id, role: m.role, content: m.content })));
+              return updated;
+            });
           }
           if (data.type === 'TEXT_MESSAGE_CONTENT') {
             if (!data.delta) {
@@ -392,7 +393,7 @@ function ChatPage() {
                     ? { ...m, content: partials.current[data.messageId] }
                     : m
                 );
-                console.log('[DEBUG] setMessages: streaming TEXT_MESSAGE_CONTENT', updated);
+                console.log('[DEBUG] setMessages: streaming TEXT_MESSAGE_CONTENT', updated.map(m => ({ id: m.id, role: m.role, content: m.content })));
                 return updated;
               });
             }
@@ -401,7 +402,7 @@ function ChatPage() {
             // Finalize and clean up (optional)
             delete partials.current[data.messageId];
             // Targeted debug log for stream end
-            console.log('[DEBUG] TEXT_MESSAGE_END for messageId:', data.messageId, 'Current messages:', JSON.stringify(messages, null, 2));
+            console.log('[DEBUG] TEXT_MESSAGE_END for messageId:', data.messageId, 'Current messages:', JSON.stringify(messages.map(m => ({ id: m.id, role: m.role, content: m.content })), null, 2));
           }
         }
       }
@@ -413,7 +414,7 @@ function ChatPage() {
       setMessages(prevMessages => [
         ...prevMessages,
         { role: 'assistant', content: `Error: ${err.message}` },
-      ]);
+      ].map(m => ({ id: m.id, role: m.role, content: m.content })));
     } finally {
       setIsLoading(false);
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });

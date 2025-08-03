@@ -1,0 +1,27 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+---
+description: Prevent repetitive or redundant suggestions about recent changes or discussions
+globs: cursor/rules/cursor_rules.mdc
+alwaysApply: true
+---
+
+- **Do NOT Suggest or Question What’s Just Been Discussed**
+  - If we’ve recently discussed, edited, or clarified a file or a specific code section, do not re-suggest, re-question, or make assumptions about that same area for a set period (e.g., the last 10 interactions).
+  - **Never reference, question, or re-litigate** backend changes after we move on to frontend or other areas—unless explicitly requested.
+  - Avoid blanket suggestions based on file scan or global context if those parts have already been handled in this session.
+
+  - **Examples:**
+    - ✅ DO: Only reference backend logic if *specifically* asked after moving on to frontend.
+    - ❌ DON'T: After backend edits are completed and we move to frontend, don’t say, “Maybe your backend needs X,” if we already fixed/discussed that.
+
+  ```typescript
+  // ✅ DO: Move forward with new context only
+  // (No backend suggestions unless explicitly asked)
+  editFrontendComponent();
+
+  // ❌ DON'T: Bring up backend issues after recent edits/discussion
+  maybeYouShouldEditBackend(); // ← Not helpful, already discussed!

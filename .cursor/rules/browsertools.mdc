@@ -1,0 +1,63 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+---
+description: Use browsertools for browser errors
+globs: cursor/rules/cursor_rules.mdc
+alwaysApply: true
+---
+
+- **Automatic Browser Tool Activation**
+  - When users report browser errors, console issues, or frontend problems, automatically use browser tools MCP server
+  - Trigger on keywords: "browser error", "console error", "frontend issue", "page not loading", "network error", "JavaScript error"
+  - Use the `bt` alias (configured in `.zshrc`) to start browser tools server: `npx @agentdeskai/browser-tools-server@1.2.0`
+
+- **Systematic Error Investigation Process**
+  1. **Console Logs First**: Always check browser console logs for JavaScript errors, warnings, and debug information
+  2. **Network Analysis**: Examine network requests for failed API calls, CORS issues, or authentication problems
+  3. **Visual Debugging**: Take screenshots of the current page state to understand UI issues
+  4. **Performance Check**: Monitor for slow loading times or resource issues
+
+- **Common Error Patterns in This Codebase**
+  - **Authentication Errors**: OAuth callback failures, token expiration, Supabase connection issues
+  - **API Communication**: Failed requests to `/auth/*`, `/weapons/*`, `/catalysts/*` endpoints
+  - **React State Issues**: Message streaming problems, conversation loading failures
+  - **Network Connectivity**: Supabase connection errors, backend service unavailability
+
+- **Specific Error Handling for Destiny 2 App**
+  - **OAuth Flow Issues**: Check for Bungie authentication callback problems
+  - **Weapon/Catalyst Data**: Verify API responses for weapon inventory and catalyst information
+  - **Real-time Features**: Monitor SSE (Server-Sent Events) for chat functionality
+  - **Certificate Issues**: Self-signed certificate trust problems (common in development)
+
+- **Browser Tools Usage Guidelines**
+  - **Console Logs**: Look for patterns matching existing error handling in [ChatPage.js](mdc:web_app/frontend/src/pages/ChatPage.js) and [Login.js](mdc:web_app/frontend/src/pages/Login.js)
+  - **Network Requests**: Focus on requests to `localhost:8000` (backend) and `localhost:3000` (frontend)
+  - **Error Messages**: Cross-reference with error patterns in [app.log](mdc:web_app/backend/logs/app.log)
+  - **Authentication Flow**: Pay special attention to OAuth redirects and token management
+
+- **Integration with Existing Error Handling**
+  - Reference existing error states in React components: `useState(null)` for error handling
+  - Check for console.error patterns in [Dashboard.js](mdc:web_app/frontend/src/pages/Dashboard.js) and [ChatPage.js](mdc:web_app/frontend/src/pages/ChatPage.js)
+  - Monitor for authentication token issues in [AuthContext.js](mdc:web_app/frontend/src/contexts/AuthContext.js)
+
+- **Development Environment Considerations**
+  - **HTTPS Setup**: Remember the app uses self-signed certificates requiring browser trust
+  - **Port Configuration**: Backend runs on 8000, frontend on 3000
+  - **Local Storage**: Check for OAuth state persistence issues
+  - **CORS Configuration**: Verify cross-origin requests between frontend and backend
+
+- **Error Resolution Workflow**
+  1. **Immediate Assessment**: Use browser tools to capture current state
+  2. **Pattern Recognition**: Match errors to known patterns in the codebase
+  3. **Backend Correlation**: Cross-reference with backend logs when applicable
+  4. **Solution Implementation**: Provide specific fixes based on error type
+  5. **Verification**: Use browser tools to confirm resolution
+
+- **Prevention and Monitoring**
+  - **Proactive Checks**: Use browser tools to verify app functionality before user reports
+  - **Performance Monitoring**: Check for slow loading times or resource bottlenecks
+  - **Authentication Flow**: Regularly verify OAuth callback functionality
+  - **API Health**: Monitor backend service availability and response times
